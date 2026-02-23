@@ -52,6 +52,7 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
         linux-headers-"$(uname -r)" \
         libbpf-dev \
         bpftool \
+        build-essential \
         iproute2 \
         python3 \
         gcc-multilib 2>/dev/null || true
