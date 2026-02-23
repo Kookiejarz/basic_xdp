@@ -256,12 +256,17 @@ def port_to_key(port: int):
 
 def map_update(map_path, port, dry_run):
     import struct
-    hi = (port >> 8) & 0xFF
-    lo = port & 0xFF
-    key_hex = f"{hi:02x}{lo:02x}"
-    
+    # Convert port to network byte order for the key
+    # tcp->dest is big-endian: port 1066 (0x042A) is stored as 04 2A in packet
+    # On x86 (little-endian), __u16 with value 0x042A is stored in memory as 2A 04
+    # bpftool writes raw bytes into memory, so we write the little-endian representation
+    # of the big-endian port value
+    net_port = ((port >> 8) & 0xFF) | ((port & 0xFF) << 8)
+    lo = net_port & 0xFF
+    hi = (net_port >> 8) & 0xFF
+
     cmd = ["bpftool", "map", "update", "pinned", map_path,
-           "key", f"0x{hi:02x}", f"0x{lo:02x}", 
+           "key", f"0x{lo:02x}", f"0x{hi:02x}",
            "value", "0x01", "0x00", "0x00", "0x00"]
 
     if dry_run:
@@ -299,9 +304,14 @@ def map_dump_ports(map_path) -> set:
         for e in entries:
             k = e.get("key")
             if isinstance(k, list) and len(k) == 2:
-                hi = int(k[0], 16)
-                lo = int(k[1], 16)
-                ports.add((hi << 8) | lo)
+                # Bytes are in memory order (little-endian on x86)
+                # Reconstruct the __u16 value (which is network byte order port)
+                b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
+                b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
+                net_port = b0 | (b1 << 8)  # little-endian memory to __u16
+                # Convert from network byte order to host byte order
+                port = ((net_port >> 8) & 0xFF) | ((net_port & 0xFF) << 8)
+                ports.add(port)
         return ports
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return set()
