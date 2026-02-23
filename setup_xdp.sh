@@ -79,15 +79,19 @@ done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Missing dependency: ${MISSING[*]}, Installing..."
 
+    # 设置环境变量，强制 apt 进入非交互模式
+    export DEBIAN_FRONTEND=noninteractive
+    # 定义通用的强制静默参数
+    APT_OPTS="-y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+
     run_with_spinner "Updating system repositories..." \
     apt-get update -qq
 
     run_with_spinner "Installing core build tools (clang, llvm, etc.)..." \
-    apt-get install -y -qq clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
+    apt-get install $APT_OPTS clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
 
     run_with_spinner "Installing kernel specific tools (bpftool)..." \
-    info "Installing specific kernel tools..."
-    apt-get install -y -qq linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
+    apt-get install $APT_OPTS linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
 
     if ! command -v bpftool &>/dev/null; then
         REAL_BPFTOOL=$(find /usr/lib/linux-tools -name bpftool -type f -executable -print -quit 2>/dev/null || true)
@@ -96,6 +100,10 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
             ok "Found bpftool at $REAL_BPFTOOL and created symlink."
         fi
     fi
+    
+    # 取消环境变量（可选，避免影响后续操作）
+    unset DEBIAN_FRONTEND
+fi
 
     # 4. Last Check
     command -v bpftool &>/dev/null || die "bpftool installation failed. Please run: apt install linux-tools-generic"
