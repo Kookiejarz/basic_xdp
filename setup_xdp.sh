@@ -136,41 +136,40 @@ fetch_or_keep() {
         return
     fi
 
-    # 对比两个文件的内容
-    if diff -q "$filename" "$tmp_file" &>/dev/null; then
+    local local_hash github_hash
+    local_hash=$(sha256sum "$filename"  | awk '{print $1}')
+    github_hash=$(sha256sum "$tmp_file" | awk '{print $1}')
+
+    if [[ "$local_hash" == "$github_hash" ]]; then
         info "${filename} is identical to GitHub, no update needed"
         rm -f "$tmp_file"
-        return
+        return 0
     fi
 
-    # 内容不同，比较修改时间
-    # 获取 GitHub 文件的 Last-Modified 时间戳
-    local remote_date
-    remote_date=$(curl -fsSI "$url" 2>/dev/null \
-        | grep -i "last-modified:" \
-        | sed 's/last-modified: //i' \
-        | tr -d '\r')
-
-    local remote_ts=0
-    if [[ -n "$remote_date" ]]; then
-        remote_ts=$(date -d "$remote_date" +%s 2>/dev/null || echo 0)
-    fi
-
+    # 内容不同，用本地修改时间 vs GitHub commit 时间
     local local_ts
     local_ts=$(stat -c %Y "$filename" 2>/dev/null || echo 0)
 
-    info "  Local  : $(date -d @"$local_ts"  '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown')"
-    info "  GitHub : $(date -d @"$remote_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown')"
+    local remote_date remote_ts=0
+    remote_date=$(curl -fsSI "$url" --connect-timeout 5 2>/dev/null \
+        | grep -i "^last-modified:" \
+        | sed 's/last-modified: //i' \
+        | tr -d '\r') || true
+    [[ -n "$remote_date" ]] && \
+        remote_ts=$(date -d "$remote_date" +%s 2>/dev/null || echo 0)
+
+    info "  Local  : $(date -d @"$local_ts"  '+%Y-%m-%d %H:%M:%S') [sha256: ${local_hash:0:8}...]"
+    info "  GitHub : $(date -d @"$remote_ts" '+%Y-%m-%d %H:%M:%S') [sha256: ${github_hash:0:8}...]"
 
     if [[ "$remote_ts" -gt "$local_ts" ]]; then
-        # 备份本地文件
         cp "$filename" "${filename}.bak"
         mv "$tmp_file" "$filename"
-        ok "Updated ${filename} from GitHub (backup saved as ${filename}.bak)"
+        ok "Updated ${filename} from GitHub (backup → ${filename}.bak)"
     else
-        info "Local ${filename} is newer or same age, keeping local version"
+        info "Local ${filename} is newer, keeping local version"
         rm -f "$tmp_file"
     fi
+    return 0
 }
 
 fetch_or_keep "$XDP_SRC"
