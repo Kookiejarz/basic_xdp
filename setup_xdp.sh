@@ -15,6 +15,38 @@ ok()    { echo -e "${GREEN}[ OK ]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[ERR ]${NC}  $*" >&2; exit 1; }
 
+# ── Spinner Animation ──────────────────────────────────────────────
+spinner() {
+    local pid=$1
+    local delay=0.1
+    local spinstr='|/-\'
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+run_with_spinner() {
+    local msg="$1"
+    shift
+    info "$msg"
+    "$@" > /tmp/xdp_install.log 2>&1 &
+    local pid=$!
+    spinner $pid
+    wait $pid
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${RED}[FAIL]${NC}"
+        die "Command failed: $*\nCheck /tmp/xdp_install.log for details."
+    else
+        echo -e "${GREEN}[DONE]${NC}"
+    fi
+}
+
 # ── Settings ─────────────────────────────────────────────────────
 IFACE="${1:-}"
 XDP_SRC="xdp_firewall.c"
@@ -46,10 +78,14 @@ done
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Missing dependency: ${MISSING[*]}, Installing..."
+
+    run_with_spinner "Updating system repositories..." \
     apt-get update -qq
 
+    run_with_spinner "Installing core build tools (clang, llvm, etc.)..." \
     apt-get install -y -qq clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
 
+    run_with_spinner "Installing kernel specific tools (bpftool)..." \
     info "Installing specific kernel tools..."
     apt-get install -y -qq linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
 
