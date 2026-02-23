@@ -54,6 +54,8 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
         bpftool \
         build-essential \
         iproute2 \
+        linux-tools-common \ 
+        linux-tools-generic \
         python3 \
         gcc-multilib 2>/dev/null || true
     command -v bpftool &>/dev/null || apt-get install -y -qq linux-tools-"$(uname -r)" 2>/dev/null || true
