@@ -46,8 +46,8 @@ done
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Missing dependency: ${MISSING[*]}, Installing..."
-    apt-get update -qq
-    apt-get install -y -qq \
+    apt-get update
+    apt-get install -y \
         clang llvm \
         linux-headers-"$(uname -r)" \
         libbpf-dev \
@@ -61,7 +61,7 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     command -v bpftool &>/dev/null || apt-get install -y -qq linux-tools-"$(uname -r)" || true
     command -v bpftool &>/dev/null || die "bpftool Installation failed. Please install manually"
 else
-    apt-get install -y -qq gcc-multilib 2>/dev/null || true
+    apt-get install -y -qq gcc-multilib || true
 fi
 ok "Dependency check completed"
 
