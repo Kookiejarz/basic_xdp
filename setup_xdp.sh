@@ -46,22 +46,23 @@ done
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     warn "Missing dependency: ${MISSING[*]}, Installing..."
-    apt-get update
-    apt-get install -y \
-        clang llvm \
-        linux-headers-"$(uname -r)" \
-        libbpf-dev \
-        bpftool \
-        build-essential \
-        iproute2 \
-        linux-tools-common \ 
-        linux-tools-generic \
-        python3 \
-        gcc-multilib || true
-    command -v bpftool &>/dev/null || apt-get install -y -qq linux-tools-"$(uname -r)" || true
-    command -v bpftool &>/dev/null || die "bpftool Installation failed. Please install manually"
-else
-    apt-get install -y -qq gcc-multilib || true
+    apt-get update -qq
+
+    apt-get install -y clang llvm libbpf-dev build-essential iproute2 python3 gcc-multilib || true
+
+    info "Installing specific kernel tools..."
+    apt-get install -y linux-tools-common linux-tools-generic linux-tools-$(uname -r) linux-headers-$(uname -r) || true
+
+    if ! command -v bpftool &>/dev/null; then
+        REAL_BPFTOOL=$(find /usr/lib/linux-tools -name bpftool -type f -executable -print -quit 2>/dev/null || true)
+        if [[ -n "$REAL_BPFTOOL" ]]; then
+            ln -sf "$REAL_BPFTOOL" /usr/local/bin/bpftool
+            ok "Found bpftool at $REAL_BPFTOOL and created symlink."
+        fi
+    fi
+
+    # 4. Last Check
+    command -v bpftool &>/dev/null || die "bpftool installation failed. Please run: apt install linux-tools-generic"
 fi
 ok "Dependency check completed"
 
