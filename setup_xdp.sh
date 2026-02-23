@@ -81,6 +81,10 @@ case "$ARCH" in
 esac
 if [[ ! -d "$ASM_INC" ]]; then
     ASM_INC="/usr/src/linux-headers-$(uname -r)/arch/x86/include/generated"
+elif [[ -d "/usr/include/asm" ]]; then
+    ASM_INC="/usr/include"
+else
+    ASM_INC=$(find /usr/src -name "asm" -type d -print -quit | xargs dirname 2>/dev/null || echo "")
 fi
 [[ -d "$ASM_INC" ]] || die "The asm header file directory cannot be found: apt install gcc-multilib"
 info "Using the ASM header file directory: $ASM_INC"
