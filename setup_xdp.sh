@@ -178,10 +178,10 @@ fetch_or_keep "$XDP_SRC"
 info "Compiling $XDP_SRC ..."
 ARCH=$(uname -m)
 case "$ARCH" in
-    x86_64)  ASM_INC="/usr/include/x86_64-linux-gnu" ;;
-    aarch64) ASM_INC="/usr/include/aarch64-linux-gnu" ;;
-    armv7*)  ASM_INC="/usr/include/arm-linux-gnueabihf" ;;
-    *)       ASM_INC="/usr/include/${ARCH}-linux-gnu" ;;
+    x86_64)  ASM_INC="/usr/include/x86_64-linux-gnu";  TARGET_ARCH="x86" ;;
+    aarch64) ASM_INC="/usr/include/aarch64-linux-gnu";  TARGET_ARCH="arm64" ;;
+    armv7*)  ASM_INC="/usr/include/arm-linux-gnueabihf"; TARGET_ARCH="arm" ;;
+    *)       ASM_INC="/usr/include/${ARCH}-linux-gnu";   TARGET_ARCH="${ARCH}" ;;
 esac
 if [[ ! -d "$ASM_INC" ]]; then
     ASM_INC="/usr/src/linux-headers-$(uname -r)/arch/x86/include/generated"
@@ -193,9 +193,12 @@ fi
 [[ -d "$ASM_INC" ]] || die "The asm header file directory cannot be found: apt install gcc-multilib"
 info "Using the ASM header file directory: $ASM_INC"
 
-clang -O2 -g \
+clang -O3 -g \
     -target bpf \
-    -D__TARGET_ARCH_x86 \
+    -mcpu=v3 \
+    -D__TARGET_ARCH_${TARGET_ARCH} \
+    -fno-stack-protector \
+    -Wall -Wno-unused-value \
     -I/usr/include \
     -I"$ASM_INC" \
     -I/usr/include/bpf \
@@ -306,17 +309,15 @@ def get_listening_ports() -> PortState:
     return state
 
 def port_to_key(port: int):
-    # 主机字节序写入，对应 XDP 中 bpf_ntohs(tcp->dest)
+    # ARRAY map key = __u32 (4 bytes, little-endian host byte order)
     lo = port & 0xFF
     hi = (port >> 8) & 0xFF
-    return [f"0x{lo:02x}", f"0x{hi:02x}"]
+    return [f"0x{lo:02x}", f"0x{hi:02x}", "0x00", "0x00"]
 
 def map_update(map_path, port, dry_run):
-    # 直接用主机字节序写入 key
-    lo = port & 0xFF
-    hi = (port >> 8) & 0xFF
+    # ARRAY map key = __u32 (4 bytes, little-endian host byte order)
     cmd = ["bpftool", "map", "update", "pinned", map_path,
-           "key", f"0x{lo:02x}", f"0x{hi:02x}",
+           "key", *port_to_key(port),
            "value", "0x01", "0x00", "0x00", "0x00"]
     if dry_run:
         log.info(f"[DRY] {' '.join(cmd)}")
@@ -329,15 +330,18 @@ def map_update(map_path, port, dry_run):
         return False
 
 def map_delete(map_path, port, dry_run):
-    cmd = ["bpftool", "map", "delete", "pinned", map_path,
-           "key", *port_to_key(port)]
+    # ARRAY maps do not support deletion; zero out the value instead.
+    cmd = ["bpftool", "map", "update", "pinned", map_path,
+           "key", *port_to_key(port),
+           "value", "0x00", "0x00", "0x00", "0x00"]
     if dry_run:
         log.info(f"[DRY] {' '.join(cmd)}")
         return True
     try:
         subprocess.check_call(cmd, stderr=subprocess.PIPE)
         return True
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        log.warning(f"delete (zero) failed port={port}: {e}")
         return False
 
 def map_dump_ports(map_path) -> set:
@@ -351,11 +355,16 @@ def map_dump_ports(map_path) -> set:
         entries = json.loads(out)
         ports = set()
         for e in entries:
+            # ARRAY map dumps ALL 65536 entries; skip zero-value (unset) slots.
+            v = e.get("value", 0)
+            val = v if isinstance(v, int) else \
+                  (int(v[0], 16) if isinstance(v, list) and v else 0)
+            if not val:
+                continue
             k = e.get("key")
-            # bpftool 无 -j 原始字节时返回整数
             if isinstance(k, int):
                 ports.add(k)
-            elif isinstance(k, list) and len(k) == 2:
+            elif isinstance(k, list) and len(k) >= 2:
                 b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
                 b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
                 ports.add(b0 | (b1 << 8))
@@ -465,14 +474,21 @@ try:
     data = json.load(sys.stdin)
     items = data if isinstance(data, list) else data.get('items', [])
     for e in items:
-        if isinstance(e, dict):
-            k = e.get('key')
-            if isinstance(k, int):
-                print(f'    → TCP {k}')
-            elif isinstance(k, list) and len(k) >= 2:
-                b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
-                b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
-                print(f'    → TCP {b0 | (b1 << 8)}')
+        if not isinstance(e, dict):
+            continue
+        # Skip zero-value (unset) ARRAY slots
+        v = e.get('value', 0)
+        val = v if isinstance(v, int) else \
+              (int(v[0], 16) if isinstance(v, list) and v else 0)
+        if not val:
+            continue
+        k = e.get('key')
+        if isinstance(k, int):
+            print(f'    → TCP {k}')
+        elif isinstance(k, list) and len(k) >= 2:
+            b0 = int(k[0], 16) if isinstance(k[0], str) else k[0]
+            b1 = int(k[1], 16) if isinstance(k[1], str) else k[1]
+            print(f'    → TCP {b0 | (b1 << 8)}')
 except:
     pass
 " || echo "    (NULL)"

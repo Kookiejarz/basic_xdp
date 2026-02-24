@@ -10,21 +10,23 @@
 #include <bpf/bpf_endian.h>
 
 // ============================================================
-// BPF Map：运行时可热更新的 TCP/UDP 端口白名单
+// BPF Map：运行时可热更新的 TCP/UDP 端口白名单（ARRAY 实现）
+// ARRAY Map 以端口号（主机字节序）作为数组下标（__u32 key），
+// max_entries = 65536 覆盖全部合法端口。
 // 用法：bpftool map update pinned /sys/fs/bpf/tcp_whitelist \
-//         key 0x50 0x00 value 0x01 0x00 0x00 0x00
+//         key 0x50 0x00 0x00 0x00 value 0x01 0x00 0x00 0x00
 // ============================================================
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 64);
-    __type(key, __u16);   // 网络字节序端口号
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);   // 主机字节序端口号作为数组下标
     __type(value, __u32);  // 1 = 放行
 } tcp_whitelist SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 16);
-    __type(key, __u16);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 65536);
+    __type(key, __u32);   // 主机字节序端口号作为数组下标
     __type(value, __u32);
 } udp_whitelist SEC(".maps");
 
@@ -36,7 +38,9 @@ static __always_inline int check_tcp(void *trans_data, void *data_end) {
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    __u8 tcp_flags = ((__u8 *)tcp)[13];
+    // 函数开头一次性完成字节序转换，后续逻辑统一使用主机字节序
+    __u8  tcp_flags = ((__u8 *)tcp)[13];
+    __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
 
     // 优先放行已建立连接的回包（ACK/SYN-ACK/FIN/RST）
     //    回包的 dest_port 是客户端随机端口，不在白名单，必须在白名单检查前放行
@@ -44,7 +48,6 @@ static __always_inline int check_tcp(void *trans_data, void *data_end) {
         return XDP_PASS;
 
     // 只有纯 SYN（0x02，无 ACK）才查白名单
-    __u16 dest_port = bpf_ntohs(tcp->dest);
     __u32 *allow = bpf_map_lookup_elem(&tcp_whitelist, &dest_port);
     if (allow && *allow)
         return XDP_PASS;
@@ -60,15 +63,19 @@ static __always_inline int check_udp(void *trans_data, void *data_end) {
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
-    if (udp->source == bpf_htons(53)  ||
-        udp->source == bpf_htons(123) ||
-        udp->source == bpf_htons(67)  ||
-        udp->source == bpf_htons(443))
+    // 函数开头一次性完成字节序转换：
+    //   原来 source 侧用 4 次 bpf_htons() 做比较，现在只需 1 次 bpf_ntohs()
+    __u16 src_port  = bpf_ntohs(udp->source);
+    __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
+
+    // 放行常见 UDP 响应（DNS / NTP / DHCP / QUIC）
+    if (src_port == 53  ||
+        src_port == 123 ||
+        src_port == 67  ||
+        src_port == 443)
         return XDP_PASS;
 
-    // 同样转换为主机字节序查询
-    __u16 dest_port = bpf_ntohs(udp->dest);
-    __u8 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
+    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow)
         return XDP_PASS;
 
