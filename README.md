@@ -1,4 +1,6 @@
-### Basic XDP
+## **⚡ Basic XDP**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE) [![Kernel](https://img.shields.io/badge/Kernel-%E2%89%A54.18-blue)](https://www.kernel.org/) [![Platform](https://img.shields.io/badge/Platform-Debian%20%7C%20Ubuntu-orange)](https://ubuntu.com/) [![XDP](https://img.shields.io/badge/Tech-eBPF%2FXDP-brightgreen)](https://ebpf.io/)
 
 A lightweight, high-performance XDP/eBPF-based rule for Linux that provides **automatic port whitelisting** and **basic DDoS protection** for personal cloud instances.
 
@@ -13,6 +15,12 @@ Although there are some XDP firewall solutions available, Basic XDP provides use
 ### What is XDP?
 
 **XDP (eXpress Data Path)** is an eBPF-based, high-performance packet processing path that runs **before packets enter the Linux networking stack** (at the NIC driver level). This makes it significantly faster than traditional `iptables`/`nftables` filtering.
+
+### Why Basic XDP?
+
+Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` work, but they process packets *after* the kernel networking stack — adding latency and CPU overhead.
+
+**Basic XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the BPF maps in sync automatically. You never need to manually update firewall rules when you start or stop a service. 😎
 
 ---
 
@@ -267,5 +275,26 @@ sudo bpftool prog run id "$PROG_ID" repeat 100000000 data_in /tmp/pkt.bin
 
 ---
 
-## License](./LICENSE)
+##  📁 Project Structure
+
+basic_xdp/
+├── xdp_firewall.c      # eBPF/XDP kernel program (packet filtering logic)
+├── setup_xdp.sh        # One-click deploy: compile, load, and start daemon
+└── README.md
+
+
+## 🤝 **Contributing**
+
+Contributions are welcome! If you have a bug fix, performance improvement, or new feature in mind: 
+
+1. Fork the repository 
+2. Create a feature branch (`git checkout -b feature/my-improvement`) 
+3. Commit your changes
+4. Open a pull request For bugs or questions, please [open an issue](https://github.com/Kookiejarz/basic_xdp/issues).
+
+---
+
+## 📄 License
+
+[MIT](./LICENSE) © 2026 Yunheng Liu
 
