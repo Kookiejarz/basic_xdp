@@ -235,42 +235,62 @@ systemctl daemon-reload
 
 ---
 
-## Benchmarks
+## **📊 Real-World Performance Benchmark**
 
-Measured with `bpftool prog run ... repeat N data_in <packet>` against the JIT-compiled XDP program. Return value `2` = `XDP_DROP` (fast-path hit).
+This benchmark simulates a volumetric UDP flood attack. We used a high-performance **AMD EPYC™ 7Y43** server as the "Attacker" to stress-test a **1 vCPU AMD Ryzen 9 3900X** instance protected by Basic XDP.
 
-| Host | CPU | vCPUs | Packet input | Repeat | Avg latency |
-|:----:|:---:|:-----:|:------------:|:------:|:-----------:|
-| VPS A | Intel Xeon Platinum 8160M @ 2.10 GHz (KVM) | 2 | synthetic (no `data_in`) | 100 000 000 | **65 ns** |
-| VPS B | AMD Ryzen 9 3900X @ 2.0 GHz (KVM) | 1 | 30-byte IPv4 pkt (`data_in`) | 1 000 000 000 | **40 ns** |
-| VPS C | AMD EPYC 7Y43 @ 2.55GHz (KVM) | 1 | 30-byte IPv4 pkt (`data_in`) | 1 000 000 000 | **34 ns** |
+### **Test Environment**
 
-> **Note — `data_in` matters.**  
-> Without `data_in` the runner feeds a zero-length buffer; the BPF program returns immediately at the first bounds check (`data_end` == `data`), so the measurement reflects JIT dispatch overhead more than real packet-processing logic.  
-> The 40ns and 34 ns figure (VPS B and VPS C, with a real IPv4 frame) are the more representative numbers.
++ **Attacker**: AMD EPYC™ 7Y43 @ 2.55GHz (Generating ~367k PPS / 188 Mbps)
++ **Target (Receiver)**: AMD Ryzen 9 3900X @ 2.0GHz (1 vCPU, 1GB RAM)
++ **Tool**: `pktgen` (Linux Kernel Packet Generator)
 
-### Theoretical throughput (single core, `XDP_DROP` fast path)
+### **Comparative Results**
 
-| Avg latency | Packets / second |
-|:-----------:|:----------------:|
-| 65 ns | ≈ **15.4 Mpps** |
-| 40 ns | ≈ **25.0 Mpps** |
-| 34 ns | ≈ **29.4 Mpps** |
+| Metric                     | Basic XDP **OFF**         | Basic XDP **ON**        | Improvement        |
+| -------------------------- | ------------------------- | ----------------------- | ------------------ |
+| **Softirq (si) CPU Usage** | **85.9%**                 | **3.0%**                | **~28x Reduction** |
+| **System Responsiveness**  | Extremely Laggy           | **Smooth**              | Significant        |
+| **Packet Handling**        | Processed by Kernel Stack | Dropped at Driver Level | -                  |
 
-> Real-world NIC throughput will be the practical ceiling; the XDP program itself is not the bottleneck.
+> When XDP is off, the kernel networking stack processes every incoming packet, consuming nearly all CPU via soft interrupts. With XDP on, packets are dropped at the NIC driver level before reaching the stack — the same 367k PPS flood only uses 3% CPU, and the machine stays fully responsive.
+
+**XDP OFF** — softirq at 85.9% under flood:
+
+![XDP OFF](https://s3.liuu.org/blog/uPic/Screenshot%202026-02-27%20at%205.35.30%E2%80%AFPM.png)
+
+**XDP ON** — same flood, CPU drops to 3.0%:
+
+![XDP ON](https://s3.liuu.org/blog/uPic/Screenshot%202026-02-27%20at%205.37.43%E2%80%AFPM.png)
+
+**XDP ON** — before attack:
+
+![XDP ON, before attack](https://s3.liuu.org/blog/uPic/Screenshot%202026-02-27%20at%205.38.05%E2%80%AFPM.png)
+
+**XDP ON** — after attack:
+
+![XDP ON, After attack](https://s3.liuu.org/blog/uPic/Screenshot%202026-02-27%20at%205.38.14%E2%80%AFPM.png)
+
+---
 
 ### How to reproduce
 
 ```bash
-# Build a minimal IPv4 packet (Ethernet header + IPv4 header, no payload)
-python3 -c 'print("00"*14 + "45000028" + "00"*16)' | xxd -r -p > /tmp/pkt.bin
+# Load the kernel module
+modprobe pktgen
 
-# Get the program ID
-PROG_ID=$(bpftool -j prog show pinned /sys/fs/bpf/xdp_fw/prog \
-          | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# Configure the device (replace enp3s0 with your interface name)
+PGDEV=/proc/net/pktgen/INTERFACE
 
-# Run 100 M iterations with a real packet
-sudo bpftool prog run id "$PROG_ID" repeat 100000000 data_in /tmp/pkt.bin
+echo "rem_device_all" > /proc/net/pktgen/kpktgend_0
+echo "add_device INTERFACE" > /proc/net/pktgen/kpktgend_0
+
+# Set attack parameters
+echo "count 10000000" > $PGDEV             # Send 10 million packets
+echo "pkt_size 64" > $PGDEV                # Small packets put more stress on the CPU
+echo "dst TARGET_IP" > $PGDEV         # Target IP
+echo "dst_mac TARGET_MAC" > $PGDEV  # Target MAC
+echo "clone_skb 100" > $PGDEV              # Speed up packet generation
 ```
 
 
@@ -289,4 +309,10 @@ Contributions are welcome! If you have a bug fix, performance improvement, or ne
 ## 📄 License
 
 [MIT](./LICENSE) © 2026 Yunheng Liu
+
+
+
+
+
+
 
