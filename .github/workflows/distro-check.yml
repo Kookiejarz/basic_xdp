@@ -50,7 +50,7 @@ jobs:
             install: dnf -y install bash curl git ca-certificates iproute
           - name: rockylinux
             image: rockylinux:9
-            install: dnf -y install bash curl git ca-certificates iproute
+            install: dnf -y --allowerasing install bash curl git ca-certificates iproute
     container:
       image: ${{ matrix.image }}
     steps:
