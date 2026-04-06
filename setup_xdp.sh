@@ -28,6 +28,9 @@ BXDP_CMD="/usr/local/bin/bxdp"
 RUNNER_SCRIPT="/usr/local/bin/basic_xdp_start.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
 TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
+BPF_HELPER_SRC="basic_xdp_bpf_helpers.py"
+BPF_HELPER_INSTALLED="${INSTALL_DIR}/basic_xdp_bpf_helpers.py"
+BPF_HELPER_BOOTSTRAP=""
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
@@ -543,17 +546,13 @@ cleanup_existing_xdp() {
 
 pin_program_maps() {
     local prog_id="$1"
-    bpftool -j prog show id "$prog_id" | python3 -c "
-import json, subprocess, sys, os
-prog = json.load(sys.stdin)
-pin_dir = os.environ['BPF_PIN_DIR']
-for map_id in prog.get('map_ids', []):
-    info = json.loads(subprocess.check_output(['bpftool', '-j', 'map', 'show', 'id', str(map_id)]))
-    name = info.get('name', f'map_{map_id}')
-    pin_path = f'{pin_dir}/{name}'
-    subprocess.check_call(['bpftool', 'map', 'pin', 'id', str(map_id), pin_path])
-    print(f'  pinned [{name}] -> {pin_path}')
-" || return 1
+    [[ -n "$BPF_HELPER_BOOTSTRAP" ]] || {
+        warn "BPF helper is not available for bootstrap pinning."
+        return 1
+    }
+    "$PYTHON3_BIN" "$BPF_HELPER_BOOTSTRAP" pin-maps \
+        --prog-id "$prog_id" \
+        --pin-dir "$BPF_PIN_DIR" || return 1
 }
 
 seed_existing_tcp_conntrack() {
@@ -562,102 +561,14 @@ seed_existing_tcp_conntrack() {
 
     [[ -e "$map_path" ]] || return 0
 
+    [[ -n "$BPF_HELPER_BOOTSTRAP" ]] || {
+        warn "BPF helper is not available for conntrack seeding."
+        return 0
+    }
+
     # Pre-seed established TCP flows so reloading XDP does not cut off
     # existing sessions before a fresh SYN can recreate conntrack state.
-    if ! seeded=$("$PYTHON3_BIN" - "$map_path" <<'PY'
-import ctypes
-import ctypes.util
-import os
-import platform
-import socket
-import struct
-import sys
-import time
-
-try:
-    import psutil
-except ImportError:
-    print(0)
-    sys.exit(0)
-
-NR_BPF = {
-    "x86_64": 321,
-    "aarch64": 280,
-    "armv7l": 386,
-    "armv6l": 386,
-}.get(platform.machine(), 321)
-BPF_MAP_UPDATE_ELEM = 2
-BPF_OBJ_GET = 7
-
-libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-def bpf(cmd, attr):
-    ret = libc.syscall(NR_BPF, ctypes.c_int(cmd), attr, ctypes.c_uint(len(attr)))
-    if ret < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    return ret
-
-def obj_get(path):
-    path_b = ctypes.create_string_buffer(path.encode() + b"\x00")
-    attr = ctypes.create_string_buffer(128)
-    struct.pack_into("=Q", attr, 0, ctypes.cast(path_b, ctypes.c_void_p).value or 0)
-    return bpf(BPF_OBJ_GET, attr)
-
-def iter_established_tcp():
-    getter = getattr(psutil, "connections", psutil.net_connections)
-    for conn in getter(kind="inet"):
-        if getattr(conn, "family", None) not in (socket.AF_INET, socket.AF_INET6):
-            continue
-        if getattr(conn, "type", None) != socket.SOCK_STREAM:
-            continue
-        if conn.status != psutil.CONN_ESTABLISHED:
-            continue
-        if not conn.laddr or not conn.raddr:
-            continue
-        yield conn
-
-def pack_ct_key(conn):
-    if conn.family == socket.AF_INET:
-        family = socket.AF_INET
-        remote_ip = socket.inet_aton(conn.raddr.ip) + (b"\x00" * 12)
-        local_ip = socket.inet_aton(conn.laddr.ip) + (b"\x00" * 12)
-    else:
-        family = socket.AF_INET6
-        remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
-        local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
-    return struct.pack("!B3xHH16s16s", family, conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-
-fd = obj_get(sys.argv[1])
-key = ctypes.create_string_buffer(40)
-value = ctypes.create_string_buffer(8)
-attr = ctypes.create_string_buffer(128)
-struct.pack_into(
-    "=I4xQQQ",
-    attr,
-    0,
-    fd,
-    ctypes.cast(key, ctypes.c_void_p).value or 0,
-    ctypes.cast(value, ctypes.c_void_p).value or 0,
-    0,
-)
-
-seeded = 0
-stamp = time.monotonic_ns()
-for conn in iter_established_tcp():
-    try:
-        packed = pack_ct_key(conn)
-        ctypes.memmove(key, packed, len(packed))
-        struct.pack_into("=Q", value, 0, stamp)
-        bpf(BPF_MAP_UPDATE_ELEM, attr)
-        seeded += 1
-    except OSError:
-        continue
-
-os.close(fd)
-print(seeded)
-PY
-); then
+    if ! seeded=$("$PYTHON3_BIN" "$BPF_HELPER_BOOTSTRAP" seed-tcp-conntrack --map-path "$map_path"); then
         warn "Failed to pre-seed tcp_conntrack; established sessions may reconnect."
         return 0
     fi
@@ -665,6 +576,19 @@ PY
     if [[ "$seeded" != "0" ]]; then
         info "Seeded ${seeded} existing TCP session(s) into tcp_conntrack."
     fi
+}
+
+ensure_bpf_helper_bootstrap() {
+    local helper_path="$BPF_HELPER_SRC"
+    if [[ ! -f "$helper_path" ]]; then
+        helper_path=$(mktemp)
+    fi
+    if ! fetch_local_or_remote "$BPF_HELPER_SRC" "$BPF_HELPER_SRC" "$helper_path"; then
+        warn "Failed to fetch ${BPF_HELPER_SRC}; helper-based map operations will be unavailable."
+        return 1
+    fi
+    BPF_HELPER_BOOTSTRAP="$helper_path"
+    return 0
 }
 
 load_tc_egress_program() {
@@ -805,6 +729,11 @@ deploy_xdp_backend() {
         rm -rf "$BPF_PIN_DIR"
         return 1
     fi
+    if ! xdp_maps_ready; then
+        warn "Pinned XDP maps are incomplete after pinning; falling back from XDP."
+        rm -rf "$BPF_PIN_DIR"
+        return 1
+    fi
 
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
@@ -867,6 +796,7 @@ BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${XDP_OBJ_INSTALLED}"
 TC_OBJ_PATH="${TC_OBJ_INSTALLED}"
 PREFERRED_BACKEND="auto"
+BPF_HELPER_SCRIPT="${BPF_HELPER_INSTALLED}"
 export BPF_PIN_DIR
 EOF_CFG
 }
@@ -895,15 +825,7 @@ ensure_bpffs() {
 
 pin_program_maps() {
     local prog_id="$1"
-    bpftool -j prog show id "$prog_id" | python3 -c '
-import json, os, subprocess, sys
-prog = json.load(sys.stdin)
-pin_dir = os.environ["BPF_PIN_DIR"]
-for map_id in prog.get("map_ids", []):
-    info = json.loads(subprocess.check_output(["bpftool", "-j", "map", "show", "id", str(map_id)]))
-    name = info.get("name", f"map_{map_id}")
-    subprocess.check_call(["bpftool", "map", "pin", "id", str(map_id), f"{pin_dir}/{name}"])
-' >/dev/null
+    "$PYTHON3_BIN" "$BPF_HELPER_SCRIPT" pin-maps --prog-id "$prog_id" --pin-dir "$BPF_PIN_DIR" >/dev/null
 }
 
 cleanup_tc_egress_filter() {
@@ -933,89 +855,7 @@ seed_existing_tcp_conntrack() {
 
     [[ -e "$map_path" ]] || return 0
 
-    if ! seeded=$("$PYTHON3_BIN" - "$map_path" <<'PY'
-import ctypes
-import ctypes.util
-import os
-import platform
-import socket
-import struct
-import sys
-import time
-
-try:
-    import psutil
-except ImportError:
-    print(0)
-    sys.exit(0)
-
-NR_BPF = {
-    "x86_64": 321,
-    "aarch64": 280,
-    "armv7l": 386,
-    "armv6l": 386,
-}.get(platform.machine(), 321)
-BPF_MAP_UPDATE_ELEM = 2
-BPF_OBJ_GET = 7
-libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-def bpf(cmd, attr):
-    ret = libc.syscall(NR_BPF, ctypes.c_int(cmd), attr, ctypes.c_uint(len(attr)))
-    if ret < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    return ret
-
-def obj_get(path):
-    path_b = ctypes.create_string_buffer(path.encode() + b"\x00")
-    attr = ctypes.create_string_buffer(128)
-    struct.pack_into("=Q", attr, 0, ctypes.cast(path_b, ctypes.c_void_p).value or 0)
-    return bpf(BPF_OBJ_GET, attr)
-
-def iter_established_tcp():
-    getter = getattr(psutil, "connections", psutil.net_connections)
-    for conn in getter(kind="inet"):
-        if getattr(conn, "family", None) not in (socket.AF_INET, socket.AF_INET6):
-            continue
-        if getattr(conn, "type", None) != socket.SOCK_STREAM:
-            continue
-        if conn.status != psutil.CONN_ESTABLISHED:
-            continue
-        if not conn.laddr or not conn.raddr:
-            continue
-        yield conn
-
-def pack_ct_key(conn):
-    if conn.family == socket.AF_INET:
-        family = socket.AF_INET
-        remote_ip = socket.inet_aton(conn.raddr.ip) + (b"\x00" * 12)
-        local_ip = socket.inet_aton(conn.laddr.ip) + (b"\x00" * 12)
-    else:
-        family = socket.AF_INET6
-        remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
-        local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
-    return struct.pack("!B3xHH16s16s", family, conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-
-fd = obj_get(sys.argv[1])
-key = ctypes.create_string_buffer(40)
-value = ctypes.create_string_buffer(8)
-attr = ctypes.create_string_buffer(128)
-struct.pack_into("=I4xQQQ", attr, 0, fd, ctypes.cast(key, ctypes.c_void_p).value or 0, ctypes.cast(value, ctypes.c_void_p).value or 0, 0)
-seeded = 0
-stamp = time.monotonic_ns()
-for conn in iter_established_tcp():
-    try:
-        packed = pack_ct_key(conn)
-        ctypes.memmove(key, packed, len(packed))
-        struct.pack_into("=Q", value, 0, stamp)
-        bpf(BPF_MAP_UPDATE_ELEM, attr)
-        seeded += 1
-    except OSError:
-        continue
-os.close(fd)
-print(seeded)
-PY
-); then
+    if ! seeded=$("$PYTHON3_BIN" "$BPF_HELPER_SCRIPT" seed-tcp-conntrack --map-path "$map_path"); then
         echo "[basic_xdp] failed to pre-seed tcp_conntrack" >&2
         return 0
     fi
@@ -1081,6 +921,11 @@ ensure_xdp_loaded() {
         cleanup_failed_load
         return 1
     }
+    xdp_maps_ready || {
+        echo "[basic_xdp] pinned XDP maps incomplete after pinning; fallback to nftables" >&2
+        cleanup_failed_load
+        return 1
+    }
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
 
@@ -1133,6 +978,13 @@ install_sync_script() {
     chmod +x "$SYNC_SCRIPT"
 }
 
+install_bpf_helper() {
+    if ! fetch_local_or_remote "$BPF_HELPER_SRC" "$BPF_HELPER_SRC" "$BPF_HELPER_INSTALLED"; then
+        die "Failed to install ${BPF_HELPER_SRC}"
+    fi
+    chmod +x "$BPF_HELPER_INSTALLED"
+}
+
 install_bxdp_command() {
     if ! fetch_local_or_remote "bxdp" "bxdp" "$BXDP_CMD"; then
         die "Failed to install bxdp"
@@ -1144,6 +996,7 @@ install_runtime_files() {
     info "Installing runtime files..."
     mkdir -p "$INSTALL_DIR"
     install_sync_script
+    install_bpf_helper
     install_bxdp_command
     write_config
     write_runner_script
@@ -1251,6 +1104,8 @@ command -v ip &>/dev/null || die "ip command not found after installation."
 ensure_psutil
 PYTHON3_BIN=$(command -v python3)
 ok "Base dependencies satisfied."
+
+ensure_bpf_helper_bootstrap || true
 
 if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
     warn "bpftool or clang still missing; XDP backend may be unavailable."

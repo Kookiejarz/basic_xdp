@@ -82,8 +82,10 @@ _NR_BPF: int = {
     "armv6l": 386,
 }.get(platform.machine(), 321)
 
+_BPF_MAP_LOOKUP_ELEM = 1
 _BPF_MAP_UPDATE_ELEM = 2
 BPF_MAP_DELETE_ELEM = 3
+_BPF_MAP_GET_NEXT_KEY = 4
 _BPF_OBJ_GET = 7
 
 
@@ -127,10 +129,13 @@ class BpfArrayMap:
 
         self._key = ctypes.create_string_buffer(4)
         self._val = ctypes.create_string_buffer(4)
-        self._attr = ctypes.create_string_buffer(128)
+        self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
         v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
-        struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
+        self._load_cache()
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -146,7 +151,20 @@ class BpfArrayMap:
     def _update(self, port: int, val: int) -> None:
         struct.pack_into("=I", self._key, 0, port)
         struct.pack_into("=I", self._val, 0, val)
-        _bpf(_BPF_MAP_UPDATE_ELEM, self._attr)
+        _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
+
+    def _lookup(self, port: int) -> int:
+        struct.pack_into("=I", self._key, 0, port)
+        _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+        return struct.unpack_from("=I", self._val, 0)[0]
+
+    def _load_cache(self) -> None:
+        for port in range(65536):
+            try:
+                if self._lookup(port):
+                    self._cache.add(port)
+            except OSError:
+                continue
 
     def active_ports(self) -> set[int]:
         return set(self._cache)
@@ -174,13 +192,20 @@ class BpfHashMap:
         self._cache: set[str] = set()
 
         self._key = ctypes.create_string_buffer(4)
+        self._next_key = ctypes.create_string_buffer(4)
         self._val = ctypes.create_string_buffer(4)
         self._update_attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
         self._delete_attr = ctypes.create_string_buffer(128)
+        self._next_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
         v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
         struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
+        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
+        self._load_cache()
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -204,6 +229,37 @@ class BpfHashMap:
     def _delete(self, ip_str: str) -> None:
         self._pack_ip(ip_str)
         _bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+
+    def _lookup_raw_key(self, key_raw: bytes) -> int:
+        ctypes.memmove(self._key, key_raw, 4)
+        _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+        return struct.unpack_from("=I", self._val, 0)[0]
+
+    def _iter_raw_keys(self):
+        current_ptr = 0
+        while True:
+            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
+            try:
+                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    break
+                raise
+            key_raw = bytes(self._next_key.raw[:4])
+            yield key_raw
+            ctypes.memmove(self._key, key_raw, 4)
+            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+
+    def _load_cache(self) -> None:
+        try:
+            for key_raw in self._iter_raw_keys():
+                try:
+                    if self._lookup_raw_key(key_raw):
+                        self._cache.add(socket.inet_ntoa(key_raw))
+                except OSError:
+                    continue
+        except OSError:
+            return
 
     def active_keys(self) -> set[str]:
         return set(self._cache)
@@ -250,11 +306,16 @@ class BpfConntrackMap:
         self._cache: set[bytes] = set()
 
         self._key = ctypes.create_string_buffer(40)
+        self._next_key = ctypes.create_string_buffer(40)
         self._val = ctypes.create_string_buffer(8)
         self._attr = ctypes.create_string_buffer(128)
+        self._next_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
         v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
         struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
+        self._load_cache()
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -269,6 +330,28 @@ class BpfConntrackMap:
 
     def active_keys(self) -> set[bytes]:
         return set(self._cache)
+
+    def _iter_raw_keys(self):
+        current_ptr = 0
+        while True:
+            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
+            try:
+                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    break
+                raise
+            key_raw = bytes(self._next_key.raw[:40])
+            yield key_raw
+            ctypes.memmove(self._key, key_raw, 40)
+            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+
+    def _load_cache(self) -> None:
+        try:
+            for key_raw in self._iter_raw_keys():
+                self._cache.add(key_raw)
+        except OSError:
+            return
 
     def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
         if dry_run:
@@ -327,43 +410,50 @@ class XdpBackend(PortBackend):
         dry_run: bool,
     ) -> None:
         changed = False
+        tcp_permanent = set(TCP_PERMANENT)
+        udp_permanent = set(UDP_PERMANENT)
+        trusted_permanent = set(TRUSTED_SRC_IPS)
+        active_tcp = self.tcp_map.active_ports()
+        active_udp = self.udp_map.active_ports()
+        active_trusted = self.trusted_map.active_keys()
+        active_conntrack = self.conntrack_map.active_keys()
 
-        for port in sorted(tcp_target - self.tcp_map.active_ports()):
+        for port in sorted(tcp_target - active_tcp):
             tag = f" [{TCP_PERMANENT[port]}]" if port in TCP_PERMANENT else ""
             if self.tcp_map.set(port, 1, dry_run):
                 log.debug("TCP +%d%s", port, tag)
                 changed = True
 
-        for port in sorted(self.tcp_map.active_ports() - tcp_target - set(TCP_PERMANENT)):
+        for port in sorted(active_tcp - tcp_target - tcp_permanent):
             if self.tcp_map.set(port, 0, dry_run):
                 log.debug("TCP -%d  (stopped)", port)
                 changed = True
 
-        for port in sorted(udp_target - self.udp_map.active_ports()):
+        for port in sorted(udp_target - active_udp):
             tag = f" [{UDP_PERMANENT[port]}]" if port in UDP_PERMANENT else ""
             if self.udp_map.set(port, 1, dry_run):
                 log.debug("UDP +%d%s", port, tag)
                 changed = True
 
-        for port in sorted(self.udp_map.active_ports() - udp_target - set(UDP_PERMANENT)):
+        for port in sorted(active_udp - udp_target - udp_permanent):
             if self.udp_map.set(port, 0, dry_run):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
 
         # HASH maps need delete, not write-zero, when trust entries disappear.
-        for ip_str in sorted(trusted_target - self.trusted_map.active_keys()):
+        for ip_str in sorted(trusted_target - active_trusted):
             tag = f" [{TRUSTED_SRC_IPS[ip_str]}]" if ip_str in TRUSTED_SRC_IPS else ""
             if self.trusted_map.set(ip_str, 1, dry_run):
                 log.info("TRUST +%s%s", ip_str, tag)
                 changed = True
 
-        for ip_str in sorted(self.trusted_map.active_keys() - trusted_target - set(TRUSTED_SRC_IPS)):
+        for ip_str in sorted(active_trusted - trusted_target - trusted_permanent):
             if self.trusted_map.delete(ip_str, dry_run):
                 log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
 
         # Periodic conntrack sync (seeding established flows)
-        for flow in sorted(conntrack_target - self.conntrack_map.active_keys()):
+        for flow in sorted(conntrack_target - active_conntrack):
             if self.conntrack_map.set(flow, dry_run):
                 log.debug("CT +flow (established)")
                 changed = True
