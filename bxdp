@@ -1,0 +1,525 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/basic_xdp/basic_xdp.env"
+RUN_STATE_DIR="/run/basic_xdp"
+BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
+NFT_FAMILY="inet"
+NFT_TABLE="basic_xdp"
+NFT_CHAIN="input"
+RUNNER_SCRIPT="/usr/local/bin/basic_xdp_start.sh"
+SERVICE_NAME="xdp-port-sync"
+
+WATCH_MODE=0
+SHOW_RATES=0
+INTERVAL=1
+IFACE=""
+BACKEND=""
+
+declare -A CUR_PACKETS=()
+declare -A CUR_BYTES=()
+declare -A PREV_PACKETS=()
+declare -A PREV_BYTES=()
+declare -a ROW_ORDER=()
+
+usage() {
+    cat <<'EOF'
+Usage: bxdp [command] [options]
+
+Commands:
+  stats [args...]   Show Basic XDP statistics
+  watch [args...]   Shorthand for: stats --watch
+  sync [args...]    Run one sync pass with automatic backend selection
+  start             Start the installed service
+  stop              Stop the installed service
+  restart           Restart the installed service
+  status            Show service status
+  help              Show this help
+
+Stats options:
+  --watch              Refresh continuously
+  --rates              Show packet/bit rate deltas
+  --interval SEC       Refresh / delta interval in seconds (default: 1)
+  --interface IFACE    Override interface autodetection
+
+With no command, bxdp runs: stats
+EOF
+}
+
+run_service_cmd() {
+    local action="$1"
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        exec systemctl "$action" "$SERVICE_NAME"
+    fi
+
+    if command -v rc-service >/dev/null 2>&1; then
+        exec rc-service "$SERVICE_NAME" "$action"
+    fi
+
+    echo "No supported init system detected for service control." >&2
+    exit 1
+}
+
+ensure_installed() {
+    local path="$1"
+    [[ -x "$path" ]] || {
+        echo "Missing executable: $path" >&2
+        exit 1
+    }
+}
+
+parse_stats_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --watch)
+                WATCH_MODE=1
+                shift
+                ;;
+            --rates)
+                SHOW_RATES=1
+                shift
+                ;;
+            --interval)
+                [[ $# -ge 2 ]] || {
+                    echo "Missing value for --interval" >&2
+                    exit 1
+                }
+                INTERVAL="$2"
+                shift 2
+                ;;
+            --interface)
+                [[ $# -ge 2 ]] || {
+                    echo "Missing value for --interface" >&2
+                    exit 1
+                }
+                IFACE="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown stats option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+load_config() {
+    local cli_iface="$IFACE"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1091
+        source "$CONFIG_FILE"
+    fi
+    if [[ -n "$cli_iface" ]]; then
+        IFACE="$cli_iface"
+    fi
+}
+
+autodetect_iface() {
+    if [[ -n "$IFACE" ]]; then
+        return 0
+    fi
+
+    IFACE="${IFACE:-}"
+    if [[ -z "$IFACE" ]]; then
+        IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    fi
+
+    [[ -n "$IFACE" ]] || {
+        echo "Could not detect interface. Use --interface IFACE." >&2
+        exit 1
+    }
+}
+
+detect_backend() {
+    local candidate=""
+
+    if [[ -f "${RUN_STATE_DIR}/backend" ]]; then
+        candidate=$(<"${RUN_STATE_DIR}/backend")
+    fi
+
+    case "$candidate" in
+        xdp)
+            if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] || ip -d link show dev "$IFACE" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+                BACKEND="xdp"
+                return 0
+            fi
+            ;;
+        nftables)
+            if command -v nft &>/dev/null && nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+                BACKEND="nftables"
+                return 0
+            fi
+            ;;
+    esac
+
+    if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] && ip -d link show dev "$IFACE" 2>/dev/null | grep -Eq 'xdp|xdpgeneric|xdpoffload'; then
+        BACKEND="xdp"
+        return 0
+    fi
+
+    if command -v nft &>/dev/null && nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+        BACKEND="nftables"
+        return 0
+    fi
+
+    if [[ -e "${BPF_PIN_DIR}/pkt_counters" ]]; then
+        BACKEND="xdp"
+        return 0
+    fi
+
+    echo "No active Basic XDP backend detected." >&2
+    exit 1
+}
+
+human_bytes() {
+    local value="$1"
+    if [[ "$value" == "-1" ]]; then
+        echo "-"
+        return
+    fi
+
+    awk -v bytes="$value" '
+    BEGIN {
+        split("B KiB MiB GiB TiB PiB", units, " ")
+        val = bytes + 0
+        idx = 1
+        while (val >= 1024 && idx < 6) {
+            val /= 1024
+            idx++
+        }
+        if (idx == 1) {
+            printf "%.0f %s", val, units[idx]
+        } else {
+            printf "%.2f %s", val, units[idx]
+        }
+    }'
+}
+
+human_bps() {
+    local value="$1"
+    if [[ "$value" == "-1" ]]; then
+        echo "-"
+        return
+    fi
+
+    awk -v bits="$value" '
+    BEGIN {
+        split("bps Kbps Mbps Gbps Tbps", units, " ")
+        val = bits + 0
+        idx = 1
+        while (val >= 1000 && idx < 5) {
+            val /= 1000
+            idx++
+        }
+        if (idx == 1) {
+            printf "%.0f %s", val, units[idx]
+        } else {
+            printf "%.2f %s", val, units[idx]
+        }
+    }'
+}
+
+format_rate() {
+    local packet_delta="$1"
+    local byte_delta="$2"
+    local elapsed="$3"
+
+    if [[ "$packet_delta" == "-1" || "$elapsed" == "0" ]]; then
+        echo "-"
+        return
+    fi
+
+    local pps
+    pps=$(awk -v p="$packet_delta" -v t="$elapsed" 'BEGIN { printf "%.2f", p / t }')
+
+    if [[ "$byte_delta" == "-1" ]]; then
+        printf "%s pps / -" "$pps"
+        return
+    fi
+
+    local bps
+    bps=$(awk -v b="$byte_delta" -v t="$elapsed" 'BEGIN { printf "%.0f", (b * 8) / t }')
+    printf "%s pps / %s" "$pps" "$(human_bps "$bps")"
+}
+
+read_xdp_rows() {
+    [[ -e "${BPF_PIN_DIR}/pkt_counters" ]] || {
+        echo "XDP counters not found at ${BPF_PIN_DIR}/pkt_counters" >&2
+        exit 1
+    }
+
+    bpftool -j map dump pinned "${BPF_PIN_DIR}/pkt_counters" | python3 -c '
+import json
+import sys
+
+names = [
+    "TCP_PASS",
+    "TCP_DROP",
+    "UDP_PASS",
+    "UDP_DROP",
+    "IPv4_OTHER",
+    "IPv6_ICMP",
+    "FRAG_DROP",
+    "ARP_NON_IP",
+    "TCP_CT_MISS",
+]
+
+def norm(values):
+    if isinstance(values, int):
+        return values
+    if isinstance(values, str):
+        try:
+            return int(values, 0)
+        except ValueError:
+            return 0
+    if isinstance(values, list):
+        return sum(norm(item) for item in values)
+    if isinstance(values, dict):
+        if "value" in values:
+            return norm(values["value"])
+        if "values" in values:
+            return norm(values["values"])
+        total = 0
+        for key, item in values.items():
+            if key in {"cpu", "index", "key"}:
+                continue
+            total += norm(item)
+        return total
+    return 0
+
+rows = json.load(sys.stdin)
+total = 0
+for idx, row in enumerate(rows):
+    values = row.get("values")
+    if values is None:
+        values = row.get("value")
+    packets = norm(values)
+    total += packets
+    # Keep stats output resilient if counters grow before this helper is updated.
+    name = names[idx] if idx < len(names) else f"COUNTER_{idx}"
+    print(f"{name}|{packets}|-1")
+print(f"XDP_TOTAL|{total}|-1")
+'
+}
+
+read_nft_rows() {
+    command -v nft >/dev/null 2>&1 || {
+        echo "nft command not found" >&2
+        exit 1
+    }
+
+    nft -a list chain "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" | python3 -c '
+import re
+import sys
+
+text = sys.stdin.read()
+match = re.search(r"counter packets (\d+) bytes (\d+) drop", text)
+if not match:
+    print("NFT_DROP|0|0")
+    sys.exit(0)
+print(f"NFT_DROP|{match.group(1)}|{match.group(2)}")
+'
+}
+
+read_iface_row() {
+    local stats_dir="/sys/class/net/${IFACE}/statistics"
+    [[ -r "${stats_dir}/rx_packets" && -r "${stats_dir}/rx_bytes" ]] || return 0
+
+    local packets bytes
+    packets=$(<"${stats_dir}/rx_packets")
+    bytes=$(<"${stats_dir}/rx_bytes")
+    printf 'IFACE_RX|%s|%s\n' "$packets" "$bytes"
+}
+
+collect_rows() {
+    local name packets bytes
+
+    BACKEND=""
+    detect_backend
+
+    CUR_PACKETS=()
+    CUR_BYTES=()
+    ROW_ORDER=()
+
+    while IFS='|' read -r name packets bytes; do
+        [[ -n "$name" ]] || continue
+        ROW_ORDER+=("$name")
+        CUR_PACKETS["$name"]="$packets"
+        CUR_BYTES["$name"]="$bytes"
+    done < <(
+        case "$BACKEND" in
+            xdp)
+                read_xdp_rows
+                ;;
+            nftables)
+                read_nft_rows
+                ;;
+        esac
+        read_iface_row
+    )
+}
+
+copy_current_to_prev() {
+    local key
+    PREV_PACKETS=()
+    PREV_BYTES=()
+    for key in "${!CUR_PACKETS[@]}"; do
+        PREV_PACKETS["$key"]="${CUR_PACKETS[$key]}"
+        PREV_BYTES["$key"]="${CUR_BYTES[$key]}"
+    done
+}
+
+print_separator() {
+    printf '%-12s  %-15s  %-12s' "Metric" "Packets" "Bytes"
+    if [[ $SHOW_RATES -eq 1 ]]; then
+        printf '  %-24s' "Rate"
+    fi
+    printf '\n'
+    printf '%-12s  %-15s  %-12s' "------------" "---------------" "------------"
+    if [[ $SHOW_RATES -eq 1 ]]; then
+        printf '  %-24s' "------------------------"
+    fi
+    printf '\n'
+}
+
+render_stats() {
+    local elapsed="$1"
+    local row packets bytes packet_delta byte_delta rate
+
+    printf 'Backend   : %s\n' "$BACKEND"
+    printf 'Interface : %s\n' "$IFACE"
+    printf 'Updated   : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '\n'
+
+    print_separator
+
+    for row in "${ROW_ORDER[@]}"; do
+        packets="${CUR_PACKETS[$row]}"
+        bytes="${CUR_BYTES[$row]}"
+
+        printf '%-12s  %-15s  %-12s' \
+            "$row" \
+            "$packets" \
+            "$(human_bytes "$bytes")"
+
+        if [[ $SHOW_RATES -eq 1 ]]; then
+            if [[ -n "${PREV_PACKETS[$row]:-}" ]]; then
+                packet_delta=$(( packets - PREV_PACKETS["$row"] ))
+                if (( packet_delta < 0 )); then
+                    packet_delta=-1
+                fi
+
+                if [[ "$bytes" == "-1" || "${PREV_BYTES[$row]:--1}" == "-1" ]]; then
+                    byte_delta=-1
+                else
+                    byte_delta=$(( bytes - PREV_BYTES["$row"] ))
+                    if (( byte_delta < 0 )); then
+                        byte_delta=-1
+                    fi
+                fi
+
+                rate=$(format_rate "$packet_delta" "$byte_delta" "$elapsed")
+            else
+                rate="-"
+            fi
+
+            printf '  %-24s' "$rate"
+        fi
+
+        printf '\n'
+    done
+}
+
+run_stats() {
+    local prev_ts cur_ts elapsed
+
+    parse_stats_args "$@"
+    load_config
+    autodetect_iface
+
+    if [[ $WATCH_MODE -eq 1 ]]; then
+        if [[ $SHOW_RATES -eq 1 ]]; then
+            collect_rows
+            copy_current_to_prev
+            prev_ts=$(python3 -c 'import time; print(time.time())')
+        fi
+
+        while true; do
+            if [[ $SHOW_RATES -eq 1 ]]; then
+                sleep "$INTERVAL"
+                cur_ts=$(python3 -c 'import time; print(time.time())')
+                collect_rows
+                elapsed=$(awk -v a="$cur_ts" -v b="$prev_ts" 'BEGIN { printf "%.6f", a - b }')
+            else
+                collect_rows
+                elapsed=0
+            fi
+
+            if [[ -n "${TERM:-}" ]] && command -v clear >/dev/null 2>&1; then
+                clear
+            else
+                printf '\033[H\033[2J'
+            fi
+            render_stats "$elapsed"
+
+            if [[ $SHOW_RATES -eq 1 ]]; then
+                copy_current_to_prev
+                prev_ts="$cur_ts"
+            else
+                sleep "$INTERVAL"
+            fi
+        done
+    fi
+
+    if [[ $SHOW_RATES -eq 1 ]]; then
+        collect_rows
+        copy_current_to_prev
+        prev_ts=$(python3 -c 'import time; print(time.time())')
+        sleep "$INTERVAL"
+        cur_ts=$(python3 -c 'import time; print(time.time())')
+        collect_rows
+        elapsed=$(awk -v a="$cur_ts" -v b="$prev_ts" 'BEGIN { printf "%.6f", a - b }')
+        render_stats "$elapsed"
+        return 0
+    fi
+
+    collect_rows
+    render_stats 0
+}
+
+main() {
+    local cmd="${1:-stats}"
+
+    case "$cmd" in
+        stats)
+            shift || true
+            run_stats "$@"
+            ;;
+        watch)
+            shift || true
+            run_stats --watch "$@"
+            ;;
+        sync)
+            shift || true
+            ensure_installed "$RUNNER_SCRIPT"
+            exec "$RUNNER_SCRIPT" --sync-once "$@"
+            ;;
+        start|stop|restart|status)
+            shift || true
+            run_service_cmd "$cmd"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            run_stats "$@"
+            ;;
+    esac
+}
+
+main "$@"

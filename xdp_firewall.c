@@ -218,8 +218,6 @@ static __always_inline int check_udp(
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
-    // Keep source port parsed as __u32 for type consistency with map key usage.
-    __u32 src_port  = (__u32)bpf_ntohs(udp->source);
     __u32 dest_port = (__u32)bpf_ntohs(udp->dest);
 
     // UDP replies are stateful now: tc egress records outbound packets as the
@@ -229,8 +227,6 @@ static __always_inline int check_udp(
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
-
-    (void)src_port;
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow) {
