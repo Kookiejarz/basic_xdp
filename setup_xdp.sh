@@ -45,6 +45,13 @@ case "${BASH_SOURCE[0]:-}" in
         PREFER_REMOTE_SOURCES=1
         ;;
 esac
+if [[ $PREFER_REMOTE_SOURCES -eq 0 ]]; then
+    # Some shells expose stdin execution as "bash" instead of /dev/fd/*.
+    # Also prefer remote sources when the script path is not a readable file.
+    if [[ "${BASH_SOURCE[0]:-}" == "bash" || ! -r "${BASH_SOURCE[0]:-}" ]]; then
+        PREFER_REMOTE_SOURCES=1
+    fi
+fi
 
 PKG_MANAGER=""
 INIT_SYSTEM="none"
@@ -817,6 +824,28 @@ RUN_STATE_DIR="/run/basic_xdp"
 # shellcheck disable=SC1091
 source "$CONFIG_FILE"
 
+sync_script_supports_log_level() {
+    "$PYTHON3_BIN" "$SYNC_SCRIPT" --help 2>/dev/null | grep -q -- "--log-level"
+}
+
+run_sync_script() {
+    local mode="$1"
+    shift || true
+
+    if sync_script_supports_log_level; then
+        if [[ "$mode" == "watch" ]]; then
+            exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+        fi
+        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+    fi
+
+    echo "[basic_xdp] warning: installed xdp_port_sync.py does not support --log-level; running without it" >&2
+    if [[ "$mode" == "watch" ]]; then
+        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+    fi
+    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+}
+
 ensure_bpffs() {
     if ! mount | grep -q 'type bpf'; then
         mount -t bpf bpf /sys/fs/bpf
@@ -961,11 +990,11 @@ select_backend() {
 if [[ "${1:-}" == "--sync-once" ]]; then
     shift
     select_backend
-    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+    run_sync_script once "$@"
 fi
 
 select_backend
-exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")"
+run_sync_script watch
 EOF_RUNNER
 
     chmod +x "$RUNNER_SCRIPT"
