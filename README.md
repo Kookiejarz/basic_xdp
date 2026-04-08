@@ -132,6 +132,14 @@ Incoming Packet
 curl -fsSL https://raw.githubusercontent.com/Kookiejarz/basic_xdp/refs/heads/main/setup_xdp.sh | sudo bash
 ```
 
+### Install a Specific Release
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kookiejarz/basic_xdp/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
+```
+
+Using a tag gives you a reproducible installer version instead of tracking the latest `main` branch.
+
 When the installer is executed from `stdin` (`curl | bash`), it prefers the matching GitHub source files instead of stale local files from the current working directory.
 
 ## Automated Distro Checks
