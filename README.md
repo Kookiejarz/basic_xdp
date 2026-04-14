@@ -135,7 +135,7 @@ curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookieja
 ### Install a Specific Release
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Kookiejarz/basic_xdp/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/basic_xdp/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
 ```
 
 Using a tag gives you a reproducible installer version instead of tracking the latest `main` branch.
