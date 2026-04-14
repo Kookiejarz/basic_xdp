@@ -1,4 +1,4 @@
-# Basic XDP
+# Auto XDP
 
 **A lightweight XDP/eBPF firewall for automatic port whitelisting and basic DDoS protection on Linux hosts.**
 
