@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# setup_xdp.sh — Basic XDP installer / loader / fallback bootstrap
+# setup_xdp.sh — Auto XDP installer / loader / fallback bootstrap
 # Usage: sudo bash setup_xdp.sh [--check-update] [--force] [--check-env] [--dry-run] [interface]
 # Supports Debian/Ubuntu, Fedora/RHEL, openSUSE, Arch, and Alpine.
 
@@ -20,21 +20,21 @@ TC_SRC="tc_flow_track.c"
 TC_OBJ="tc_flow_track.o"
 SYNC_INTERVAL=30
 
-INSTALL_DIR="/usr/local/lib/basic_xdp"
-CONFIG_DIR="/etc/basic_xdp"
-CONFIG_FILE="${CONFIG_DIR}/basic_xdp.env"
+INSTALL_DIR="/usr/local/lib/auto_xdp"
+CONFIG_DIR="/etc/auto_xdp"
+CONFIG_FILE="${CONFIG_DIR}/auto_xdp.env"
 SYNC_SCRIPT="/usr/local/bin/xdp_port_sync.py"
-BXDP_CMD="/usr/local/bin/bxdp"
-RUNNER_SCRIPT="/usr/local/bin/basic_xdp_start.sh"
+AXDP_CMD="/usr/local/bin/axdp"
+RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
 TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
-BPF_HELPER_SRC="basic_xdp_bpf_helpers.py"
-BPF_HELPER_INSTALLED="${INSTALL_DIR}/basic_xdp_bpf_helpers.py"
+BPF_HELPER_SRC="auto_xdp_bpf_helpers.py"
+BPF_HELPER_INSTALLED="${INSTALL_DIR}/auto_xdp_bpf_helpers.py"
 BPF_HELPER_BOOTSTRAP=""
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
-RAW_URL="https://raw.githubusercontent.com/Kookiejarz/basic_xdp/main"
+RAW_URL="https://raw.githubusercontent.com/Kookiejarz/auto_xdp/main"
 TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
 
@@ -787,7 +787,7 @@ stop_existing_service() {
             ;;
     esac
 
-    pkill -f "basic_xdp_start.sh" 2>/dev/null || true
+    pkill -f "auto_xdp_start.sh" 2>/dev/null || true
     pkill -f "xdp_port_sync.py" 2>/dev/null || true
 }
 
@@ -813,11 +813,11 @@ write_runner_script() {
 #!/bin/bash
 set -euo pipefail
 
-CONFIG_FILE="/etc/basic_xdp/basic_xdp.env"
-RUN_STATE_DIR="/run/basic_xdp"
+CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
+RUN_STATE_DIR="/run/auto_xdp"
 
 [[ -f "$CONFIG_FILE" ]] || {
-    echo "[basic_xdp] missing config: $CONFIG_FILE" >&2
+    echo "[auto_xdp] missing config: $CONFIG_FILE" >&2
     exit 1
 }
 
@@ -839,7 +839,7 @@ run_sync_script() {
         exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
     fi
 
-    echo "[basic_xdp] warning: installed xdp_port_sync.py does not support --log-level; running without it" >&2
+    echo "[auto_xdp] warning: installed xdp_port_sync.py does not support --log-level; running without it" >&2
     if [[ "$mode" == "watch" ]]; then
         exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
     fi
@@ -885,12 +885,12 @@ seed_existing_tcp_conntrack() {
     [[ -e "$map_path" ]] || return 0
 
     if ! seeded=$("$PYTHON3_BIN" "$BPF_HELPER_SCRIPT" seed-tcp-conntrack --map-path "$map_path"); then
-        echo "[basic_xdp] failed to pre-seed tcp_conntrack" >&2
+        echo "[auto_xdp] failed to pre-seed tcp_conntrack" >&2
         return 0
     fi
 
     if [[ "$seeded" != "0" ]]; then
-        echo "[basic_xdp] seeded ${seeded} existing TCP session(s) into tcp_conntrack" >&2
+        echo "[auto_xdp] seeded ${seeded} existing TCP session(s) into tcp_conntrack" >&2
     fi
 }
 
@@ -934,7 +934,7 @@ ensure_xdp_loaded() {
             echo "existing" > "${RUN_STATE_DIR}/xdp_mode"
             return 0
         fi
-        echo "[basic_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
+        echo "[auto_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
     fi
 
     rm -rf "$BPF_PIN_DIR"
@@ -951,7 +951,7 @@ ensure_xdp_loaded() {
         return 1
     }
     xdp_maps_ready || {
-        echo "[basic_xdp] pinned XDP maps incomplete after pinning; fallback to nftables" >&2
+        echo "[auto_xdp] pinned XDP maps incomplete after pinning; fallback to nftables" >&2
         cleanup_failed_load
         return 1
     }
@@ -981,7 +981,7 @@ select_backend() {
     fi
 
     command -v nft &>/dev/null || {
-        echo "[basic_xdp] nft not found and XDP unavailable" >&2
+        echo "[auto_xdp] nft not found and XDP unavailable" >&2
         exit 1
     }
     echo "nftables" > "${RUN_STATE_DIR}/backend"
@@ -1014,11 +1014,11 @@ install_bpf_helper() {
     chmod +x "$BPF_HELPER_INSTALLED"
 }
 
-install_bxdp_command() {
-    if ! fetch_local_or_remote "bxdp" "bxdp" "$BXDP_CMD"; then
-        die "Failed to install bxdp"
+install_axdp_command() {
+    if ! fetch_local_or_remote "axdp" "axdp" "$AXDP_CMD"; then
+        die "Failed to install axdp"
     fi
-    chmod +x "$BXDP_CMD"
+    chmod +x "$AXDP_CMD"
 }
 
 install_runtime_files() {
@@ -1026,7 +1026,7 @@ install_runtime_files() {
     mkdir -p "$INSTALL_DIR"
     install_sync_script
     install_bpf_helper
-    install_bxdp_command
+    install_axdp_command
     write_config
     write_runner_script
     ok "Runtime installed under $INSTALL_DIR and $CONFIG_DIR"
@@ -1036,7 +1036,7 @@ install_systemd_service() {
     info "Creating systemd service: $SERVICE_NAME..."
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF_UNIT
 [Unit]
-Description=Basic XDP Loader + Port Whitelist Auto-Sync
+Description=Auto XDP Loader + Port Whitelist Auto-Sync
 After=network-online.target
 Wants=network-online.target
 
@@ -1061,7 +1061,7 @@ install_openrc_service() {
     info "Creating OpenRC service: $SERVICE_NAME..."
     cat > "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
 #!/sbin/openrc-run
-description="Basic XDP loader + port whitelist auto-sync"
+description="Auto XDP loader + port whitelist auto-sync"
 command="${RUNNER_SCRIPT}"
 command_background=true
 pidfile="/run/\${RC_SVCNAME}.pid"
@@ -1186,7 +1186,7 @@ if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
     echo "  BPF maps       : $BPF_PIN_DIR/"
     echo "  TC egress obj  : $TC_OBJ_INSTALLED"
 else
-    echo "  nftables table : inet basic_xdp"
+    echo "  nftables table : inet auto_xdp"
 fi
 echo "  Init system    : $INIT_SYSTEM"
 if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -1197,18 +1197,18 @@ else
     echo "  Service        : not installed"
 fi
 echo "  Launcher       : $RUNNER_SCRIPT"
-echo "  Command        : $BXDP_CMD"
+echo "  Command        : $AXDP_CMD"
 echo ""
 echo "  Next Commands"
-echo "  bxdp           : sudo bxdp"
-echo "  bxdp watch     : sudo bxdp watch"
-echo "  bxdp rates     : sudo bxdp stats --rates"
-echo "  bxdp live      : sudo bxdp stats --watch --rates --interval 2"
-echo "  bxdp sync      : sudo bxdp sync"
+echo "  axdp           : sudo axdp"
+echo "  axdp watch     : sudo axdp watch"
+echo "  axdp rates     : sudo axdp stats --rates"
+echo "  axdp live      : sudo axdp stats --watch --rates --interval 2"
+echo "  axdp sync      : sudo axdp sync"
 if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    echo "  service status : sudo bxdp status"
-    echo "  service restart: sudo bxdp restart"
+    echo "  service status : sudo axdp status"
+    echo "  service restart: sudo axdp restart"
 elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    echo "  service status : sudo bxdp status"
-    echo "  service restart: sudo bxdp restart"
+    echo "  service status : sudo axdp status"
+    echo "  service restart: sudo axdp restart"
 fi

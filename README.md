@@ -7,7 +7,7 @@
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <a href="https://www.kernel.org/"><img src="https://img.shields.io/badge/Kernel-%E2%89%A54.18-blue.svg?style=flat-square" alt="Kernel >= 4.18"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
-  <a href="https://github.com/Kookiejarz/basic_xdp/actions/workflows/distro-check.yml"><img src="https://github.com/Kookiejarz/basic_xdp/actions/workflows/distro-check.yml/badge.svg" alt="Distro Checks"></a>
+  <a href="https://github.com/Kookiejarz/auto_xdp/actions/workflows/distro-check.yml"><img src="https://github.com/Kookiejarz/auto_xdp/actions/workflows/distro-check.yml/badge.svg" alt="Distro Checks"></a>
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <img src="https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC-555555.svg?style=flat-square" alt="systemd and OpenRC">
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
@@ -26,7 +26,7 @@
   <img src="https://img.shields.io/badge/Alpine-supported-0D597F.svg?style=flat-square" alt="Alpine supported">
 </p>
 
-Although there are some XDP firewall solutions available, Basic XDP provides users with automatic port whitelisting, which makes maintenance easier.
+Although there are some XDP firewall solutions available, Auto XDP provides users with automatic port whitelisting, which makes maintenance easier.
 
 ***⚠️ XDP only filters traffic that reaches your NIC. If your upstream bandwidth is already saturated by a volumetric attack, this tool cannot help. For large-scale DDoS mitigation, consider upstream scrubbing services or a DDoS-protected hosting provider.***
 
@@ -38,11 +38,11 @@ Although there are some XDP firewall solutions available, Basic XDP provides use
 
 **XDP (eXpress Data Path)** is an eBPF-based, high-performance packet processing path that runs **before packets enter the Linux networking stack** (at the NIC driver level). This makes it significantly faster than traditional `iptables`/`nftables` filtering.
 
-### Why Basic XDP?
+### Why Auto XDP?
 
 Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` work, but they process packets *after* the kernel networking stack — adding latency and CPU overhead.
 
-**Basic XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the active backend in sync automatically. When a host cannot run XDP, it can fall back to an `nftables` ruleset instead of failing outright.
+**Auto XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the active backend in sync automatically. When a host cannot run XDP, it can fall back to an `nftables` ruleset instead of failing outright.
 
 ---
 
@@ -66,7 +66,8 @@ Incoming Packet
 │                  conntrack   │
 │  IPv4 TCP ACK? → conntrack   │
 │  IPv4 UDP?     → ct/port/IP  │
-│  ICMP/ARP? → PASS            │
+│  ICMP/ICMPv6? → rate-limit   │
+│  ARP/NDP?   → PASS           │
 │                              │
 │  Not in whitelist → DROP     │
 └──────────────────────────────┘
@@ -82,7 +83,7 @@ Incoming Packet
 1. **`xdp_firewall.c`** — eBPF/XDP kernel program that filters packets at wire speed
 2. **`tc_flow_track.c`** — eBPF `tc` egress helper that records outbound IPv4/IPv6 TCP SYN packets and UDP reply tuples
 3. **`xdp_port_sync.py`** — userspace daemon that syncs TCP/UDP listening ports and trusted IPv4 source IPs
-4. **`bxdp`** — operator CLI for statistics, sync, service control, and daemon log level
+4. **`axdp`** — operator CLI for statistics, sync, service control, and daemon log level
 5. **`setup_xdp.sh`** — installer that compiles the BPF objects, installs the runtime launcher, and sets up boot-time auto-sync
 
 ---
@@ -100,10 +101,11 @@ Incoming Packet
 - **Periodic conntrack sync (seeding established flows)**: the daemon now periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack`, which helps preserve active sessions after re-attaching XDP or manual map clears.
 - **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
 - **Pinned BPF maps** that survive reloads and can be updated at runtime 
-- **ICMP/ICMPv6/ARP passthrough** (ping + IPv6 NDP still work) 
+- **ICMP token-bucket rate limiter**: XDP-level protection against ICMP/ICMPv6 ping floods; 100 pps burst cap with per-second token refill, while ARP and IPv6 NDP control traffic (RS/RA/NS/NA) are always passed
+- **Per-IP SYN rate limiting (anti-brute-force)**: configurable per-port SYN rate limit tracked per source IP in a 1-second fixed window; stricter defaults for SSH/MySQL, higher for mail services
 - **Boot-time loader**: restores protection on reboot instead of only syncing userspace state
 - **Systemd + OpenRC support**: installs the service automatically when either init system is present
-- **Configurable daemon verbosity**: `bxdp log-level debug|info|warning|error` updates the installed service config and restarts it
+- **Configurable daemon verbosity**: `axdp log-level debug|info|warning|error` updates the installed service config and restarts it
 - **Native + generic XDP**: tries native first, then generic
 - **nftables fallback**: if both XDP attach modes fail, keeps automatic port whitelisting with a dynamic `nftables` ruleset
 
@@ -129,13 +131,13 @@ Incoming Packet
 ## Quick Start
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/heads/main/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/auto_xdp/refs/heads/main/setup_xdp.sh | sudo bash
 ```
 
 ### Install a Specific Release
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/Auto_XDP/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
+curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/Kookiejarz/auto_xdp/refs/tags/v26.4.7a/setup_xdp.sh | sudo bash
 ```
 
 Using a tag gives you a reproducible installer version instead of tracking the latest `main` branch.
@@ -165,8 +167,8 @@ bash setup_xdp.sh --check-env
 ## Install From Source
 
 ```bash
-git clone https://github.com/Kookiejarz/basic_xdp.git
-cd basic_xdp
+git clone https://github.com/Kookiejarz/auto_xdp.git
+cd auto_xdp
 
 # Auto-detect interface
 sudo bash setup_xdp.sh
@@ -188,13 +190,13 @@ sudo bash setup_xdp.sh --check-update --force
 1. Checks for root privileges 
 2. Auto-detects default network interface
 3. Installs missing dependencies via the detected package manager 
-4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `bxdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
+4. Uses local `xdp_firewall.c` / `tc_flow_track.c` / `xdp_port_sync.py` / `axdp` by default from a local checkout; when run from `stdin`, it prefers the matching GitHub copies
 5. Compiles the XDP and tc BPF objects when the host has the required toolchain
 6. Pre-seeds current IPv4/IPv6 established TCP sessions into `tcp_conntrack` before attaching XDP
 7. Loads and attaches a `tc clsact egress` program that records outbound TCP SYN and UDP reply tuples
 8. Tries to attach XDP in native mode, then generic mode
 9. Falls back to `nftables` automatically if XDP cannot be attached
-10. Installs the runtime launcher at `/usr/local/bin/basic_xdp_start.sh`
+10. Installs the runtime launcher at `/usr/local/bin/auto_xdp_start.sh`
 11. Installs the sync daemon at `/usr/local/bin/xdp_port_sync.py`
 12. Runs an initial port sync using the selected backend
 13. Registers and starts `xdp-port-sync` on `systemd` or `OpenRC` when available
@@ -212,7 +214,10 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 | `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
 | `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
 | `trusted_src_ips` | HASH | 256 | `__be32` IPv4 source address | `__u32` (1 = trusted) |
-| `pkt_counters` | PERCPU_ARRAY | 10 | `__u32` counter index | `__u64` packet count |
+| `pkt_counters` | PERCPU_ARRAY | 12 | `__u32` counter index | `__u64` packet count |
+| `icmp_tb` | ARRAY | 1 | `__u32` (0) | `struct icmp_token_bucket { last_ns, tokens }` |
+| `syn_rate_ports` | HASH | 64 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
+| `syn_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
 
 ### Manually Add / Remove a Port
 
@@ -245,7 +250,7 @@ Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. We transi
 
 ## Auto-Sync Daemon
 
-The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/basic_xdp_start.sh` and provides **real-time updates** for either backend:
+The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_start.sh` and provides **real-time updates** for either backend:
 
 1. **Event-driven**: Uses Linux **Netlink Process Connector** to detect `exec()` and `exit()` events immediately.
 2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses).
@@ -289,7 +294,7 @@ journalctl -u xdp-port-sync -f
 rc-service xdp-port-sync status
 
 # Manual foreground run
-/usr/local/bin/basic_xdp_start.sh
+/usr/local/bin/auto_xdp_start.sh
 
 # One-shot sync with automatic backend selection
 python3 /usr/local/bin/xdp_port_sync.py --backend auto
@@ -301,48 +306,55 @@ python3 /usr/local/bin/xdp_port_sync.py --backend auto --log-level debug
 
 ## Statistics
 
-Basic XDP installs a convenience command `/usr/local/bin/bxdp`. Statistics are now built directly into `bxdp`, so you only need one operational command after installation.
+Auto XDP installs a convenience command `/usr/local/bin/axdp`. Statistics are now built directly into `axdp`, so you only need one operational command after installation.
 
 ```bash
 # Single snapshot
-sudo bxdp
+sudo axdp
 
 # Real-time refresh
-sudo bxdp watch
+sudo axdp watch
 
 # Show delta rates (pps / bps)
-sudo bxdp stats --rates
+sudo axdp stats --rates
 
 # Combine both
-sudo bxdp stats --watch --rates --interval 2
+sudo axdp stats --watch --rates --interval 2
 
 # Run one manual sync
-sudo bxdp sync
+sudo axdp sync
+
+# Inspect currently allowed TCP/UDP ports (with per-IP SYN rate stats)
+sudo axdp ports
+sudo axdp ports --tcp
+sudo axdp ports --udp
 
 # View or change daemon log level
-sudo bxdp log-level
-sudo bxdp log-level debug
+sudo axdp log-level
+sudo axdp log-level debug
 
 # Service control
-sudo bxdp start
-sudo bxdp stop
-sudo bxdp restart
-sudo bxdp status
+sudo axdp start
+sudo axdp stop
+sudo axdp restart
+sudo axdp status
 ```
 
 What it shows:
 
 1. `xdp` backend: per-category packet counters from `/sys/fs/bpf/xdp_fw/pkt_counters`, plus interface RX totals
-2. `nftables` backend: current drop counter from the `inet basic_xdp input` chain, plus interface RX totals
+2. `nftables` backend: current drop counter from the `inet auto_xdp input` chain, plus interface RX totals
 3. `--rates`: packet deltas for XDP counters, and packet/bit deltas where byte counters are available
 
-Counter labels in `bxdp` are intentionally human-readable:
+Counter labels in `axdp` are intentionally human-readable:
 
 1. `TCP_NEW_ALLOW` counts pure SYN packets admitted by `tcp_whitelist`
 2. `TCP_ESTABLISHED` counts TCP packets admitted by `tcp_conntrack`
 3. `TCP_CT_MISS` counts TCP ACK packets dropped because no conntrack entry existed
-4. `IPv6_ICMP` covers ICMPv6, neighbor discovery, and other non-TCP/UDP IPv6 traffic that is passed through
+4. `IPv6_ICMP` covers ICMPv6 and non-TCP/UDP IPv6 traffic that passed the rate limiter
 5. `ARP_NON_IP` covers ARP and other non-IP Ethernet traffic
+6. `ICMP_DROP` counts ICMP/ICMPv6 echo packets dropped by the token-bucket rate limiter
+7. `SYN_RATE_DROP` counts TCP SYN packets dropped by the per-IP SYN rate limiter
 
 ## Post-Install Quick Commands
 
@@ -350,33 +362,38 @@ After installation, these are the main commands you will actually use:
 
 ```bash
 # Help
-sudo bxdp help
+sudo axdp help
 
 # Current statistics snapshot
-sudo bxdp
+sudo axdp
 
 # Live statistics
-sudo bxdp watch
+sudo axdp watch
 
 # Delta rates
-sudo bxdp stats --rates
+sudo axdp stats --rates
 
 # Live delta rates
-sudo bxdp stats --watch --rates --interval 2
+sudo axdp stats --watch --rates --interval 2
 
 # Run one manual sync
-sudo bxdp sync
+sudo axdp sync
+
+# Inspect currently allowed ports
+sudo axdp ports
+sudo axdp ports --tcp
+sudo axdp ports --udp
 
 # Change daemon log verbosity and restart the service
-sudo bxdp log-level
-sudo bxdp log-level debug
-sudo bxdp log-level info
+sudo axdp log-level
+sudo axdp log-level debug
+sudo axdp log-level info
 
 # Service control
-sudo bxdp start
-sudo bxdp stop
-sudo bxdp status
-sudo bxdp restart
+sudo axdp start
+sudo axdp stop
+sudo axdp status
+sudo axdp restart
 ```
 
 ### Source Update Check
@@ -389,7 +406,7 @@ sudo bash setup_xdp.sh --check-update
 
 In `--check-update` mode, the installer:
 
-1. Downloads the GitHub version of `xdp_firewall.c`, `tc_flow_track.c`, `xdp_port_sync.py`, and `bxdp` to temporary files
+1. Downloads the GitHub version of `xdp_firewall.c`, `tc_flow_track.c`, `xdp_port_sync.py`, and `axdp` to temporary files
 2. Compares the local and GitHub SHA-256 hashes
 3. Prompts you when they differ
 4. Pulls the GitHub copy only if you confirm
@@ -455,7 +472,7 @@ tc filter del dev eth0 egress pref 49152 2>/dev/null || true
 
 # Remove pinned maps and nftables fallback table
 rm -rf /sys/fs/bpf/xdp_fw
-nft delete table inet basic_xdp 2>/dev/null || true
+nft delete table inet auto_xdp 2>/dev/null || true
 
 # systemd
 systemctl disable --now xdp-port-sync 2>/dev/null || true
@@ -469,17 +486,17 @@ rm /etc/init.d/xdp-port-sync
 
 # Remove installed runtime files
 rm /usr/local/bin/xdp_port_sync.py
-rm /usr/local/bin/bxdp
-rm /usr/local/bin/basic_xdp_start.sh
-rm -rf /usr/local/lib/basic_xdp
-rm -rf /etc/basic_xdp
+rm /usr/local/bin/axdp
+rm /usr/local/bin/auto_xdp_start.sh
+rm -rf /usr/local/lib/auto_xdp
+rm -rf /etc/auto_xdp
 ```
 
 ---
 
 ## **📊 Real-World Performance Benchmark**
 
-This benchmark simulates a volumetric UDP flood attack. We used a high-performance **AMD EPYC™ 7Y43** server as the "Attacker" to stress-test a **1 vCPU AMD Ryzen 9 3900X** instance protected by Basic XDP.
+This benchmark simulates a volumetric UDP flood attack. We used a high-performance **AMD EPYC™ 7Y43** server as the "Attacker" to stress-test a **1 vCPU AMD Ryzen 9 3900X** instance protected by Auto XDP.
 
 ### **Test Environment**
 
@@ -490,7 +507,7 @@ This benchmark simulates a volumetric UDP flood attack. We used a high-performan
 
 ### **Comparative Results**
 
-| Metric                     | Basic XDP **OFF**         | Basic XDP **ON**        | Improvement        |
+| Metric                     | Auto XDP **OFF**         | Auto XDP **ON**        | Improvement        |
 | -------------------------- | ------------------------- | ----------------------- | ------------------ |
 | **Softirq (si) CPU Usage** | **85.9%**                 | **3.0%**                | **~28x Reduction** |
 | **System Responsiveness**  | Extremely Laggy           | **Smooth**              | Significant        |
@@ -543,17 +560,17 @@ Contributions are welcome! If you have a bug fix, performance improvement, or ne
 1. Fork the repository 
 2. Create a feature branch (`git checkout -b feature/my-improvement`) 
 3. Commit your changes
-4. Open a pull request For bugs or questions, please [open an issue](https://github.com/Kookiejarz/basic_xdp/issues).
+4. Open a pull request For bugs or questions, please [open an issue](https://github.com/Kookiejarz/auto_xdp/issues).
 
 ---
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=Kookiejarz%2Fbasic_xdp&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=Kookiejarz%2Fauto_xdp&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Kookiejarz/basic_xdp&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Kookiejarz/basic_xdp&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Kookiejarz/basic_xdp&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Kookiejarz/auto_xdp&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Kookiejarz/auto_xdp&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Kookiejarz/auto_xdp&type=date&legend=top-left" />
  </picture>
 </a>
 

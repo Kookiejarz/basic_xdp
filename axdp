@@ -1,13 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-CONFIG_FILE="/etc/basic_xdp/basic_xdp.env"
-RUN_STATE_DIR="/run/basic_xdp"
+CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
+RUN_STATE_DIR="/run/auto_xdp"
 BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 NFT_FAMILY="inet"
-NFT_TABLE="basic_xdp"
+NFT_TABLE="auto_xdp"
 NFT_CHAIN="input"
-RUNNER_SCRIPT="/usr/local/bin/basic_xdp_start.sh"
+RUNNER_SCRIPT="/usr/local/bin/auto_xdp_start.sh"
 SERVICE_NAME="xdp-port-sync"
 
 WATCH_MODE=0
@@ -26,10 +26,10 @@ declare -a ROW_ORDER=()
 
 usage() {
     cat <<'EOF'
-Usage: bxdp [command] [options]
+Usage: axdp [command] [options]
 
 Commands:
-  stats [args...]   Show Basic XDP statistics
+  stats [args...]   Show Auto XDP statistics
   watch [args...]   Shorthand for: stats --watch
   ports [args...]   Show currently allowed TCP/UDP ports
   sync [args...]    Run one sync pass with automatic backend selection
@@ -50,7 +50,7 @@ Ports options:
   --watch              Refresh continuously and detect changes
   --interval SEC       Refresh interval in seconds (default: 2)
 
-With no command, bxdp runs: stats
+With no command, axdp runs: stats
 EOF
 }
 
@@ -254,7 +254,7 @@ detect_backend() {
         return 0
     fi
 
-    echo "No active Basic XDP backend detected." >&2
+    echo "No active Auto XDP backend detected." >&2
     exit 1
 }
 

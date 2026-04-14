@@ -17,8 +17,8 @@ jobs:
       - name: Python syntax check
         run: python3 -m py_compile xdp_port_sync.py
 
-      - name: Shell syntax check for bxdp
-        run: bash -n bxdp
+      - name: Shell syntax check for axdp
+        run: bash -n axdp
 
   distro-check:
     needs: syntax

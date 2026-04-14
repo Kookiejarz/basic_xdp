@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helpers for Basic XDP BPF map operations."""
+"""Helpers for Auto XDP BPF map operations."""
 
 from __future__ import annotations
 
@@ -144,7 +144,7 @@ def cmd_seed_tcp_conntrack(map_path: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Basic XDP BPF helper")
+    parser = argparse.ArgumentParser(description="Auto XDP BPF helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     pin = sub.add_parser("pin-maps", help="Pin all maps referenced by a program id")

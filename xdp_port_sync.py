@@ -84,7 +84,7 @@ _SYN_RATE_BY_SERVICE: dict[str, int] = {
 }
 
 NFT_FAMILY = "inet"
-NFT_TABLE = "basic_xdp"
+NFT_TABLE = "auto_xdp"
 NFT_TCP_SET = "tcp_ports"
 NFT_UDP_SET = "udp_ports"
 
@@ -1014,7 +1014,7 @@ def main() -> None:
             raise argparse.ArgumentTypeError(f"invalid IPv4 address: {ip_str}") from exc
         return ip_str
 
-    p = argparse.ArgumentParser(description="Basic XDP port-whitelist sync daemon")
+    p = argparse.ArgumentParser(description="Auto XDP port-whitelist sync daemon")
     p.add_argument(
         "--backend",
         choices=[BACKEND_AUTO, BACKEND_XDP, BACKEND_NFTABLES],
