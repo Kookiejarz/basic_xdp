@@ -556,12 +556,16 @@ echo "clone_skb 100" > $PGDEV              # Speed up packet generation
 
 ## 🤝 **Contributing**
 
-Contributions are welcome! If you have a bug fix, performance improvement, or new feature in mind: 
+Contributions are welcome! Please read our [Contributing Guide](./CONTRIBUTING.md) for details on our process for submitting pull requests and how to set up your development environment.
 
-1. Fork the repository 
-2. Create a feature branch (`git checkout -b feature/my-improvement`) 
+If you have a bug fix, performance improvement, or new feature in mind:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-improvement`)
 3. Commit your changes
-4. Open a pull request For bugs or questions, please [open an issue](https://github.com/Kookiejarz/Auto_XDP/issues).
+4. Open a pull request
+
+For bugs or questions, please [open an issue](https://github.com/Kookiejarz/Auto_XDP/issues).
 
 ---
 
