@@ -2,7 +2,7 @@
 
 > 🚩 The Mission: Making high-performance eBPF security accessible to everyone—without needing a PhD in Linux kernel networking.
 
-**A lightweight XDP/eBPF firewall for automatic port whitelisting and basic DDoS protection on Linux hosts.**
+**A lightweight XDP/eBPF firewall for automatic port whitelisting and DDoS protection on Linux hosts.**
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License"></a>
@@ -27,7 +27,7 @@
   <img width="3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   <img src="https://img.shields.io/badge/Alpine-supported-0D597F.svg?style=flat-square" alt="Alpine supported">
 </p>
-Although there are some XDP firewall solutions available, Auto XDP provides users with automatic port whitelisting, which makes maintenance significantly easier.
+Although there are some other XDP firewall solutions available, Auto XDP provides users with automatic port whitelisting, which makes maintenance significantly easier. Zero config, effortless management.
 
 ***⚠️ XDP only filters traffic that reaches your NIC. If your upstream bandwidth is already saturated by a volumetric attack, this tool cannot help. For large-scale DDoS mitigation, consider upstream scrubbing services or a DDoS-protected hosting provider.***
 
@@ -41,7 +41,7 @@ Although there are some XDP firewall solutions available, Auto XDP provides user
 
 ### Why Auto XDP?
 
-Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` work, but they process packets *after* the kernel networking stack — adding latency and CPU overhead.
+Personal cloud instances are constantly scanned and probed. Traditional firewalls like `iptables` work, but they process packets *after* the kernel networking stack — adding latency and CPU overhead. They also require manual firewall configurations and port controls, making host management to be more complicated.
 
 **Auto XDP** hooks in **at the NIC driver level**, before any kernel processing. And unlike other XDP solutions, it **manages the port whitelist for you**: a daemon watches which ports are actually open on your system and keeps the active backend in sync automatically. When a host cannot run XDP, it can fall back to an `nftables` ruleset instead of failing outright.
 
@@ -241,7 +241,7 @@ Key encoding note: the map type is now **ARRAY** (`BPF_MAP_TYPE_ARRAY`), so the 
 
 ## Why ARRAY instead of HASH?
 
-Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. We transitioned to **BPF_MAP_TYPE_ARRAY** for several critical reasons:
+Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. It transitioned to **BPF_MAP_TYPE_ARRAY** for several critical reasons:
 
 - **O(1) Lookup Time**: An Array map provides constant-time lookup ($O(1)$) by directly indexing into memory using the port number. A Hash map averages O(1) but degrades under hash collisions, whereas an Array map guarantees O(1) by direct index access with no collision possible. :))))
 - **Zero Hash Collisions**: With 65,536 entries (one for every possible port), there is no possibility of hash collisions. In a Hash map with a small max_entries (e.g., 64), collisions frequently occur during high-volume scans, causing latency spikes.
@@ -254,11 +254,11 @@ Originally, this project used **BPF_MAP_TYPE_HASH** for the whitelist. We transi
 The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_start.sh` and provides **real-time updates** for either backend:
 
 1. **Event-driven**: Uses Linux **Netlink Process Connector** to detect `exec()` and `exit()` events immediately.
-2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses).
+2. **Efficient Discovery**: Uses `psutil` to read `/proc` directly for listening ports (no slow `ss` or `netstat` subprocesses, yeahhh).
 3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
 4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
 5. **UDP Discovery Rule**: Because UDP has no `LISTEN` state, the daemon syncs unconnected bound UDP sockets (no remote peer) into `udp_whitelist`, which is a practical approximation of server-style UDP ports.
-6. **Trusted Source IPs**: Optional IPv4 addresses can be synced into the XDP-side `trusted_src_ips` map for reply-style UDP traffic such as DNS or NTP.
+6. **Trusted Source IPs**: Optional IPv4 addresses can be synced into the XDP-side `trusted_src_ips` map for reply-style UDP traffic such as DNS or NTP. (IPv6 support under progress)
 7. **Backend Guard Rails**: In `auto` mode, the daemon only selects XDP when the required pinned maps are present; otherwise it falls back to `nftables` instead of crashing.
 
 Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips`.
