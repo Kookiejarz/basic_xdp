@@ -64,7 +64,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev bpftool
+          sudo apt-get install -y clang llvm libbpf-dev linux-tools-$(uname -r) linux-tools-generic || sudo apt-get install -y clang llvm libbpf-dev linux-tools-generic
 
       - name: Compile XDP and tc objects
         run: bash ./tests/bash/test_bpf_build.sh
