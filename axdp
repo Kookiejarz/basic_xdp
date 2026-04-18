@@ -748,10 +748,10 @@ diff_csv() {
     local mode="$3" # added|removed
     case "$mode" in
         added)
-            comm -13 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | xargs
+            comm -13 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | paste -s -d ' '
             ;;
         removed)
-            comm -23 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | xargs
+            comm -23 <(csv_to_sorted_lines "$old_csv") <(csv_to_sorted_lines "$new_csv") | paste -s -d ' '
             ;;
     esac
 }
