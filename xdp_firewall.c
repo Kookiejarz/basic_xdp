@@ -40,6 +40,10 @@ struct vlan_hdr {
 #define ICMP_TOKEN_MAX     100ULL  // burst capacity: bucket depth
 #define ICMP_NS_PER_TOKEN  (1000000000ULL / ICMP_TOKEN_RATE)
 
+// Global UDP sliding-window rate limiter
+#define UDP_GLOBAL_WINDOW_NS     (1000000000ULL) // 1-second window
+#define UDP_GLOBAL_DEFAULT_RATE  10000U           // default 10,000 pps; 0 = disabled
+
 // Per-IP SYN rate limiter (anti-brute-force)
 // Rate limits per port are configured at runtime via the syn_rate_ports map.
 #define SYN_RATE_WINDOW_NS  (1000000000ULL)  // 1-second fixed window per source IP
@@ -68,7 +72,9 @@ enum xdp_counter_idx {
     CNT_TCP_CT_MISS     = 9,  // TCP ACK packets dropped due to missing conntrack state
     CNT_ICMP_DROP       = 10, // ICMP/ICMPv6 echo packets dropped by token-bucket rate limiter
     CNT_SYN_RATE_DROP   = 11, // TCP SYN dropped by per-IP rate limiter (anti-brute-force)
-    CNT_MAX             = 12,
+    CNT_UDP_RATE_DROP        = 12, // UDP dropped by per-source-IP rate limiter
+    CNT_UDP_GLOBAL_RATE_DROP = 13, // UDP dropped by global sliding-window rate limiter
+    CNT_MAX                  = 14,
 };
 
 struct {
@@ -94,6 +100,16 @@ struct ct_key {
     __u32 daddr[4];
 } __attribute__((aligned(8)));
 
+struct trusted_v4_key {
+    __u32 prefixlen;
+    __be32 addr;
+};
+
+struct trusted_v6_key {
+    __u32 prefixlen;
+    __u8 addr[16];
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 262144);
@@ -102,11 +118,20 @@ struct {
 } tcp_conntrack SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 256);
-    __type(key, __be32);   // IPv4 source address in network byte order
-    __type(value, __u32);  // 1 = trusted
-} trusted_src_ips SEC(".maps");
+    __type(key, struct trusted_v4_key);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} trusted_src_ips4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 256);
+    __type(key, struct trusted_v6_key);
+    __type(value, __u32);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} trusted_src_ips6 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -143,6 +168,24 @@ struct {
     __type(value, struct icmp_token_bucket);
 } icmp_tb SEC(".maps");
 
+// Global UDP two-bucket sliding-window rate limiter state.
+// rate_max is runtime-configurable via bpftool; set to 0 to disable.
+struct udp_global_tb {
+    struct bpf_spin_lock lock;
+    __u32 rate_max;          // max packets per 1-second window; 0 = disabled
+    __u32 _pad;
+    __u64 window_start_ns;   // ktime_ns of current bucket's start; 0 = uninit
+    __u64 prev_count;        // packet count in the previous 1-second bucket
+    __u64 curr_count;        // packet count in the current 1-second bucket
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct udp_global_tb);
+} udp_global_rl SEC(".maps");
+
 // Per-port SYN rate limit config, populated at runtime by xdp_port_sync.
 // Key: dest port (host byte order). Value: rate_max SYNs/window (0 = disabled).
 // Ports absent from this map are NOT rate-limited (e.g. HTTP/HTTPS).
@@ -177,6 +220,20 @@ struct {
     __type(key, struct syn_rate_key);
     __type(value, struct syn_rate_val);
 } syn_rate_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // dest port (host byte order)
+    __type(value, struct syn_rate_port_cfg);
+} udp_rate_ports SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct syn_rate_key);
+    __type(value, struct syn_rate_val);
+} udp_rate_map SEC(".maps");
 
 // Per-IP SYN rate limiter: returns XDP_PASS or XDP_DROP.
 // Looks up per-port config from syn_rate_ports; skips limiting entirely if
@@ -224,6 +281,109 @@ static __always_inline int syn_rate_check(struct ct_key *key, __u64 now,
 
     rv->count++;
     return XDP_PASS;
+}
+
+static __always_inline int udp_rate_check(struct ct_key *key, __u64 now,
+                                           __u32 dest_port)
+{
+    struct syn_rate_port_cfg *cfg = bpf_map_lookup_elem(&udp_rate_ports, &dest_port);
+    if (!cfg || cfg->rate_max == 0)
+        return XDP_PASS;
+
+    __u32 rate_max = cfg->rate_max;
+
+    struct syn_rate_key rkey;
+    __builtin_memset(&rkey, 0, sizeof(rkey));
+    rkey.family  = key->family;
+    rkey.addr[0] = key->saddr[0];
+    rkey.addr[1] = key->saddr[1];
+    rkey.addr[2] = key->saddr[2];
+    rkey.addr[3] = key->saddr[3];
+
+    struct syn_rate_val *rv = bpf_map_lookup_elem(&udp_rate_map, &rkey);
+    if (!rv) {
+        struct syn_rate_val new_rv;
+        __builtin_memset(&new_rv, 0, sizeof(new_rv));
+        new_rv.window_start_ns = now;
+        new_rv.count = 1;
+        bpf_map_update_elem(&udp_rate_map, &rkey, &new_rv, BPF_ANY);
+        return XDP_PASS;
+    }
+
+    if (now - rv->window_start_ns >= SYN_RATE_WINDOW_NS) {
+        rv->window_start_ns = now;
+        rv->count = 1;
+        return XDP_PASS;
+    }
+
+    if (rv->count >= rate_max)
+        return XDP_DROP;
+
+    rv->count++;
+    return XDP_PASS;
+}
+
+// Global UDP sliding-window rate limiter.
+// Uses a two-bucket approximation: maintains current and previous 1-second
+// buckets and computes a weighted estimate of the last 1 second's packet count.
+// Avoids integer division by comparing scaled values:
+//   prev*(WINDOW-elapsed) + curr*WINDOW  vs  rate_max*WINDOW
+static __always_inline int udp_global_rate_check(__u64 now)
+{
+    __u32 key = 0;
+    struct udp_global_tb *tb = bpf_map_lookup_elem(&udp_global_rl, &key);
+    if (!tb)
+        return XDP_PASS;
+
+    bpf_spin_lock(&tb->lock);
+
+    if (tb->rate_max == 0) {
+        bpf_spin_unlock(&tb->lock);
+        return XDP_PASS;
+    }
+
+    if (tb->window_start_ns == 0) {
+        tb->window_start_ns = now;
+        tb->prev_count = 0;
+        tb->curr_count = 1;
+        bpf_spin_unlock(&tb->lock);
+        return XDP_PASS;
+    }
+
+    __u64 elapsed = now - tb->window_start_ns;
+
+    if (elapsed >= 2 * UDP_GLOBAL_WINDOW_NS) {
+        // Both buckets expired; start fresh.
+        tb->window_start_ns = now;
+        tb->prev_count = 0;
+        tb->curr_count = 1;
+        bpf_spin_unlock(&tb->lock);
+        return XDP_PASS;
+    }
+
+    if (elapsed >= UDP_GLOBAL_WINDOW_NS) {
+        tb->prev_count = tb->curr_count;
+        tb->curr_count = 0;
+        tb->window_start_ns += UDP_GLOBAL_WINDOW_NS;
+        elapsed -= UDP_GLOBAL_WINDOW_NS;
+    }
+
+    // Weighted sliding-window estimate (multiplication avoids division):
+    //   (prev*(W-elapsed) + curr*W) >= rate_max*W  →  DROP
+    __u64 weighted   = tb->prev_count * (UDP_GLOBAL_WINDOW_NS - elapsed)
+                     + tb->curr_count * UDP_GLOBAL_WINDOW_NS;
+    __u64 threshold  = (__u64)tb->rate_max * UDP_GLOBAL_WINDOW_NS;
+
+    int ret;
+    if (weighted >= threshold) {
+        ret = XDP_DROP;
+    } else {
+        tb->curr_count++;
+        ret = XDP_PASS;
+    }
+
+    bpf_spin_unlock(&tb->lock);
+    return ret;
 }
 
 static __always_inline void fill_ct_key_v4(
@@ -407,11 +567,22 @@ static __always_inline int check_udp_ipv4(
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow) {
+        if (udp_rate_check(&key, now, dest_port) == XDP_DROP) {
+            count(CNT_UDP_RATE_DROP);
+            count(CNT_UDP_DROP);
+            return XDP_DROP;
+        }
+        if (udp_global_rate_check(now) == XDP_DROP) {
+            count(CNT_UDP_GLOBAL_RATE_DROP);
+            count(CNT_UDP_DROP);
+            return XDP_DROP;
+        }
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
 
-    __u32 *trusted = bpf_map_lookup_elem(&trusted_src_ips, &ip->saddr);
+    struct trusted_v4_key tk4 = { .prefixlen = 32, .addr = ip->saddr };
+    __u32 *trusted = bpf_map_lookup_elem(&trusted_src_ips4, &tk4);
     if (trusted && *trusted) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
@@ -453,6 +624,25 @@ static __always_inline int check_udp_ipv6(
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow) {
+        if (udp_rate_check(&key, now, dest_port) == XDP_DROP) {
+            count(CNT_UDP_RATE_DROP);
+            count(CNT_UDP_DROP);
+            return XDP_DROP;
+        }
+        if (udp_global_rate_check(now) == XDP_DROP) {
+            count(CNT_UDP_GLOBAL_RATE_DROP);
+            count(CNT_UDP_DROP);
+            return XDP_DROP;
+        }
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
+
+    struct trusted_v6_key tk6;
+    tk6.prefixlen = 128;
+    __builtin_memcpy(tk6.addr, &ipv6->saddr, 16);
+    __u32 *trusted6 = bpf_map_lookup_elem(&trusted_src_ips6, &tk6);
+    if (trusted6 && *trusted6) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }

@@ -96,8 +96,7 @@ Incoming Packet
 - **Auto-sync whitelist**: daemon watches listening sockets and updates the active backend in real time
 - **IPv4 + IPv6 TCP conntrack hardening**: pure SYN creates temporary state; unsolicited ACK packets are dropped
 - **Kernel-side outbound state tracking**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets and UDP reply tuples so return traffic can be matched at XDP without reopening the old bypasses
-- **IPv4 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by `udp_conntrack`, and explicitly trusted IPv4 sources can still be allowed via `trusted_src_ips`
-- **IPv6 UDP stateful filtering**: reply traffic uses the shared `udp_conntrack`, and inbound server traffic still uses `udp_whitelist` (note: `trusted_src_ips` is currently IPv4-only)
+- **IPv4 + IPv6 UDP hardening**: inbound server ports use `udp_whitelist`, reply traffic can be matched by `udp_conntrack`, and explicitly trusted IPv4/IPv6 sources or CIDR ranges can be allowed via `trusted_src_ips4`/`trusted_src_ips6`
 - **IPv6 support**, including extension header traversal on both XDP and tc egress, plus explicit non-initial fragment drops
 - **Periodic conntrack sync (seeding established flows)**: the daemon now periodically seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack`, which helps preserve active sessions after re-attaching XDP or manual map clears.
 - **Reload-safe XDP attach**: the installer also pre-seeds existing sessions before initial attach.
@@ -214,7 +213,8 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
 | `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
-| `trusted_src_ips` | HASH | 256 | `__be32` IPv4 source address | `__u32` (1 = trusted) |
+| `trusted_src_ips4` | LPM_TRIE | 256 | `struct trusted_v4_key { prefixlen, addr }` (IPv4 CIDR) | `__u32` (1 = trusted) |
+| `trusted_src_ips6` | LPM_TRIE | 256 | `struct trusted_v6_key { prefixlen, addr[16] }` (IPv6 CIDR) | `__u32` (1 = trusted) |
 | `pkt_counters` | PERCPU_ARRAY | 12 | `__u32` counter index | `__u64` packet count |
 | `icmp_tb` | ARRAY | 1 | `__u32` (0) | `struct icmp_token_bucket { last_ns, tokens }` |
 | `syn_rate_ports` | HASH | 64 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
@@ -258,10 +258,10 @@ The daemon `xdp_port_sync.py` runs behind the launcher `/usr/local/bin/auto_xdp_
 3. **Safety Fallback**: Performs a full sync every **30 seconds** to ensure consistency.
 4. **Backend Sync**: Updates either pinned BPF maps or `nftables` sets, depending on what the host supports.
 5. **UDP Discovery Rule**: Because UDP has no `LISTEN` state, the daemon syncs unconnected bound UDP sockets (no remote peer) into `udp_whitelist`, which is a practical approximation of server-style UDP ports.
-6. **Trusted Source IPs**: Optional IPv4 addresses can be synced into the XDP-side `trusted_src_ips` map for reply-style UDP traffic such as DNS or NTP. (IPv6 support under progress)
+6. **Trusted Source IPs/CIDRs**: Optional IPv4/IPv6 addresses or CIDR ranges can be synced into the XDP-side `trusted_src_ips4`/`trusted_src_ips6` LPM trie maps for reply-style UDP traffic such as DNS or NTP.
 7. **Backend Guard Rails**: In `auto` mode, the daemon only selects XDP when the required pinned maps are present; otherwise it falls back to `nftables` instead of crashing.
 
-Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips`.
+Outbound TCP/UDP reply tracking is kernel-side: a `tc` egress program records reverse reply tuples into `tcp_conntrack` and `udp_conntrack`, and the XDP ingress path checks those maps before falling back to `tcp_whitelist`, `udp_whitelist`, or `trusted_src_ips4`/`trusted_src_ips6`.
 
 ### Permanent Ports
 
@@ -270,16 +270,37 @@ Edit `xdp_port_sync.py` to always allow specific ports:
 ```python
 TCP_PERMANENT = {22: "SSH-fallback"}   # Optional: add ports you never want blocked
 UDP_PERMANENT = {50000: "custom-udp-service"}  # Use this for real high-port UDP services
-TRUSTED_SRC_IPS = {"1.1.1.1": "cloudflare-dns"}
+TRUSTED_SRC_IPS = {"1.1.1.1/32": "cloudflare-dns", "2606:4700:4700::1111/128": "cloudflare-dns-v6", "10.0.0.0/8": "internal-net"}
 ```
 
 If a real UDP server uses a high port, add it to `UDP_PERMANENT` explicitly so it remains whitelisted even when the daemon's socket heuristics cannot distinguish it cleanly from transient client traffic.
 
-You can also add trusted IPv4 sources at runtime:
+You can also add trusted IPv4/IPv6 sources and CIDR ranges at runtime:
 
 ```bash
-python3 /usr/local/bin/xdp_port_sync.py --backend auto --trusted-ip 1.1.1.1 cloudflare-dns
-python3 /usr/local/bin/xdp_port_sync.py --backend auto --trusted-ip 129.6.15.28 ntp-nist --dry-run
+# Single IPv4 host
+python3 /usr/local/bin/xdp_port_sync.py --backend auto \
+  --trusted-ip 1.1.1.1 cloudflare-dns
+
+# IPv4 subnet — host bits are masked automatically (203.23.2.5/24 → 203.23.2.0/24)
+python3 /usr/local/bin/xdp_port_sync.py --backend auto \
+  --trusted-ip 203.23.2.0/24 office-net
+
+# IPv6 single host
+python3 /usr/local/bin/xdp_port_sync.py --backend auto \
+  --trusted-ip 2606:4700:4700::1111 cloudflare-dns-v6
+
+# IPv6 prefix
+python3 /usr/local/bin/xdp_port_sync.py --backend auto \
+  --trusted-ip 2001:db8::/32 example-v6-net
+
+# Mix of IPv4, IPv4 CIDR, IPv6 host, IPv6 prefix — all in one invocation
+python3 /usr/local/bin/xdp_port_sync.py --backend auto \
+  --trusted-ip 1.1.1.1          cloudflare-dns \
+  --trusted-ip 10.0.0.0/8       internal-net \
+  --trusted-ip 2606:4700:4700::1111 cloudflare-dns-v6 \
+  --trusted-ip fd00::/8         ula-net \
+  --dry-run
 ```
 
 `--trusted-ip` currently affects the XDP backend. The `nftables` fallback continues to use its own compatibility ruleset.
@@ -448,13 +469,14 @@ In `--force` mode, the installer skips confirmation prompts and:
 - **IPv4 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
   - If destination port is in `udp_whitelist` → **PASS**
-  - Else if source IPv4 address is in `trusted_src_ips` → **PASS**
+  - Else if source IPv4 address/prefix matches `trusted_src_ips4` → **PASS**
   - Otherwise → **DROP**
 - **IPv6 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
   - If destination port is in `udp_whitelist` → **PASS**
+  - Else if source IPv6 address/prefix matches `trusted_src_ips6` → **PASS**
   - Otherwise → **DROP**
-- **Userspace assist**: trusted IPv4 source addresses remain available as an explicit fallback for response-style UDP traffic.
+- **Userspace assist**: trusted IPv4/IPv6 source addresses and CIDR ranges remain available as an explicit fallback for response-style UDP traffic (e.g. DNS, NTP).
 
 ### IPv6 Extension Headers
 

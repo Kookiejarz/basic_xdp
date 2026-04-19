@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ipaddress
 import ctypes.util
 import errno
 import logging
@@ -33,13 +34,17 @@ except ImportError:
 TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
 TCP_CONNTRACK_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_conntrack"
-TRUSTED_IPS_MAP_PATH = "/sys/fs/bpf/xdp_fw/trusted_src_ips"
-SYN_RATE_MAP_PATH = "/sys/fs/bpf/xdp_fw/syn_rate_ports"
+TRUSTED_IPS_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/trusted_src_ips4"
+TRUSTED_IPS_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/trusted_src_ips6"
+SYN_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/syn_rate_ports"
+UDP_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/udp_rate_ports"
+UDP_GLOBAL_RL_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_global_rl"
 REQUIRED_XDP_MAP_PATHS = (
     TCP_MAP_PATH,
     UDP_MAP_PATH,
     TCP_CONNTRACK_MAP_PATH,
-    TRUSTED_IPS_MAP_PATH,
+    TRUSTED_IPS_MAP_PATH4,
+    TRUSTED_IPS_MAP_PATH6,
 )
 
 # SYN rate limits keyed by process name (highest priority).
@@ -81,6 +86,20 @@ _SYN_RATE_BY_SERVICE: dict[str, int] = {
     "ms-wbt-server": 2,  # RDP 3389
     "vnc":           2,
     "telnet":        2,
+}
+
+_UDP_RATE_BY_PROC: dict[str, int] = {
+    "named":    5000,
+    "unbound":  5000,
+    "dnsmasq":  5000,
+    "openvpn":   200,
+}
+
+_UDP_RATE_BY_SERVICE: dict[str, int] = {
+    "domain":   5000,  # DNS 53
+    "ntp":       500,  # NTP 123
+    "isakmp":    100,  # IKE/VPN 500
+    "openvpn":   200,  # OpenVPN 1194
 }
 
 NFT_FAMILY = "inet"
@@ -225,16 +244,19 @@ class BpfArrayMap:
             return False
 
 
-class BpfHashMap:
-    """Pinned BPF HASH map (key = IPv4 __be32, value = __u32 1)."""
+class BpfLpmMap:
+    """Pinned BPF LPM_TRIE map for CIDR prefix matching (IPv4 or IPv6)."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, family: int) -> None:
         self.path = path
         self.fd = _obj_get(path)
+        self._family = family
+        self._addr_len = 4 if family == socket.AF_INET else 16
+        self._max_prefix = 32 if family == socket.AF_INET else 128
+        self._key_len = 4 + self._addr_len
         self._cache: set[str] = set()
-
-        self._key = ctypes.create_string_buffer(4)
-        self._next_key = ctypes.create_string_buffer(4)
+        self._key = ctypes.create_string_buffer(self._key_len)
+        self._next_key = ctypes.create_string_buffer(self._key_len)
         self._val = ctypes.create_string_buffer(4)
         self._update_attr = ctypes.create_string_buffer(128)
         self._lookup_attr = ctypes.create_string_buffer(128)
@@ -260,36 +282,54 @@ class BpfHashMap:
         except Exception:
             pass
 
-    def _pack_ip(self, ip_str: str) -> None:
-        ctypes.memmove(self._key, socket.inet_aton(ip_str), 4)
+    def _pack_key(self, cidr_str: str) -> str:
+        if self._family == socket.AF_INET:
+            net = ipaddress.IPv4Network(cidr_str, strict=False)
+        else:
+            net = ipaddress.IPv6Network(cidr_str, strict=False)
+        addr_bytes = net.network_address.packed
+        ctypes.memmove(self._key, struct.pack("=I", net.prefixlen) + addr_bytes, self._key_len)
+        return f"{net.network_address}/{net.prefixlen}"
 
-    def _update(self, ip_str: str, val: int) -> None:
-        self._pack_ip(ip_str)
+    def _unpack_key(self, key_raw: bytes) -> str:
+        prefixlen = struct.unpack_from("=I", key_raw, 0)[0]
+        addr_raw = key_raw[4:4 + self._addr_len]
+        if self._family == socket.AF_INET:
+            ip_str = socket.inet_ntoa(addr_raw)
+        else:
+            ip_str = socket.inet_ntop(socket.AF_INET6, addr_raw)
+        return f"{ip_str}/{prefixlen}"
+
+    def _update(self, cidr_str: str, val: int) -> str:
+        normalized = self._pack_key(cidr_str)
         struct.pack_into("=I", self._val, 0, val)
         _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
+        return normalized
 
-    def _delete(self, ip_str: str) -> None:
-        self._pack_ip(ip_str)
+    def _delete_key(self, cidr_str: str) -> str:
+        normalized = self._pack_key(cidr_str)
         _bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
+        return normalized
 
     def _lookup_raw_key(self, key_raw: bytes) -> int:
-        ctypes.memmove(self._key, key_raw, 4)
+        ctypes.memmove(self._key, key_raw, self._key_len)
         _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
         return struct.unpack_from("=I", self._val, 0)[0]
 
     def _iter_raw_keys(self):
         current_ptr = 0
         while True:
-            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
+            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr,
+                             ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
             try:
                 _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
             except OSError as exc:
                 if exc.errno == errno.ENOENT:
                     break
                 raise
-            key_raw = bytes(self._next_key.raw[:4])
+            key_raw = bytes(self._next_key.raw[:self._key_len])
             yield key_raw
-            ctypes.memmove(self._key, key_raw, 4)
+            ctypes.memmove(self._key, key_raw, self._key_len)
             current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
 
     def _load_cache(self) -> None:
@@ -297,7 +337,7 @@ class BpfHashMap:
             for key_raw in self._iter_raw_keys():
                 try:
                     if self._lookup_raw_key(key_raw):
-                        self._cache.add(socket.inet_ntoa(key_raw))
+                        self._cache.add(self._unpack_key(key_raw))
                 except OSError:
                     continue
         except OSError:
@@ -306,37 +346,61 @@ class BpfHashMap:
     def active_keys(self) -> set[str]:
         return set(self._cache)
 
-    def set(self, ip_str: str, val: int, dry_run: bool = False) -> bool:
+    def set(self, cidr_str: str, val: int, dry_run: bool = False) -> bool:
         if not val:
-            return self.delete(ip_str, dry_run)
-
+            return self.delete(cidr_str, dry_run)
         if dry_run:
-            log.info("[DRY] %s ip %s -> 1", self.path, ip_str)
-            self._cache.add(ip_str)
+            log.info("[DRY] %s cidr %s -> 1", self.path, cidr_str)
+            self._cache.add(cidr_str)
             return True
         try:
-            self._update(ip_str, 1)
-            self._cache.add(ip_str)
+            normalized = self._update(cidr_str, 1)
+            self._cache.add(normalized)
             return True
         except OSError as exc:
-            log.warning("BPF update failed ip=%s: %s", ip_str, exc)
+            log.warning("BPF update failed cidr=%s: %s", cidr_str, exc)
             return False
 
-    def delete(self, ip_str: str, dry_run: bool = False) -> bool:
+    def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
         if dry_run:
-            log.info("[DRY] %s delete ip %s", self.path, ip_str)
-            self._cache.discard(ip_str)
+            log.info("[DRY] %s delete cidr %s", self.path, cidr_str)
+            self._cache.discard(cidr_str)
             return True
         try:
-            self._delete(ip_str)
-            self._cache.discard(ip_str)
+            normalized = self._delete_key(cidr_str)
+            self._cache.discard(normalized)
             return True
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                self._cache.discard(ip_str)
+                self._cache.discard(cidr_str)
                 return True
-            log.warning("BPF delete failed ip=%s: %s", ip_str, exc)
+            log.warning("BPF delete failed cidr=%s: %s", cidr_str, exc)
             return False
+
+
+class BpfTrustedMaps:
+    """Pair of IPv4/IPv6 LPM trie maps for trusted source CIDRs."""
+
+    def __init__(self, path4: str, path6: str) -> None:
+        self._map4 = BpfLpmMap(path4, socket.AF_INET)
+        self._map6 = BpfLpmMap(path6, socket.AF_INET6)
+
+    def close(self) -> None:
+        self._map4.close()
+        self._map6.close()
+
+    def active_keys(self) -> set[str]:
+        return self._map4.active_keys() | self._map6.active_keys()
+
+    def set(self, cidr_str: str, val: int, dry_run: bool = False) -> bool:
+        if ":" in cidr_str:
+            return self._map6.set(cidr_str, val, dry_run)
+        return self._map4.set(cidr_str, val, dry_run)
+
+    def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
+        if ":" in cidr_str:
+            return self._map6.delete(cidr_str, dry_run)
+        return self._map4.delete(cidr_str, dry_run)
 
 
 class BpfConntrackMap:
@@ -428,6 +492,19 @@ def _port_rate_limit(port: int, proc: str = "") -> int:
     except OSError:
         return 0
     return _SYN_RATE_BY_SERVICE.get(svc, 0)
+
+
+def _udp_port_rate_limit(port: int, proc: str = "") -> int:
+    """Return the UDP rate limit for a port, or 0 to skip rate limiting."""
+    if proc:
+        rate = _UDP_RATE_BY_PROC.get(proc)
+        if rate is not None:
+            return rate
+    try:
+        svc = socket.getservbyport(port, "udp")
+    except OSError:
+        return 0
+    return _UDP_RATE_BY_SERVICE.get(svc, 0)
 
 
 class BpfSynRatePortsMap:
@@ -558,7 +635,7 @@ class XdpBackend(PortBackend):
     def __init__(self) -> None:
         self.tcp_map = BpfArrayMap(TCP_MAP_PATH)
         self.udp_map = BpfArrayMap(UDP_MAP_PATH)
-        self.trusted_map = BpfHashMap(TRUSTED_IPS_MAP_PATH)
+        self.trusted_map = BpfTrustedMaps(TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6)
         self.conntrack_map = BpfConntrackMap(TCP_CONNTRACK_MAP_PATH)
         try:
             self.syn_rate_map: BpfSynRatePortsMap | None = BpfSynRatePortsMap(SYN_RATE_MAP_PATH)
@@ -566,6 +643,12 @@ class XdpBackend(PortBackend):
         except OSError as exc:
             log.debug("syn_rate_ports map unavailable (%s); SYN rate limiting inactive.", exc)
             self.syn_rate_map = None
+        try:
+            self.udp_rate_map: BpfSynRatePortsMap | None = BpfSynRatePortsMap(UDP_RATE_MAP_PATH)
+            log.debug("udp_rate_ports map opened; per-source UDP rate limiting active.")
+        except OSError as exc:
+            log.debug("udp_rate_ports map unavailable (%s); UDP rate limiting inactive.", exc)
+            self.udp_rate_map = None
 
     def close(self) -> None:
         self.tcp_map.close()
@@ -574,6 +657,8 @@ class XdpBackend(PortBackend):
         self.conntrack_map.close()
         if self.syn_rate_map is not None:
             self.syn_rate_map.close()
+        if self.udp_rate_map is not None:
+            self.udp_rate_map.close()
 
     def sync_ports(
         self,
@@ -639,6 +724,9 @@ class XdpBackend(PortBackend):
         if self.syn_rate_map is not None:
             self._sync_syn_rate(tcp_target, dry_run)
 
+        if self.udp_rate_map is not None:
+            self._sync_udp_rate(udp_target, dry_run)
+
     def _sync_syn_rate(self, tcp_ports: set[int], dry_run: bool) -> None:
         """Update syn_rate_ports to match the current set of whitelisted TCP ports."""
         active = self.syn_rate_map.active()  # type: ignore[union-attr]
@@ -684,6 +772,29 @@ class XdpBackend(PortBackend):
         for port in set(active) - set(desired):
             if self.syn_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
                 log.info("SYN rate port %d removed (port no longer whitelisted)", port)
+
+    def _sync_udp_rate(self, udp_ports: set[int], dry_run: bool) -> None:
+        """Update udp_rate_ports to match the current set of whitelisted UDP ports."""
+        active = self.udp_rate_map.active()  # type: ignore[union-attr]
+
+        desired: dict[int, int] = {}
+        for port in udp_ports:
+            rate = _udp_port_rate_limit(port)
+            if rate > 0:
+                desired[port] = rate
+
+        for port, rate_max in desired.items():
+            if active.get(port) != rate_max:
+                if self.udp_rate_map.set(port, rate_max, dry_run):  # type: ignore[union-attr]
+                    try:
+                        svc = socket.getservbyport(port, "udp")
+                    except OSError:
+                        svc = "unknown"
+                    log.info("UDP rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
+
+        for port in set(active) - set(desired):
+            if self.udp_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
+                log.info("UDP rate port %d removed (port no longer whitelisted)", port)
 
 
 class NftablesBackend(PortBackend):
@@ -1009,10 +1120,16 @@ def watch(interval: int, dry_run: bool, backend_name: str) -> None:
 def main() -> None:
     def _parse_trusted_ip(ip_str: str) -> str:
         try:
-            socket.inet_aton(ip_str)
-        except OSError as exc:
-            raise argparse.ArgumentTypeError(f"invalid IPv4 address: {ip_str}") from exc
-        return ip_str
+            net = ipaddress.IPv4Network(ip_str, strict=False)
+            return f"{net.network_address}/{net.prefixlen}"
+        except ValueError:
+            pass
+        try:
+            net = ipaddress.IPv6Network(ip_str, strict=False)
+            return f"{net.network_address}/{net.prefixlen}"
+        except ValueError:
+            pass
+        raise argparse.ArgumentTypeError(f"invalid IPv4/IPv6 address or CIDR: {ip_str}")
 
     p = argparse.ArgumentParser(description="Auto XDP port-whitelist sync daemon")
     p.add_argument(
@@ -1049,7 +1166,7 @@ def main() -> None:
         nargs=2,
         metavar=("IP", "LABEL"),
         default=[],
-        help="Add a trusted IPv4 source IP and label (repeatable)",
+        help="Add a trusted IPv4/IPv6 source IP or CIDR and label (repeatable)",
     )
     args = p.parse_args()
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))

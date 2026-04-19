@@ -196,13 +196,13 @@ class XdpPortSyncTests(unittest.TestCase):
         with mock.patch.object(xdp, "get_listening_ports", return_value=state), \
              mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(xdp, "UDP_PERMANENT", {123: "ntp"}), \
-             mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"203.0.113.8": "office"}):
+             mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}):
             xdp.sync_once(backend, dry_run=True)
 
         backend.sync_ports.assert_called_once_with(
             {22, 80},
             {53, 123},
-            {"203.0.113.8"},
+            {"203.0.113.8/32"},
             {b"flow"},
             True,
         )
@@ -211,28 +211,31 @@ class XdpPortSyncTests(unittest.TestCase):
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
         backend.tcp_map = FakePortMap({22, 80})
         backend.udp_map = FakePortMap({53, 9999})
-        backend.trusted_map = FakeTrustedMap({"203.0.113.1"})
+        backend.trusted_map = FakeTrustedMap({"203.0.113.1/32"})
         backend.conntrack_map = FakeConntrackMap({b"keep"})
         backend.syn_rate_map = FakeSynRateMap({22: 1})
+        backend.udp_rate_map = FakeSynRateMap()
         backend._sync_syn_rate = mock.Mock()
+        backend._sync_udp_rate = mock.Mock()
 
         with mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(xdp, "UDP_PERMANENT", {53: "dns"}), \
-             mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"198.51.100.5": "office"}):
+             mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
             backend.sync_ports(
                 tcp_target={22, 443},
                 udp_target={53},
-                trusted_target={"198.51.100.5"},
+                trusted_target={"198.51.100.5/32"},
                 conntrack_target={b"keep", b"seed"},
                 dry_run=False,
             )
 
         self.assertEqual(backend.tcp_map.ops, [(443, 1, False), (80, 0, False)])
         self.assertEqual(backend.udp_map.ops, [(9999, 0, False)])
-        self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5", 1, False)])
-        self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1", False)])
+        self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
+        self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1/32", False)])
         self.assertEqual(backend.conntrack_map.ops, [(b"seed", False)])
         backend._sync_syn_rate.assert_called_once_with({22, 443}, False)
+        backend._sync_udp_rate.assert_called_once_with({53}, False)
 
     def test_xdp_backend_sync_syn_rate_uses_proc_names_and_service_names(self):
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
@@ -272,6 +275,38 @@ class XdpPortSyncTests(unittest.TestCase):
         )
         self.assertEqual(backend.syn_rate_map.delete_ops, [(8080, False)])
 
+    def test_udp_port_rate_limit_prefers_process_name_then_service_name(self):
+        def fake_getservbyport(port, proto):
+            services = {53: "domain", 123: "ntp"}
+            if port not in services:
+                raise OSError("unknown service")
+            return services[port]
+
+        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport):
+            self.assertEqual(xdp._udp_port_rate_limit(5353, "named"), 5000)
+            self.assertEqual(xdp._udp_port_rate_limit(53), 5000)
+            self.assertEqual(xdp._udp_port_rate_limit(123), 500)
+            self.assertEqual(xdp._udp_port_rate_limit(12345), 0)
+
+    def test_xdp_backend_sync_udp_rate_sets_rates_for_udp_ports(self):
+        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend.udp_rate_map = FakeSynRateMap({53: 1000, 9999: 5})
+
+        def fake_getservbyport(port, proto):
+            services = {53: "domain", 123: "ntp"}
+            if port not in services:
+                raise OSError("unknown service")
+            return services[port]
+
+        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport):
+            backend._sync_udp_rate({53, 123}, dry_run=False)
+
+        self.assertCountEqual(
+            backend.udp_rate_map.set_ops,
+            [(53, 5000, False), (123, 500, False)],
+        )
+        self.assertEqual(backend.udp_rate_map.delete_ops, [(9999, False)])
+
     def test_xdp_backend_close_closes_all_maps(self):
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
         backend.tcp_map = FakePortMap()
@@ -279,6 +314,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.trusted_map = FakeTrustedMap()
         backend.conntrack_map = FakeConntrackMap()
         backend.syn_rate_map = FakeSynRateMap()
+        backend.udp_rate_map = FakeSynRateMap()
 
         backend.close()
 
@@ -287,6 +323,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.trusted_map.closed)
         self.assertTrue(backend.conntrack_map.closed)
         self.assertTrue(backend.syn_rate_map.closed)
+        self.assertTrue(backend.udp_rate_map.closed)
 
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
         backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
@@ -385,7 +422,7 @@ class XdpPortSyncTests(unittest.TestCase):
         open_backend.assert_called_once_with("nftables")
         sync_once.assert_called_once_with(backend, False)
         backend.close.assert_called_once_with()
-        self.assertEqual(trusted_ips, {"198.51.100.8": "office"})
+        self.assertEqual(trusted_ips, {"198.51.100.8/32": "office"})
 
     def test_main_watch_mode_delegates_to_watch(self):
         with mock.patch.object(sys, "argv", [
