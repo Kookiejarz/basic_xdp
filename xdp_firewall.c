@@ -27,6 +27,7 @@ struct vlan_hdr {
 #endif
 
 #define IPV6_FRAG_DROP_SENTINEL 0xFF
+#define VLAN_MAX_DEPTH 4
 #define CT_FAMILY_IPV4 2
 #define CT_FAMILY_IPV6 10
 
@@ -74,7 +75,15 @@ enum xdp_counter_idx {
     CNT_SYN_RATE_DROP   = 11, // TCP SYN dropped by per-IP rate limiter (anti-brute-force)
     CNT_UDP_RATE_DROP        = 12, // UDP dropped by per-source-IP rate limiter
     CNT_UDP_GLOBAL_RATE_DROP = 13, // UDP dropped by global sliding-window rate limiter
-    CNT_MAX                  = 14,
+    CNT_TCP_MALFORM_NULL     = 14, // TCP NULL scan (all flags zero)
+    CNT_TCP_MALFORM_XMAS     = 15, // TCP XMAS scan (FIN+URG+PSH)
+    CNT_TCP_MALFORM_SYN_FIN  = 16, // TCP SYN+FIN contradictory flags
+    CNT_TCP_MALFORM_SYN_RST  = 17, // TCP SYN+RST contradictory flags
+    CNT_TCP_MALFORM_RST_FIN  = 18, // TCP RST+FIN contradictory flags
+    CNT_TCP_MALFORM_DOFF     = 19, // TCP invalid data offset (doff < 5 or > 15 or truncated)
+    CNT_TCP_MALFORM_PORT0    = 20, // TCP src or dst port is 0
+    CNT_VLAN_DROP            = 21, // packet dropped: VLAN nesting exceeds VLAN_MAX_DEPTH
+    CNT_MAX                  = 22,
 };
 
 struct {
@@ -502,6 +511,74 @@ drop:
     return XDP_DROP;
 }
 
+// TCP malformed packet check. Called after the basic 20-byte bounds check,
+// before conntrack. Returns XDP_DROP (and increments the appropriate counter)
+// for any packet that violates RFC 793 structural invariants.
+static __always_inline int tcp_malformed_drop(struct tcphdr *tcp, void *data_end)
+{
+    // doff must be 5–15 (20–60 bytes); values outside this range are impossible
+    // on any conforming implementation and indicate a crafted/corrupt packet.
+    __u8 doff = tcp->doff;
+    if (doff < 5 || doff > 15) {
+        count(CNT_TCP_MALFORM_DOFF);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+    // Verify the full options area declared by doff is within the packet.
+    if ((void *)tcp + ((__u32)doff * 4) > data_end) {
+        count(CNT_TCP_MALFORM_DOFF);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    // Port 0 is reserved and never used by real traffic.
+    if (tcp->source == 0 || tcp->dest == 0) {
+        count(CNT_TCP_MALFORM_PORT0);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    __u8 flags = ((__u8 *)tcp)[13];
+
+    // NULL scan: no control bits set — useless for real traffic, used by scanners.
+    if (flags == 0) {
+        count(CNT_TCP_MALFORM_NULL);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    // SYN+FIN: open and close simultaneously — never valid per RFC 793.
+    if ((flags & 0x03) == 0x03) {
+        count(CNT_TCP_MALFORM_SYN_FIN);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    // SYN+RST: initiate and abort simultaneously — never valid per RFC 793.
+    if ((flags & 0x06) == 0x06) {
+        count(CNT_TCP_MALFORM_SYN_RST);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    // RST+FIN: abort and close simultaneously — never valid. Note: RST+ACK is
+    // legitimate (normal half-close acknowledgement) and must not be caught here.
+    if ((flags & 0x05) == 0x05) {
+        count(CNT_TCP_MALFORM_RST_FIN);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    // XMAS scan: FIN(0x01)+URG(0x20)+PSH(0x08) all set — nmap -sX signature.
+    if ((flags & 0x29) == 0x29) {
+        count(CNT_TCP_MALFORM_XMAS);
+        count(CNT_TCP_DROP);
+        return XDP_DROP;
+    }
+
+    return XDP_PASS;
+}
+
 static __always_inline int check_tcp_ipv4(
     struct iphdr *ip, void *trans_data, void *data_end)
 {
@@ -510,6 +587,9 @@ static __always_inline int check_tcp_ipv4(
 
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
+
+    if (tcp_malformed_drop(tcp, data_end) == XDP_DROP)
+        return XDP_DROP;
 
     __u8  tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
@@ -526,6 +606,9 @@ static __always_inline int check_tcp_ipv6(
 
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
+
+    if (tcp_malformed_drop(tcp, data_end) == XDP_DROP)
+        return XDP_DROP;
 
     __u8 tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
@@ -737,6 +820,27 @@ static __always_inline __u8 skip_ipv6_exthdr(
     return nexthdr;
 }
 
+// Strip up to VLAN_MAX_DEPTH 802.1Q/802.1AD tags from the Ethernet frame.
+// Returns false if the packet is truncated mid-tag (caller should XDP_PASS).
+// After a successful return, if *eth_proto is still 0x8100/0x88a8 the nesting
+// depth exceeds VLAN_MAX_DEPTH and the caller should DROP.
+static __always_inline bool strip_vlan_tags(
+    __be16 *eth_proto, void **l3_data, void *data_end)
+{
+    #pragma unroll
+    for (int i = 0; i < VLAN_MAX_DEPTH; i++) {
+        if (*eth_proto != bpf_htons(ETH_P_8021Q) &&
+            *eth_proto != bpf_htons(ETH_P_8021AD))
+            return true;
+        struct vlan_hdr *vlan = *l3_data;
+        if ((void *)(vlan + 1) > data_end)
+            return false; // truncated: let the kernel handle it
+        *eth_proto = vlan->h_vlan_encapsulated_proto;
+        *l3_data   = (void *)(vlan + 1);
+    }
+    return true; // loop exhausted; caller checks whether eth_proto is still VLAN
+}
+
 // Main XDP program
 
 SEC("xdp")
@@ -755,23 +859,15 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
     __be16 eth_proto = eth->h_proto;
     void  *l3_data   = (void *)(eth + 1);
 
+    if (!strip_vlan_tags(&eth_proto, &l3_data, data_end))
+        return XDP_PASS; // truncated VLAN header: let the kernel handle it
+
+    // Drop packets with more VLAN layers than VLAN_MAX_DEPTH — no legitimate
+    // traffic uses such deep nesting; deeper tags are a known bypass technique.
     if (eth_proto == bpf_htons(ETH_P_8021Q) ||
         eth_proto == bpf_htons(ETH_P_8021AD)) {
-        struct vlan_hdr *vlan = l3_data;
-        if ((void *)(vlan + 1) > data_end)
-            return XDP_PASS;
-        eth_proto = vlan->h_vlan_encapsulated_proto;
-        l3_data   = (void *)(vlan + 1);
-
-        // Handle double-tagged (QinQ) — one more layer at most.
-        if (eth_proto == bpf_htons(ETH_P_8021Q) ||
-            eth_proto == bpf_htons(ETH_P_8021AD)) {
-            vlan = l3_data;
-            if ((void *)(vlan + 1) > data_end)
-                return XDP_PASS;
-            eth_proto = vlan->h_vlan_encapsulated_proto;
-            l3_data   = (void *)(vlan + 1);
-        }
+        count(CNT_VLAN_DROP);
+        return XDP_DROP;
     }
 
     // 2. IPv4

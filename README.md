@@ -465,6 +465,31 @@ In `--force` mode, the installer skips confirmation prompts and:
 - **Kernel assist**: a `tc` egress program records host-initiated IPv4/IPv6 TCP SYN packets immediately, closing the race where a very short outbound connection could receive SYN-ACK before conntrack state existed.
 - **Reload assist**: `setup_xdp.sh` pre-seeds existing IPv4/IPv6 TCP sessions into `tcp_conntrack` before re-attaching XDP, which helps preserve active sessions during reinstall/restart.
 
+### TCP Malformed Packet Detection
+
+Structural validity is checked **before** conntrack lookup and before the RST fast-path. Each violation increments a dedicated counter in `pkt_counters`.
+
+| Check | DROP condition | RFC basis |
+|---|---|---|
+| Invalid data offset | `doff < 5` or `doff > 15`, or declared header extends past packet end | [RFC 793 §3.1](https://www.rfc-editor.org/rfc/rfc793#section-3.1): "The minimum value for a correct header is 5." Maximum is 15 (60 bytes with options). |
+| Port zero | `src port == 0` or `dst port == 0` | [RFC 793 §3.1](https://www.rfc-editor.org/rfc/rfc793#section-3.1): port fields are undefined at zero; [RFC 6335 §7.1](https://www.rfc-editor.org/rfc/rfc6335#section-7.1) reserves port 0 as unassigned. |
+| NULL scan | All control bits zero | [RFC 793 §3.9](https://www.rfc-editor.org/rfc/rfc793#section-3.9): every state-machine transition requires at least one control bit. A packet with no flags has no defined processing path. |
+| SYN+FIN | Both bits set simultaneously | [RFC 793 §3.4](https://www.rfc-editor.org/rfc/rfc793#section-3.4): SYN requests connection open; FIN signals end of data. The state machine never transitions on both simultaneously — no conforming implementation produces this combination. |
+| SYN+RST | Both bits set simultaneously | [RFC 793 §3.4](https://www.rfc-editor.org/rfc/rfc793#section-3.4): RST aborts or refuses a connection; SYN initiates one. These are mutually exclusive operations with no defined joint state. |
+| RST+FIN | Both bits set simultaneously | [RFC 793 §3.5](https://www.rfc-editor.org/rfc/rfc793#section-3.5): FIN closes a connection gracefully; RST aborts it. No state transition in RFC 793 generates both. RST+ACK (normal half-close acknowledgement) is explicitly **allowed**. |
+| XMAS scan | FIN+URG+PSH all set | [RFC 793 §3.9](https://www.rfc-editor.org/rfc/rfc793#section-3.9): no state machine transition is defined for this combination. Classic `nmap -sX` fingerprint used against BSD-derived stacks. |
+
+#### Why malformed checks run before the RST fast-path
+
+The conntrack path contains an RST fast-path that evicts the conntrack entry and immediately passes the packet to the kernel (so the kernel can deliver `ECONNRESET` to the application). This is the correct behavior for a **legitimate RST**.
+
+RFC 793 §3.4 defines RST processing only for structurally valid packets — valid `doff`, valid ports, and no contradictory flag combinations. A packet with RST set alongside SYN or FIN, or with `doff < 5`, is not a legitimate RST: it cannot have originated from any RFC 793-conforming implementation. Letting it reach the RST fast-path would:
+
+1. **Silently evict conntrack state** for an active connection — a trivially exploitable denial-of-service: an attacker sends a single spoofed RST+SYN to tear down any tracked session without completing the SYN handshake.
+2. **Forward a structurally invalid packet to the kernel** — the kernel may discard it, but the conntrack slot is already gone.
+
+Running the structural check first ensures that only RFC 793-conforming packets reach RST handling. The cost is one additional inline function call per TCP packet, which the BPF verifier eliminates entirely via `__always_inline`.
+
 ### UDP
 - **IPv4 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
