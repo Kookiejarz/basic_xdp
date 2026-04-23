@@ -106,6 +106,8 @@ NFT_FAMILY = "inet"
 NFT_TABLE = "auto_xdp"
 NFT_TCP_SET = "tcp_ports"
 NFT_UDP_SET = "udp_ports"
+NFT_TRUSTED_SET4 = "trusted_v4"
+NFT_TRUSTED_SET6 = "trusted_v6"
 
 BACKEND_AUTO = "auto"
 BACKEND_XDP = "xdp"
@@ -168,6 +170,10 @@ def _obj_get(path: str) -> int:
 
 def _render_nft_ports(ports: set[int]) -> str:
     return "{ " + ", ".join(str(port) for port in sorted(ports)) + " }"
+
+
+def _render_nft_addrs(addrs: set[str]) -> str:
+    return "{ " + ", ".join(sorted(addrs)) + " }"
 
 
 def _run_nft(args: list[str], input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -807,13 +813,17 @@ class NftablesBackend(PortBackend):
             raise RuntimeError("nft command not found")
         self._tcp_cache: set[int] = set()
         self._udp_cache: set[int] = set()
+        self._trusted_cache: set[str] = set()
         self._ensure_ruleset()
 
     def _ensure_ruleset(self) -> None:
         result = _run_nft(["list", "table", NFT_FAMILY, NFT_TABLE], check=False)
         if result.returncode == 0:
             body = result.stdout
-            if all(marker in body for marker in (f"set {NFT_TCP_SET}", f"set {NFT_UDP_SET}", "chain input")):
+            if all(marker in body for marker in (
+                f"set {NFT_TCP_SET}", f"set {NFT_UDP_SET}",
+                f"set {NFT_TRUSTED_SET4}", "chain input",
+            )):
                 return
             _run_nft(["delete", "table", NFT_FAMILY, NFT_TABLE], check=True)
 
@@ -826,10 +836,22 @@ class NftablesBackend(PortBackend):
         type inet_service
     }}
 
+    set {NFT_TRUSTED_SET4} {{
+        type ipv4_addr
+        flags interval
+    }}
+
+    set {NFT_TRUSTED_SET6} {{
+        type ipv6_addr
+        flags interval
+    }}
+
     chain input {{
         type filter hook input priority filter; policy accept;
         iifname "lo" accept
         ct state established,related accept
+        ip saddr @{NFT_TRUSTED_SET4} accept
+        ip6 saddr @{NFT_TRUSTED_SET6} accept
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
         tcp flags & (ack | rst | fin) != 0 accept
@@ -868,6 +890,32 @@ class NftablesBackend(PortBackend):
             stderr = exc.stderr.strip() if exc.stderr else str(exc)
             raise RuntimeError(f"nftables update failed: {stderr}") from exc
 
+    def _apply_trusted(self, trusted_target: set[str], dry_run: bool) -> None:
+        v4 = {a for a in trusted_target if ":" not in a}
+        v6 = {a for a in trusted_target if ":" in a}
+        lines = [
+            f"flush set {NFT_FAMILY} {NFT_TABLE} {NFT_TRUSTED_SET4}",
+            f"flush set {NFT_FAMILY} {NFT_TABLE} {NFT_TRUSTED_SET6}",
+        ]
+        if v4:
+            lines.append(
+                f"add element {NFT_FAMILY} {NFT_TABLE} {NFT_TRUSTED_SET4} {_render_nft_addrs(v4)}"
+            )
+        if v6:
+            lines.append(
+                f"add element {NFT_FAMILY} {NFT_TABLE} {NFT_TRUSTED_SET6} {_render_nft_addrs(v6)}"
+            )
+        script = "\n".join(lines) + "\n"
+        if dry_run:
+            for line in lines:
+                log.info("[DRY] nft %s", line)
+            return
+        try:
+            _run_nft(["-f", "-"], input_text=script, check=True)
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.strip() if exc.stderr else str(exc)
+            raise RuntimeError(f"nftables trusted-ip update failed: {stderr}") from exc
+
     def sync_ports(
         self,
         tcp_target: set[int],
@@ -877,7 +925,15 @@ class NftablesBackend(PortBackend):
         dry_run: bool,
     ) -> None:
         changed = False
-        _ = (trusted_target, conntrack_target)
+        _ = conntrack_target  # kernel conntrack handles established flows natively
+
+        for ip_str in sorted(trusted_target - self._trusted_cache):
+            tag = f" [{TRUSTED_SRC_IPS[ip_str]}]" if ip_str in TRUSTED_SRC_IPS else ""
+            log.info("TRUST +%s%s", ip_str, tag)
+            changed = True
+        for ip_str in sorted(self._trusted_cache - trusted_target):
+            log.info("TRUST -%s  (removed)", ip_str)
+            changed = True
 
         for port in sorted(tcp_target - self._tcp_cache):
             tag = f" [{TCP_PERMANENT[port]}]" if port in TCP_PERMANENT else ""
@@ -896,8 +952,10 @@ class NftablesBackend(PortBackend):
             changed = True
 
         self._apply_targets(tcp_target, udp_target, dry_run)
+        self._apply_trusted(trusted_target, dry_run)
         self._tcp_cache = set(tcp_target)
         self._udp_cache = set(udp_target)
+        self._trusted_cache = set(trusted_target)
 
         if not changed:
             log.debug("Whitelist up-to-date.")

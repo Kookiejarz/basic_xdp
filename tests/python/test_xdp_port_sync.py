@@ -330,7 +330,7 @@ class XdpPortSyncTests(unittest.TestCase):
         existing = subprocess.CompletedProcess(
             ["nft"],
             0,
-            stdout=f"set {xdp.NFT_TCP_SET}\nset {xdp.NFT_UDP_SET}\nchain input\n",
+            stdout=f"set {xdp.NFT_TCP_SET}\nset {xdp.NFT_UDP_SET}\nset {xdp.NFT_TRUSTED_SET4}\nchain input\n",
         )
 
         with mock.patch.object(xdp, "_run_nft", return_value=existing) as run_nft:

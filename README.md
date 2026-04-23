@@ -213,12 +213,15 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 | `udp_whitelist` | ARRAY | 65536 | `__u32` port (host byte order) | `__u32` (1 = allow) |
 | `tcp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
 | `udp_conntrack` | LRU_HASH | 65536 | `struct ct_key { family, sport, dport, saddr[4], daddr[4] }` | `__u64` ktime_ns |
-| `trusted_src_ips4` | LPM_TRIE | 256 | `struct trusted_v4_key { prefixlen, addr }` (IPv4 CIDR) | `__u32` (1 = trusted) |
-| `trusted_src_ips6` | LPM_TRIE | 256 | `struct trusted_v6_key { prefixlen, addr[16] }` (IPv6 CIDR) | `__u32` (1 = trusted) |
-| `pkt_counters` | PERCPU_ARRAY | 12 | `__u32` counter index | `__u64` packet count |
+| `trusted_ipv4` | LPM_TRIE | 256 | `struct trusted_v4_key { prefixlen, addr }` (IPv4 CIDR) | `__u32` (1 = trusted) |
+| `trusted_ipv6` | LPM_TRIE | 256 | `struct trusted_v6_key { prefixlen, addr[16] }` (IPv6 CIDR) | `__u32` (1 = trusted) |
+| `pkt_counters` | PERCPU_ARRAY | 22 | `__u32` counter index | `__u64` packet count |
 | `icmp_tb` | ARRAY | 1 | `__u32` (0) | `struct icmp_token_bucket { last_ns, tokens }` |
 | `syn_rate_ports` | HASH | 64 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
 | `syn_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
+| `udp_rate_ports` | HASH | 64 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
+| `udp_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
+| `udp_global_rl` | ARRAY | 1 | `__u32` (0) | `struct udp_global_tb { lock, rate_max, window_start_ns, prev_count, curr_count }` |
 
 ### Manually Add / Remove a Port
 
@@ -303,7 +306,7 @@ python3 /usr/local/bin/xdp_port_sync.py --backend auto \
   --dry-run
 ```
 
-`--trusted-ip` currently affects the XDP backend. The `nftables` fallback continues to use its own compatibility ruleset.
+`--trusted-ip` is synced to both backends: XDP writes to the `trusted_ipv4`/`trusted_ipv6` LPM trie maps; `nftables` writes to equivalent `trusted_v4`/`trusted_v6` sets in the `auto_xdp` table.
 
 ### Daemon Management
 
@@ -370,13 +373,28 @@ What it shows:
 
 Counter labels in `axdp` are intentionally human-readable:
 
-1. `TCP_NEW_ALLOW` counts pure SYN packets admitted by `tcp_whitelist`
-2. `TCP_ESTABLISHED` counts TCP packets admitted by `tcp_conntrack`
-3. `TCP_CT_MISS` counts TCP ACK packets dropped because no conntrack entry existed
-4. `IPv6_ICMP` covers ICMPv6 and non-TCP/UDP IPv6 traffic that passed the rate limiter
-5. `ARP_NON_IP` covers ARP and other non-IP Ethernet traffic
-6. `ICMP_DROP` counts ICMP/ICMPv6 echo packets dropped by the token-bucket rate limiter
-7. `SYN_RATE_DROP` counts TCP SYN packets dropped by the per-IP SYN rate limiter
+1. `TCP_NEW_ALLOW` — pure SYN packets admitted by `tcp_whitelist` or trusted source
+2. `TCP_ESTABLISHED` — TCP packets admitted by `tcp_conntrack`
+3. `TCP_DROP` — TCP packets dropped
+4. `UDP_PASS` — UDP packets passed
+5. `UDP_DROP` — UDP packets dropped
+6. `IPv4_OTHER` — IPv4 non-TCP/UDP (ICMP, GRE, etc.) passed
+7. `IPv6_ICMP` — ICMPv6 and other non-TCP/UDP IPv6 traffic passed
+8. `FRAG_DROP` — fragmented packets dropped (IPv4 MF/offset set, or non-initial IPv6 fragments)
+9. `ARP_NON_IP` — ARP and other non-IP Ethernet traffic passed
+10. `TCP_CT_MISS` — TCP ACK packets dropped because no conntrack entry existed
+11. `ICMP_DROP` — ICMP/ICMPv6 echo packets dropped by the token-bucket rate limiter
+12. `SYN_RATE_DROP` — TCP SYN packets dropped by the per-IP SYN rate limiter
+13. `UDP_RATE_DROP` — UDP packets dropped by the per-source-IP rate limiter
+14. `UDP_GBL_DROP` — UDP packets dropped by the global sliding-window rate limiter
+15. `TCP_NULL` — TCP NULL scan (all flags zero)
+16. `TCP_XMAS` — TCP XMAS scan (FIN+URG+PSH)
+17. `TCP_SYN_FIN` — TCP SYN+FIN contradictory flags
+18. `TCP_SYN_RST` — TCP SYN+RST contradictory flags
+19. `TCP_RST_FIN` — TCP RST+FIN contradictory flags
+20. `TCP_BAD_DOFF` — TCP invalid data offset (`doff < 5`, `doff > 15`, or truncated header)
+21. `TCP_PORT0` — TCP src or dst port is 0
+22. `VLAN_DROP` — VLAN nesting depth exceeds limit (possible bypass attempt)
 
 ## Post-Install Quick Commands
 
@@ -458,6 +476,7 @@ In `--force` mode, the installer skips confirmation prompts and:
 
 ### TCP
 - **IPv4 + IPv6 stateful path**:
+  - If packet is a **pure SYN** and source matches `trusted_ipv4`/`trusted_ipv6` → insert flow key into `tcp_conntrack` and **PASS** (whitelist and SYN rate limit bypassed)
   - If packet is a **pure SYN** and destination port is in `tcp_whitelist` → insert flow key into `tcp_conntrack` and **PASS**
   - If **ACK** is set and the flow key exists in `tcp_conntrack` → **PASS**
   - If **ACK** is set and no conntrack entry exists → count `CNT_TCP_CT_MISS` and **DROP**
@@ -469,15 +488,15 @@ In `--force` mode, the installer skips confirmation prompts and:
 
 Structural validity is checked **before** conntrack lookup and before the RST fast-path. Each violation increments a dedicated counter in `pkt_counters`.
 
-| Check | DROP condition | RFC basis |
-|---|---|---|
-| Invalid data offset | `doff < 5` or `doff > 15`, or declared header extends past packet end | [RFC 793 §3.1](https://www.rfc-editor.org/rfc/rfc793#section-3.1): "The minimum value for a correct header is 5." Maximum is 15 (60 bytes with options). |
-| Port zero | `src port == 0` or `dst port == 0` | [RFC 793 §3.1](https://www.rfc-editor.org/rfc/rfc793#section-3.1): port fields are undefined at zero; [RFC 6335 §7.1](https://www.rfc-editor.org/rfc/rfc6335#section-7.1) reserves port 0 as unassigned. |
-| NULL scan | All control bits zero | [RFC 793 §3.9](https://www.rfc-editor.org/rfc/rfc793#section-3.9): every state-machine transition requires at least one control bit. A packet with no flags has no defined processing path. |
-| SYN+FIN | Both bits set simultaneously | [RFC 793 §3.4](https://www.rfc-editor.org/rfc/rfc793#section-3.4): SYN requests connection open; FIN signals end of data. The state machine never transitions on both simultaneously — no conforming implementation produces this combination. |
-| SYN+RST | Both bits set simultaneously | [RFC 793 §3.4](https://www.rfc-editor.org/rfc/rfc793#section-3.4): RST aborts or refuses a connection; SYN initiates one. These are mutually exclusive operations with no defined joint state. |
-| RST+FIN | Both bits set simultaneously | [RFC 793 §3.5](https://www.rfc-editor.org/rfc/rfc793#section-3.5): FIN closes a connection gracefully; RST aborts it. No state transition in RFC 793 generates both. RST+ACK (normal half-close acknowledgement) is explicitly **allowed**. |
-| XMAS scan | FIN+URG+PSH all set | [RFC 793 §3.9](https://www.rfc-editor.org/rfc/rfc793#section-3.9): no state machine transition is defined for this combination. Classic `nmap -sX` fingerprint used against BSD-derived stacks. |
+| Check | DROP condition |
+|---|---|
+| Invalid data offset | `doff < 5` or `doff > 15`, or declared header extends past packet end |
+| Port zero | `src port == 0` or `dst port == 0` |
+| NULL scan | All control bits zero |
+| SYN+FIN | Both bits set simultaneously |
+| SYN+RST | Both bits set simultaneously |
+| RST+FIN | Both bits set simultaneously |
+| XMAS scan | FIN+URG+PSH all set |
 
 #### Why malformed checks run before the RST fast-path
 
@@ -493,15 +512,16 @@ Running the structural check first ensures that only RFC 793-conforming packets 
 ### UDP
 - **IPv4 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
+  - If source IPv4 address/prefix matches `trusted_ipv4` → **PASS** (whitelist and rate limits bypassed)
   - If destination port is in `udp_whitelist` → **PASS**
-  - Else if source IPv4 address/prefix matches `trusted_src_ips4` → **PASS**
   - Otherwise → **DROP**
 - **IPv6 stateful path**:
   - If the inbound flow key exists in `udp_conntrack` → **PASS**
+  - If source IPv6 address/prefix matches `trusted_ipv6` → **PASS** (whitelist and rate limits bypassed)
   - If destination port is in `udp_whitelist` → **PASS**
-  - Else if source IPv6 address/prefix matches `trusted_src_ips6` → **PASS**
   - Otherwise → **DROP**
-- **Userspace assist**: trusted IPv4/IPv6 source addresses and CIDR ranges remain available as an explicit fallback for response-style UDP traffic (e.g. DNS, NTP).
+- **Trusted source priority**: trusted sources bypass port whitelist and all rate limits (per-source, per-port, global). Fragment drops and malformed-packet checks still apply.
+- **Userspace assist**: trusted IPv4/IPv6 source addresses and CIDR ranges are synced into `trusted_ipv4`/`trusted_ipv6` LPM trie maps by the daemon; the `nftables` fallback maintains equivalent `trusted_v4`/`trusted_v6` sets.
 
 ### IPv6 Extension Headers
 

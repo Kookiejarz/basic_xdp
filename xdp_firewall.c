@@ -250,6 +250,22 @@ struct {
     __type(value, struct syn_rate_val);
 } udp_rate_map SEC(".maps");
 
+static __always_inline bool is_trusted_v4(__be32 saddr)
+{
+    struct trusted_v4_key tk = { .prefixlen = 32, .addr = saddr };
+    __u32 *v = bpf_map_lookup_elem(&trusted_ipv4, &tk);
+    return v && *v;
+}
+
+static __always_inline bool is_trusted_v6(const struct in6_addr *saddr)
+{
+    struct trusted_v6_key tk;
+    tk.prefixlen = 128;
+    __builtin_memcpy(tk.addr, saddr, 16);
+    __u32 *v = bpf_map_lookup_elem(&trusted_ipv6, &tk);
+    return v && *v;
+}
+
 // Per-IP SYN rate limiter: returns XDP_PASS or XDP_DROP.
 // Looks up per-port config from syn_rate_ports; skips limiting entirely if
 // the port is absent (e.g. HTTP/HTTPS). Races on multi-core are tolerated —
@@ -601,6 +617,15 @@ static __always_inline int check_tcp_ipv4(
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
     fill_ct_key_v4(&key, ip->saddr, ip->daddr, tcp->source, tcp->dest);
 
+    // Trusted source: bypass whitelist + SYN rate limit for new connections.
+    // Malformed-packet check already ran above; fragments dropped before we arrive.
+    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10) && is_trusted_v4(ip->saddr)) {
+        __u64 now = bpf_ktime_get_ns();
+        bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
+        count(CNT_TCP_NEW_ALLOW);
+        return XDP_PASS;
+    }
+
     return check_tcp_conntrack(&key, tcp_flags, dest_port);
 }
 
@@ -619,6 +644,13 @@ static __always_inline int check_tcp_ipv6(
     __u8 tcp_flags = ((__u8 *)tcp)[13];
     __u32 dest_port = (__u32)bpf_ntohs(tcp->dest);
     fill_ct_key_v6(&key, &ipv6->saddr, &ipv6->daddr, tcp->source, tcp->dest);
+
+    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10) && is_trusted_v6(&ipv6->saddr)) {
+        __u64 now = bpf_ktime_get_ns();
+        bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
+        count(CNT_TCP_NEW_ALLOW);
+        return XDP_PASS;
+    }
 
     return check_tcp_conntrack(&key, tcp_flags, dest_port);
 }
@@ -654,6 +686,11 @@ static __always_inline int check_udp_ipv4(
         }
     }
 
+    if (is_trusted_v4(ip->saddr)) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
+
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow) {
         if (udp_rate_check(&key, now, dest_port) == XDP_DROP) {
@@ -666,13 +703,6 @@ static __always_inline int check_udp_ipv4(
             count(CNT_UDP_DROP);
             return XDP_DROP;
         }
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
-    }
-
-    struct trusted_v4_key tk4 = { .prefixlen = 32, .addr = ip->saddr };
-    __u32 *trusted = bpf_map_lookup_elem(&trusted_ipv4, &tk4);
-    if (trusted && *trusted) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
@@ -711,6 +741,11 @@ static __always_inline int check_udp_ipv6(
         }
     }
 
+    if (is_trusted_v6(&ipv6->saddr)) {
+        count(CNT_UDP_PASS);
+        return XDP_PASS;
+    }
+
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
     if (allow && *allow) {
         if (udp_rate_check(&key, now, dest_port) == XDP_DROP) {
@@ -723,15 +758,6 @@ static __always_inline int check_udp_ipv6(
             count(CNT_UDP_DROP);
             return XDP_DROP;
         }
-        count(CNT_UDP_PASS);
-        return XDP_PASS;
-    }
-
-    struct trusted_v6_key tk6;
-    tk6.prefixlen = 128;
-    __builtin_memcpy(tk6.addr, &ipv6->saddr, 16);
-    __u32 *trusted6 = bpf_map_lookup_elem(&trusted_ipv6, &tk6);
-    if (trusted6 && *trusted6) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
     }
@@ -904,9 +930,7 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
         case IPPROTO_UDP:
             return check_udp_ipv4(ip, trans_data, data_end);
         case IPPROTO_ICMP: {
-            // Token-bucket: allows up to ICMP_TOKEN_RATE pps with a burst of
-            // ICMP_TOKEN_MAX, so normal ping still works but flood is truncated.
-            if (icmp_rate_limit() == XDP_DROP) {
+            if (!is_trusted_v4(ip->saddr) && icmp_rate_limit() == XDP_DROP) {
                 count(CNT_ICMP_DROP);
                 return XDP_DROP;
             }
@@ -954,11 +978,11 @@ int xdp_port_whitelist(struct xdp_md *ctx) {
                 count(CNT_IPV6_OTHER);
                 return XDP_PASS;
             }
-            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST) {
-                if (icmp_rate_limit() == XDP_DROP) {
-                    count(CNT_ICMP_DROP);
-                    return XDP_DROP;
-                }
+            if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST &&
+                !is_trusted_v6(&ipv6->saddr) &&
+                icmp_rate_limit() == XDP_DROP) {
+                count(CNT_ICMP_DROP);
+                return XDP_DROP;
             }
             count(CNT_IPV6_OTHER);
             return XDP_PASS;
