@@ -66,7 +66,7 @@ jobs:
             install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib bpftool
           - name: ubuntu
             image: ubuntu:24.04
-            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib bpftool
+            install: apt-get update && apt-get install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev build-essential gcc-multilib linux-tools-common linux-tools-generic; ln -sf /usr/lib/linux-tools/*/bpftool /usr/local/bin/bpftool 2>/dev/null || true
           - name: fedora
             image: fedora:41
             install: dnf -y install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
@@ -75,16 +75,16 @@ jobs:
             install: zypper --non-interactive refresh && zypper --non-interactive install -y bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-devel bpftool gcc make
           - name: arch
             image: archlinux:latest
-            install: pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python sed iproute2 clang llvm libbpf bpftool base-devel
+            install: pacman -Sy --noconfirm --needed bash ca-certificates coreutils curl gawk git grep python sed iproute2 clang llvm libbpf base-devel sudo && useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers && su - builder -c 'git clone https://aur.archlinux.org/bpftool-bin.git /tmp/bpftool-bin && cd /tmp/bpftool-bin && makepkg -si --noconfirm'
           - name: alpine
             image: alpine:3.20
-            install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev bpftool build-base
+            install: apk add --no-cache bash ca-certificates coreutils curl gawk git grep python3 sed iproute2 clang llvm libbpf-dev bpftool build-base linux-headers
           - name: almalinux
             image: almalinux:10
             install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
           - name: rockylinux
             image: rockylinux:9
-            install: dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
+            install: dnf -y install dnf-plugins-core && dnf config-manager --enable crb && dnf -y --allowerasing install bash ca-certificates coreutils curl gawk git grep python3 sed iproute clang llvm libbpf-devel bpftool gcc make
     container:
       image: ${{ matrix.image }}
     steps:
