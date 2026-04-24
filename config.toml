@@ -1,0 +1,77 @@
+# Auto XDP configuration — /etc/auto_xdp/config.toml
+# Manage via: axdp trust / axdp acl / axdp permanent
+# The daemon reloads this file on SIGHUP (no restart needed).
+# To apply changes immediately: axdp restart
+
+[permanent_ports]
+# Ports always kept open regardless of which services are running.
+tcp = []
+udp = []
+
+[trusted_ips]
+# Source IPs/CIDRs that bypass all firewall checks (rate limits, whitelist).
+# Format:  "CIDR" = "label"
+# "10.0.0.0/8" = "internal network"
+
+# SYN rate limits (new connections per second per source IP).
+# Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
+# Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
+
+[rate_limits.syn_by_proc]
+sshd           = 2
+vsftpd         = 10
+proftpd        = 10
+"pure-ftpd"    = 10
+postfix        = 20
+sendmail       = 20
+dovecot        = 15
+mysqld         = 2
+mariadbd       = 2
+postgres       = 2
+"redis-server" = 2
+mongod         = 2
+xrdp           = 2
+telnetd        = 2
+
+[rate_limits.syn_by_service]
+ssh             = 2
+ftp             = 10
+"ftp-data"      = 10
+smtp            = 20
+smtps           = 20
+submission      = 20
+pop3            = 15
+pop3s           = 15
+imap            = 15
+imaps           = 15
+mysql           = 2
+postgresql      = 2
+redis           = 2
+mongodb         = 2
+"ms-wbt-server" = 2
+vnc             = 2
+telnet          = 2
+
+
+# UDP rate limits (packets per second per source IP).
+
+[rate_limits.udp_by_proc]
+named   = 5000
+unbound = 5000
+dnsmasq = 5000
+openvpn = 200
+
+[rate_limits.udp_by_service]
+domain  = 5000
+ntp     = 500
+isakmp  = 100
+openvpn = 200
+
+# Per-CIDR port ACL rules.
+# These bypass rate limiting and take priority over the port whitelist.
+# Ports do NOT need to be in the whitelist — ACL is a zero-trust path.
+
+# [[acl]]
+# proto = "tcp"
+# cidr  = "10.0.0.0/8"
+# ports = [5432, 6379]

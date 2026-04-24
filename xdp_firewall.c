@@ -250,6 +250,48 @@ struct {
     __type(value, struct syn_rate_val);
 } udp_rate_map SEC(".maps");
 
+// Per-CIDR port ACL: source CIDR → list of allowed destination ports.
+// ACL entries bypass rate limiting and take priority over the port whitelist.
+// TCP and UDP are configured independently via separate maps.
+#define ACL_MAX_PORTS 64
+
+struct acl_val {
+    __u32 count;
+    __u16 ports[ACL_MAX_PORTS];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct trusted_v4_key);
+    __type(value, struct acl_val);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} tcp_acl_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct trusted_v6_key);
+    __type(value, struct acl_val);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} tcp_acl_v6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct trusted_v4_key);
+    __type(value, struct acl_val);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} udp_acl_v4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 1024);
+    __type(key, struct trusted_v6_key);
+    __type(value, struct acl_val);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} udp_acl_v6 SEC(".maps");
+
 static __always_inline bool is_trusted_v4(__be32 saddr)
 {
     struct trusted_v4_key tk = { .prefixlen = 32, .addr = saddr };
@@ -264,6 +306,17 @@ static __always_inline bool is_trusted_v6(const struct in6_addr *saddr)
     __builtin_memcpy(tk.addr, saddr, 16);
     __u32 *v = bpf_map_lookup_elem(&trusted_ipv6, &tk);
     return v && *v;
+}
+
+static __always_inline bool acl_port_match(struct acl_val *v, __u32 port)
+{
+    __u16 p = (__u16)port;
+    __u32 n = v->count < ACL_MAX_PORTS ? v->count : ACL_MAX_PORTS;
+    for (__u32 i = 0; i < ACL_MAX_PORTS; i++) {
+        if (i >= n) break;
+        if (v->ports[i] == p) return true;
+    }
+    return false;
 }
 
 // Per-IP SYN rate limiter: returns XDP_PASS or XDP_DROP.
@@ -626,6 +679,17 @@ static __always_inline int check_tcp_ipv4(
         return XDP_PASS;
     }
 
+    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
+        struct trusted_v4_key tk = { .prefixlen = 32, .addr = ip->saddr };
+        struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
+        if (av && acl_port_match(av, dest_port)) {
+            __u64 now = bpf_ktime_get_ns();
+            bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
+            count(CNT_TCP_NEW_ALLOW);
+            return XDP_PASS;
+        }
+    }
+
     return check_tcp_conntrack(&key, tcp_flags, dest_port);
 }
 
@@ -650,6 +714,19 @@ static __always_inline int check_tcp_ipv6(
         bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
         count(CNT_TCP_NEW_ALLOW);
         return XDP_PASS;
+    }
+
+    if ((tcp_flags & 0x02) && !(tcp_flags & 0x10)) {
+        struct trusted_v6_key tk;
+        tk.prefixlen = 128;
+        __builtin_memcpy(tk.addr, &ipv6->saddr, 16);
+        struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
+        if (av && acl_port_match(av, dest_port)) {
+            __u64 now = bpf_ktime_get_ns();
+            bpf_map_update_elem(&tcp_conntrack, &key, &now, BPF_ANY);
+            count(CNT_TCP_NEW_ALLOW);
+            return XDP_PASS;
+        }
     }
 
     return check_tcp_conntrack(&key, tcp_flags, dest_port);
@@ -689,6 +766,15 @@ static __always_inline int check_udp_ipv4(
     if (is_trusted_v4(ip->saddr)) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
+    }
+
+    {
+        struct trusted_v4_key tk = { .prefixlen = 32, .addr = ip->saddr };
+        struct acl_val *av = bpf_map_lookup_elem(&udp_acl_v4, &tk);
+        if (av && acl_port_match(av, dest_port)) {
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
+        }
     }
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
@@ -744,6 +830,17 @@ static __always_inline int check_udp_ipv6(
     if (is_trusted_v6(&ipv6->saddr)) {
         count(CNT_UDP_PASS);
         return XDP_PASS;
+    }
+
+    {
+        struct trusted_v6_key tk;
+        tk.prefixlen = 128;
+        __builtin_memcpy(tk.addr, &ipv6->saddr, 16);
+        struct acl_val *av = bpf_map_lookup_elem(&udp_acl_v6, &tk);
+        if (av && acl_port_match(av, dest_port)) {
+            count(CNT_UDP_PASS);
+            return XDP_PASS;
+        }
     }
 
     __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);

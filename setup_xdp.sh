@@ -1137,6 +1137,24 @@ install_axdp_command() {
     chmod +x "$AXDP_CMD"
 }
 
+install_toml_config() {
+    local toml_target="${CONFIG_DIR}/config.toml"
+    mkdir -p "$CONFIG_DIR"
+
+    if [[ -f "$toml_target" ]]; then
+        if confirm_yes_no "config.toml already exists at ${toml_target}. Replace with repo default? [y/N] "; then
+            info "Replacing config.toml with repo default."
+        else
+            info "Keeping existing config.toml."
+            return 0
+        fi
+    fi
+
+    if ! fetch_local_or_remote "config.toml" "config.toml" "$toml_target"; then
+        die "Failed to install config.toml"
+    fi
+}
+
 install_runtime_files() {
     info "Installing runtime files..."
     mkdir -p "$INSTALL_DIR"
@@ -1144,6 +1162,7 @@ install_runtime_files() {
     install_bpf_helper
     install_axdp_command
     write_config
+    install_toml_config
     write_runner_script
     ok "Runtime installed under $INSTALL_DIR and $CONFIG_DIR"
 }

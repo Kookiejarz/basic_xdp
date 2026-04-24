@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
+TOML_CONFIG="/etc/auto_xdp/config.toml"
 RUN_STATE_DIR="/run/auto_xdp"
 BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 NFT_FAMILY="inet"
@@ -41,6 +42,17 @@ Commands:
   stop                   Stop the installed service
   restart                Restart the installed service
   status                 Show service status
+  config show            Show current TOML config
+  config init            Create default config.toml (if missing)
+  trust list             List trusted source IPs/CIDRs
+  trust add CIDR [LABEL] Add a trusted source CIDR
+  trust del CIDR         Remove a trusted source CIDR
+  acl list               List per-CIDR port ACL rules
+  acl add PROTO CIDR PORT...  Add an ACL rule (proto: tcp|udp)
+  acl del PROTO CIDR     Remove an ACL rule
+  permanent list         List permanently whitelisted ports
+  permanent add PROTO PORT [LABEL]  Add a permanent port
+  permanent del PROTO PORT          Remove a permanent port
   help                   Show this help
 
 Stats options:
@@ -1031,6 +1043,310 @@ run_check_update() {
     fi
 }
 
+
+# TOML config management helpers
+# Reload the running daemon via SIGHUP (no restart gap), or restart as fallback.
+reload_daemon() {
+    local pid
+    if pid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null) && [[ "$pid" -gt 1 ]]; then
+        kill -HUP "$pid" 2>/dev/null && return 0
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$SERVICE_NAME" restart 2>/dev/null && return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 && systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+}
+
+# Read the TOML config via Python and print as JSON (internal use).
+toml_to_json() {
+    python3 - "$TOML_CONFIG" <<'PY'
+import sys, json, os
+
+path = sys.argv[1]
+if not os.path.exists(path):
+    print("{}")
+    sys.exit(0)
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit("tomllib/tomli not available; install Python 3.11+ or: pip install tomli")
+
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+print(json.dumps(data))
+PY
+}
+
+# Write the config dict (JSON on stdin) back to the TOML file.
+json_to_toml() {
+    local path="$TOML_CONFIG"
+    python3 - "$path" <<'PY'
+import sys, json, os
+
+path = sys.argv[1]
+data = json.load(sys.stdin)
+
+lines = []
+
+def q(s):
+    return json.dumps(str(s))
+
+# [permanent_ports]
+perm = data.get("permanent_ports", {})
+lines.append("[permanent_ports]")
+lines.append(f"tcp = {json.dumps(perm.get('tcp', []))}")
+lines.append(f"udp = {json.dumps(perm.get('udp', []))}")
+lines.append("")
+
+# [trusted_ips]
+lines.append("[trusted_ips]")
+for cidr, label in data.get("trusted_ips", {}).items():
+    lines.append(f"{q(cidr)} = {q(label)}")
+lines.append("")
+
+# [rate_limits.*]
+for section in ["syn_by_proc", "syn_by_service", "udp_by_proc", "udp_by_service"]:
+    lines.append(f"[rate_limits.{section}]")
+    for k, v in data.get("rate_limits", {}).get(section, {}).items():
+        lines.append(f"{k} = {int(v)}")
+    lines.append("")
+
+# [[acl]]
+for rule in data.get("acl", []):
+    lines.append("[[acl]]")
+    lines.append(f"proto = {q(rule['proto'])}")
+    lines.append(f"cidr  = {q(rule['cidr'])}")
+    lines.append(f"ports = {json.dumps([int(p) for p in rule.get('ports', [])])}")
+    lines.append("")
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+    f.write("\n".join(lines).rstrip() + "\n")
+PY
+}
+
+run_config() {
+    local sub="${1:-show}"
+    shift || true
+    case "$sub" in
+        show)
+            if [[ ! -f "$TOML_CONFIG" ]]; then
+                echo "(no config file at $TOML_CONFIG — run: axdp config init)"
+                return 0
+            fi
+            cat "$TOML_CONFIG"
+            ;;
+        init)
+            if [[ -f "$TOML_CONFIG" ]]; then
+                echo "Config already exists: $TOML_CONFIG  (use 'axdp config show' to view)"
+                return 0
+            fi
+            command -v curl >/dev/null 2>&1 || { echo "curl required to fetch config template" >&2; exit 1; }
+            mkdir -p "$(dirname "$TOML_CONFIG")"
+            echo "Fetching default config.toml from GitHub..."
+            if ! curl --proto '=https' --tlsv1.2 -sSfL "${RAW_URL}/config.toml" -o "$TOML_CONFIG"; then
+                echo "Failed to fetch config.toml" >&2
+                exit 1
+            fi
+            echo "Created: $TOML_CONFIG"
+            ;;
+        -h|--help)
+            echo "Usage: axdp config show|init"
+            ;;
+        *)
+            echo "Unknown config subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
+run_trust() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list)
+            toml_to_json | python3 -c '
+import sys, json
+cfg = json.load(sys.stdin)
+tips = cfg.get("trusted_ips", {})
+if not tips:
+    print("  (none)")
+else:
+    for cidr, label in sorted(tips.items()):
+        print(f"  {cidr:<20}  {label}")
+'
+            ;;
+        add)
+            local cidr="${1:-}"
+            local label="${2:-manual}"
+            [[ -n "$cidr" ]] || { echo "Usage: axdp trust add CIDR [LABEL]" >&2; exit 1; }
+            [[ -f "$TOML_CONFIG" ]] || run_config init
+            toml_to_json | python3 - "$cidr" "$label" <<'PY' | json_to_toml
+import sys, json
+data = json.load(sys.stdin)
+cidr, label = sys.argv[1], sys.argv[2]
+data.setdefault("trusted_ips", {})[cidr] = label
+print(json.dumps(data))
+PY
+            echo "Added trusted: $cidr ($label)"
+            reload_daemon
+            ;;
+        del)
+            local cidr="${1:-}"
+            [[ -n "$cidr" ]] || { echo "Usage: axdp trust del CIDR" >&2; exit 1; }
+            toml_to_json | python3 - "$cidr" <<'PY' | json_to_toml
+import sys, json
+data = json.load(sys.stdin)
+data.setdefault("trusted_ips", {}).pop(sys.argv[1], None)
+print(json.dumps(data))
+PY
+            echo "Removed trusted: $cidr"
+            reload_daemon
+            ;;
+        -h|--help)
+            echo "Usage: axdp trust list|add CIDR [LABEL]|del CIDR"
+            ;;
+        *)
+            echo "Unknown trust subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
+run_acl() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list)
+            toml_to_json | python3 -c '
+import sys, json
+cfg = json.load(sys.stdin)
+rules = cfg.get("acl", [])
+if not rules:
+    print("  (none)")
+else:
+    for r in rules:
+        ports = " ".join(str(p) for p in r.get("ports", []))
+        print(f"  {r[\"proto\"].upper():<4}  {r[\"cidr\"]:<22}  ports: {ports}")
+'
+            ;;
+        add)
+            local proto="${1:-}"
+            local cidr="${2:-}"
+            shift 2 || true
+            local ports=("$@")
+            [[ -n "$proto" && -n "$cidr" && ${#ports[@]} -gt 0 ]] || {
+                echo "Usage: axdp acl add tcp|udp CIDR PORT..." >&2; exit 1
+            }
+            [[ "$proto" == "tcp" || "$proto" == "udp" ]] || {
+                echo "proto must be tcp or udp" >&2; exit 1
+            }
+            [[ -f "$TOML_CONFIG" ]] || run_config init
+            local ports_json
+            ports_json=$(printf '%s\n' "${ports[@]}" | python3 -c 'import sys,json; print(json.dumps([int(l) for l in sys.stdin]))')
+            toml_to_json | python3 - "$proto" "$cidr" "$ports_json" <<'PY' | json_to_toml
+import sys, json
+data = json.load(sys.stdin)
+proto, cidr, ports = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+rules = data.setdefault("acl", [])
+rules = [r for r in rules if not (r["proto"] == proto and r["cidr"] == cidr)]
+rules.append({"proto": proto, "cidr": cidr, "ports": ports})
+data["acl"] = rules
+print(json.dumps(data))
+PY
+            echo "Added ACL: $proto $cidr ports ${ports[*]}"
+            reload_daemon
+            ;;
+        del)
+            local proto="${1:-}"
+            local cidr="${2:-}"
+            [[ -n "$proto" && -n "$cidr" ]] || { echo "Usage: axdp acl del tcp|udp CIDR" >&2; exit 1; }
+            toml_to_json | python3 - "$proto" "$cidr" <<'PY' | json_to_toml
+import sys, json
+data = json.load(sys.stdin)
+proto, cidr = sys.argv[1], sys.argv[2]
+data["acl"] = [r for r in data.get("acl", []) if not (r["proto"] == proto and r["cidr"] == cidr)]
+print(json.dumps(data))
+PY
+            echo "Removed ACL: $proto $cidr"
+            reload_daemon
+            ;;
+        -h|--help)
+            echo "Usage: axdp acl list|add PROTO CIDR PORT...|del PROTO CIDR"
+            ;;
+        *)
+            echo "Unknown acl subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
+run_permanent() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list)
+            toml_to_json | python3 -c '
+import sys, json
+cfg = json.load(sys.stdin)
+perm = cfg.get("permanent_ports", {})
+tcp = perm.get("tcp", [])
+udp = perm.get("udp", [])
+if not tcp and not udp:
+    print("  (none)")
+else:
+    for p in sorted(tcp): print(f"  TCP  {p}")
+    for p in sorted(udp): print(f"  UDP  {p}")
+'
+            ;;
+        add)
+            local proto="${1:-}"
+            local port="${2:-}"
+            local label="${3:-config}"
+            [[ -n "$proto" && -n "$port" ]] || {
+                echo "Usage: axdp permanent add tcp|udp PORT [LABEL]" >&2; exit 1
+            }
+            [[ "$proto" == "tcp" || "$proto" == "udp" ]] || {
+                echo "proto must be tcp or udp" >&2; exit 1
+            }
+            [[ -f "$TOML_CONFIG" ]] || run_config init
+            toml_to_json | python3 - "$proto" "$port" <<'PY' | json_to_toml
+import sys, json
+data = json.load(sys.stdin)
+proto, port = sys.argv[1], int(sys.argv[2])
+perm = data.setdefault("permanent_ports", {"tcp": [], "udp": []})
+lst = perm.setdefault(proto, [])
+if port not in lst:
+    lst.append(port)
+    lst.sort()
+print(json.dumps(data))
+PY
+            echo "Added permanent: $proto/$port"
+            reload_daemon
+            ;;
+        del)
+            local proto="${1:-}"
+            local port="${2:-}"
+            [[ -n "$proto" && -n "$port" ]] || {
+                echo "Usage: axdp permanent del tcp|udp PORT" >&2; exit 1
+            }
+            toml_to_json | python3 - "$proto" "$port" <<'PY' | json_to_toml
+import sys, json
+data = json.load(sys.stdin)
+proto, port = sys.argv[1], int(sys.argv[2])
+perm = data.setdefault("permanent_ports", {"tcp": [], "udp": []})
+perm[proto] = [p for p in perm.get(proto, []) if p != port]
+print(json.dumps(data))
+PY
+            echo "Removed permanent: $proto/$port"
+            reload_daemon
+            ;;
+        -h|--help)
+            echo "Usage: axdp permanent list|add PROTO PORT [LABEL]|del PROTO PORT"
+            ;;
+        *)
+            echo "Unknown permanent subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
 main() {
     local cmd="${1:-stats}"
 
@@ -1059,6 +1375,22 @@ main() {
         log-level)
             shift || true
             run_log_level "$@"
+            ;;
+        config)
+            shift || true
+            run_config "$@"
+            ;;
+        trust)
+            shift || true
+            run_trust "$@"
+            ;;
+        acl)
+            shift || true
+            run_acl "$@"
+            ;;
+        permanent)
+            shift || true
+            run_permanent "$@"
             ;;
         start|stop|restart|status)
             shift || true

@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 XDP-eBPF-Anti-DDoS-Firewall/
+website/
