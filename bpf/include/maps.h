@@ -1,6 +1,10 @@
 #pragma once
 #include "keys.h"
 
+/* Note: pkt_counters (PERCPU_ARRAY) and pkt_ringbuf (RINGBUF) are declared
+ * in common.h alongside the count() and emit_drop() helpers that use them.
+ * All other SEC(".maps") map definitions are below. */
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 262144);
