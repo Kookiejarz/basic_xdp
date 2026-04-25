@@ -26,7 +26,7 @@ def _make_subscribe_msg(pid: int) -> bytes:
     return hdr + cn
 
 
-def open_proc_connector():
+def open_proc_connector() -> socket.socket | None:
     try:
         sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, _NETLINK_CONNECTOR)
         sock.bind((os.getpid(), _CN_IDX_PROC))

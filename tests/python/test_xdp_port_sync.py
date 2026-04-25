@@ -2,7 +2,6 @@ import socket
 import struct
 import subprocess
 import sys
-import re
 import types
 import unittest
 from pathlib import Path
