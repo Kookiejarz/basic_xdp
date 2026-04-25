@@ -10,6 +10,7 @@ from unittest import mock
 
 import support
 
+from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
 
 xdp = support.load_module("xdp_port_sync_test", "xdp_port_sync.py")
 
@@ -160,17 +161,17 @@ class XdpPortSyncTests(unittest.TestCase):
             self.assertEqual(xdp._port_rate_limit(80), 0)
 
     def test_bind_ip_is_exposed_keeps_wildcard_but_filters_loopback_and_private(self):
-        with mock.patch.object(xdp.cfg, "DISCOVERY_EXCLUDE_LOOPBACK", True), \
-             mock.patch.object(xdp, "DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
-            exclude_nets = xdp._discovery_exclude_networks()
+        with mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_LOOPBACK", True), \
+             mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
+            exclude_nets = _discovery_exclude_networks()
 
-        self.assertTrue(xdp._bind_ip_is_exposed("0.0.0.0", exclude_nets))
-        self.assertTrue(xdp._bind_ip_is_exposed("::", exclude_nets))
-        self.assertFalse(xdp._bind_ip_is_exposed("127.0.0.1", exclude_nets))
-        self.assertFalse(xdp._bind_ip_is_exposed("::1", exclude_nets))
-        self.assertFalse(xdp._bind_ip_is_exposed("10.1.2.3", exclude_nets))
-        self.assertFalse(xdp._bind_ip_is_exposed("fd00::1234", exclude_nets))
-        self.assertTrue(xdp._bind_ip_is_exposed("203.0.113.10", exclude_nets))
+        self.assertTrue(_bind_ip_is_exposed("0.0.0.0", exclude_nets))
+        self.assertTrue(_bind_ip_is_exposed("::", exclude_nets))
+        self.assertFalse(_bind_ip_is_exposed("127.0.0.1", exclude_nets))
+        self.assertFalse(_bind_ip_is_exposed("::1", exclude_nets))
+        self.assertFalse(_bind_ip_is_exposed("10.1.2.3", exclude_nets))
+        self.assertFalse(_bind_ip_is_exposed("fd00::1234", exclude_nets))
+        self.assertTrue(_bind_ip_is_exposed("203.0.113.10", exclude_nets))
 
     def test_get_listening_ports_filters_loopback_and_configured_bind_cidrs(self):
         fake_psutil = types.SimpleNamespace(CONN_LISTEN="LISTEN", CONN_ESTABLISHED="ESTABLISHED")
@@ -234,10 +235,10 @@ class XdpPortSyncTests(unittest.TestCase):
             ),
         ]
 
-        with mock.patch.object(xdp, "psutil", fake_psutil), \
-             mock.patch.object(xdp, "_net_connections", return_value=fake_connections), \
-             mock.patch.object(xdp.cfg, "DISCOVERY_EXCLUDE_LOOPBACK", True), \
-             mock.patch.object(xdp, "DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
+        with mock.patch("auto_xdp.discovery.psutil", fake_psutil), \
+             mock.patch("auto_xdp.discovery._net_connections", return_value=fake_connections), \
+             mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_LOOPBACK", True), \
+             mock.patch("auto_xdp.config.DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
             state = xdp.get_listening_ports()
 
         self.assertEqual(state.tcp, {22, 443})
@@ -339,8 +340,8 @@ class XdpPortSyncTests(unittest.TestCase):
                 raise OSError("unknown service")
             return services[port]
 
-        with mock.patch.object(xdp, "psutil", FakePsutil), \
-             mock.patch.object(xdp, "_net_connections", return_value=conns), \
+        with mock.patch("auto_xdp.discovery.psutil", FakePsutil), \
+             mock.patch("auto_xdp.discovery._net_connections", return_value=conns), \
              mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
              mock.patch.object(policy, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
              mock.patch.object(policy, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
