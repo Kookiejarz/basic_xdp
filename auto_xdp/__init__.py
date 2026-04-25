@@ -1,1 +1,0 @@
-"""Auto XDP support package."""
