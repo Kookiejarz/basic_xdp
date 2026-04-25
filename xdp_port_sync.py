@@ -21,11 +21,6 @@ import subprocess
 import sys
 import time
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
 from auto_xdp import config as cfg
 from auto_xdp.config import apply_toml_config, load_toml_config
 from auto_xdp.bpf.maps import (
