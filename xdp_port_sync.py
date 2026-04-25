@@ -15,17 +15,12 @@ import os
 
 from auto_xdp import config as cfg
 from auto_xdp.config import apply_toml_config, load_toml_config
-from auto_xdp.backends import NftablesBackend, XdpBackend
 from auto_xdp.syncer import open_backend, sync_once, watch
 
 TOML_CONFIG_PATH = cfg.TOML_CONFIG_PATH
-REQUIRED_XDP_MAP_PATHS = cfg.REQUIRED_XDP_MAP_PATHS
 BACKEND_AUTO = cfg.BACKEND_AUTO
 BACKEND_XDP = cfg.BACKEND_XDP
 BACKEND_NFTABLES = cfg.BACKEND_NFTABLES
-TCP_PERMANENT = cfg.TCP_PERMANENT
-UDP_PERMANENT = cfg.UDP_PERMANENT
-SCTP_PERMANENT = cfg.SCTP_PERMANENT
 TRUSTED_SRC_IPS = cfg.TRUSTED_SRC_IPS
 
 

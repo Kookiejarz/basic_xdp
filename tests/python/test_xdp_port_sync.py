@@ -12,6 +12,7 @@ import support
 from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
 from auto_xdp.bpf.maps import render_nft_ports as _render_nft_ports
 from auto_xdp import config as cfg
+import auto_xdp.backends as backends_mod
 import auto_xdp.backends.nftables as nftables_mod
 import auto_xdp.proc_events as proc_events_mod
 import auto_xdp.syncer as syncer_mod
@@ -273,7 +274,7 @@ class XdpPortSyncTests(unittest.TestCase):
         )
 
     def test_xdp_backend_sync_ports_adds_and_removes_runtime_state(self):
-        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend.tcp_map = FakePortMap({22, 80})
         backend.udp_map = FakePortMap({53, 9999})
         backend.sctp_map = FakePortMap({3868, 9899})
@@ -292,10 +293,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend._sync_udp_rate = mock.Mock()
         backend._sync_udp_agg_rate = mock.Mock()
 
-        with mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
-             mock.patch.object(xdp, "UDP_PERMANENT", {53: "dns"}), \
-             mock.patch.object(xdp, "SCTP_PERMANENT", {3868: "diameter"}), \
-             mock.patch.object(xdp, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
+        with mock.patch.object(syncer_mod, "TCP_PERMANENT", {22: "ssh"}), \
+             mock.patch.object(syncer_mod, "UDP_PERMANENT", {53: "dns"}), \
+             mock.patch.object(syncer_mod, "SCTP_PERMANENT", {3868: "diameter"}), \
+             mock.patch.object(syncer_mod, "TRUSTED_SRC_IPS", {"198.51.100.5/32": "office"}):
             backend.sync_ports(
                 tcp_target={22, 443},
                 udp_target={53},
@@ -319,7 +320,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
     def test_xdp_backend_sync_syn_rate_uses_proc_names_and_service_names(self):
         import auto_xdp.policy as policy
-        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend.syn_rate_map = FakeSynRateMap({22: 1, 8080: 5})
 
         class FakePsutil:
@@ -402,7 +403,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
     def test_xdp_backend_sync_udp_rate_sets_rates_for_udp_ports(self):
         import auto_xdp.policy as policy
-        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend.udp_rate_map = FakeUdpPortMap({53: 1000, 9999: 5})
 
         def fake_getservbyport(port, proto):
@@ -423,7 +424,7 @@ class XdpPortSyncTests(unittest.TestCase):
 
     def test_xdp_backend_sync_udp_aggregate_sets_byte_limits_for_udp_ports(self):
         import auto_xdp.policy as policy
-        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend.udp_agg_rate_map = FakeUdpPortMap({53: 1000, 9999: 5})
 
         def fake_getservbyport(port, proto):
@@ -444,7 +445,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.udp_agg_rate_map.delete_ops, [(9999, False)])
 
     def test_xdp_backend_close_closes_all_maps(self):
-        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend = backends_mod.XdpBackend.__new__(backends_mod.XdpBackend)
         backend.tcp_map = FakePortMap()
         backend.udp_map = FakePortMap()
         backend.sctp_map = FakePortMap()
@@ -472,7 +473,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.udp_agg_rate_map.closed)
 
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
-        backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
+        backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
         existing = subprocess.CompletedProcess(
             ["nft"],
             0,
@@ -491,7 +492,7 @@ class XdpPortSyncTests(unittest.TestCase):
         run_nft.assert_called_once_with(["list", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=False)
 
     def test_nftables_backend_ensure_ruleset_recreates_incomplete_ruleset(self):
-        backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
+        backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
         existing = subprocess.CompletedProcess(["nft"], 0, stdout="table inet auto_xdp { }")
         deleted = subprocess.CompletedProcess(["nft"], 0, stdout="")
         created = subprocess.CompletedProcess(["nft"], 0, stdout="")
@@ -505,7 +506,7 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertIn(f"set {cfg.NFT_TCP_SET}", create_call.kwargs["input_text"])
 
     def test_nftables_backend_apply_targets_flushes_and_reloads_sets(self):
-        backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
+        backend = backends_mod.NftablesBackend.__new__(backends_mod.NftablesBackend)
 
         with mock.patch.object(nftables_mod, "_run_nft") as run_nft:
             backend._apply_targets({443, 22}, {53}, {3868}, dry_run=False)
@@ -527,7 +528,7 @@ class XdpPortSyncTests(unittest.TestCase):
                 xdp.open_backend("invalid")
 
     def test_open_backend_prefers_xdp_and_falls_back_to_nftables(self):
-        exists_map = {path: True for path in xdp.REQUIRED_XDP_MAP_PATHS}
+        exists_map = {path: True for path in syncer_mod.REQUIRED_XDP_MAP_PATHS}
 
         with mock.patch.object(syncer_mod.os.path, "exists", side_effect=lambda path: exists_map.get(path, False)), \
              mock.patch.object(syncer_mod, "XdpBackend", return_value="xdp-backend") as xdp_backend:
