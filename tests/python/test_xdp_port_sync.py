@@ -10,6 +10,7 @@ from unittest import mock
 import support
 
 from auto_xdp.discovery import _discovery_exclude_networks, _bind_ip_is_exposed
+import auto_xdp.backends.nftables as nftables_mod
 import auto_xdp.proc_events as proc_events_mod
 
 xdp = support.load_module("xdp_port_sync_test", "xdp_port_sync.py")
@@ -480,7 +481,7 @@ class XdpPortSyncTests(unittest.TestCase):
             ),
         )
 
-        with mock.patch.object(xdp, "_run_nft", return_value=existing) as run_nft:
+        with mock.patch.object(nftables_mod, "_run_nft", return_value=existing) as run_nft:
             backend._ensure_ruleset()
 
         run_nft.assert_called_once_with(["list", "table", xdp.NFT_FAMILY, xdp.NFT_TABLE], check=False)
@@ -491,7 +492,7 @@ class XdpPortSyncTests(unittest.TestCase):
         deleted = subprocess.CompletedProcess(["nft"], 0, stdout="")
         created = subprocess.CompletedProcess(["nft"], 0, stdout="")
 
-        with mock.patch.object(xdp, "_run_nft", side_effect=[existing, deleted, created]) as run_nft:
+        with mock.patch.object(nftables_mod, "_run_nft", side_effect=[existing, deleted, created]) as run_nft:
             backend._ensure_ruleset()
 
         self.assertEqual(run_nft.call_args_list[1], mock.call(["delete", "table", xdp.NFT_FAMILY, xdp.NFT_TABLE], check=True))
@@ -502,7 +503,7 @@ class XdpPortSyncTests(unittest.TestCase):
     def test_nftables_backend_apply_targets_flushes_and_reloads_sets(self):
         backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
 
-        with mock.patch.object(xdp, "_run_nft") as run_nft:
+        with mock.patch.object(nftables_mod, "_run_nft") as run_nft:
             backend._apply_targets({443, 22}, {53}, {3868}, dry_run=False)
 
         run_nft.assert_called_once()
