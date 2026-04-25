@@ -43,12 +43,22 @@ install_python_support_package() {
     local bpf_root="${pkg_root}/bpf"
 
     mkdir -p "$bpf_root"
+    mkdir -p "${pkg_root}/backends"
 
     fetch_local_or_remote "auto_xdp/__init__.py" "auto_xdp/__init__.py" "${pkg_root}/__init__.py" || return 1
     fetch_local_or_remote "auto_xdp/config.py" "auto_xdp/config.py" "${pkg_root}/config.py" || return 1
     fetch_local_or_remote "auto_xdp/bpf/__init__.py" "auto_xdp/bpf/__init__.py" "${bpf_root}/__init__.py" || return 1
     fetch_local_or_remote "auto_xdp/bpf/maps.py" "auto_xdp/bpf/maps.py" "${bpf_root}/maps.py" || return 1
     fetch_local_or_remote "auto_xdp/bpf/syscall.py" "auto_xdp/bpf/syscall.py" "${bpf_root}/syscall.py" || return 1
+    fetch_local_or_remote "auto_xdp/policy.py" "auto_xdp/policy.py" "${pkg_root}/policy.py" || return 1
+    fetch_local_or_remote "auto_xdp/discovery.py" "auto_xdp/discovery.py" "${pkg_root}/discovery.py" || return 1
+    fetch_local_or_remote "auto_xdp/proc_events.py" "auto_xdp/proc_events.py" "${pkg_root}/proc_events.py" || return 1
+    fetch_local_or_remote "auto_xdp/backends/__init__.py" "auto_xdp/backends/__init__.py" "${pkg_root}/backends/__init__.py" || return 1
+    fetch_local_or_remote "auto_xdp/backends/base.py" "auto_xdp/backends/base.py" "${pkg_root}/backends/base.py" || return 1
+    fetch_local_or_remote "auto_xdp/backends/xdp.py" "auto_xdp/backends/xdp.py" "${pkg_root}/backends/xdp.py" || return 1
+    fetch_local_or_remote "auto_xdp/backends/nftables.py" "auto_xdp/backends/nftables.py" "${pkg_root}/backends/nftables.py" || return 1
+    fetch_local_or_remote "auto_xdp/syncer.py" "auto_xdp/syncer.py" "${pkg_root}/syncer.py" || return 1
+    fetch_local_or_remote "auto_xdp/cli.py" "auto_xdp/cli.py" "${pkg_root}/cli.py" || return 1
 }
 
 install_runner_script() {

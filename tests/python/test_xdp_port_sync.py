@@ -17,6 +17,7 @@ import auto_xdp.backends.nftables as nftables_mod
 import auto_xdp.proc_events as proc_events_mod
 import auto_xdp.syncer as syncer_mod
 import auto_xdp.discovery as discovery_mod
+import auto_xdp.cli as cli_mod
 
 xdp = support.load_module("xdp_port_sync_test", "xdp_port_sync.py")
 
@@ -261,7 +262,7 @@ class XdpPortSyncTests(unittest.TestCase):
              mock.patch.object(syncer_mod, "UDP_PERMANENT", {123: "ntp"}), \
              mock.patch.object(syncer_mod, "SCTP_PERMANENT", {3868: "diameter"}), \
              mock.patch.object(syncer_mod, "TRUSTED_SRC_IPS", {"203.0.113.8/32": "office"}):
-            xdp.sync_once(backend, dry_run=True)
+            syncer_mod.sync_once(backend, dry_run=True)
 
         backend.sync_ports.assert_called_once_with(
             {22, 80},
@@ -522,23 +523,23 @@ class XdpPortSyncTests(unittest.TestCase):
     def test_open_backend_validates_requested_backend(self):
         with mock.patch.object(syncer_mod.os.path, "exists", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "required XDP maps missing"):
-                xdp.open_backend(xdp.BACKEND_XDP)
+                syncer_mod.open_backend(syncer_mod.BACKEND_XDP)
 
             with self.assertRaisesRegex(RuntimeError, "Unsupported backend"):
-                xdp.open_backend("invalid")
+                syncer_mod.open_backend("invalid")
 
     def test_open_backend_prefers_xdp_and_falls_back_to_nftables(self):
         exists_map = {path: True for path in syncer_mod.REQUIRED_XDP_MAP_PATHS}
 
         with mock.patch.object(syncer_mod.os.path, "exists", side_effect=lambda path: exists_map.get(path, False)), \
              mock.patch.object(syncer_mod, "XdpBackend", return_value="xdp-backend") as xdp_backend:
-            backend = xdp.open_backend(xdp.BACKEND_AUTO)
+            backend = syncer_mod.open_backend(syncer_mod.BACKEND_AUTO)
         self.assertEqual(backend, "xdp-backend")
         xdp_backend.assert_called_once_with()
 
         with mock.patch.object(syncer_mod.os.path, "exists", return_value=False), \
              mock.patch.object(syncer_mod, "NftablesBackend", return_value="nft-backend") as nft_backend:
-            backend = xdp.open_backend(xdp.BACKEND_AUTO)
+            backend = syncer_mod.open_backend(syncer_mod.BACKEND_AUTO)
         self.assertEqual(backend, "nft-backend")
         nft_backend.assert_called_once_with()
 
@@ -568,10 +569,10 @@ class XdpPortSyncTests(unittest.TestCase):
             "office",
             "--log-level",
             "debug",
-        ]), mock.patch.object(xdp, "TRUSTED_SRC_IPS", trusted_ips), \
-             mock.patch.object(xdp, "open_backend", return_value=backend) as open_backend, \
-             mock.patch.object(xdp, "sync_once") as sync_once:
-            xdp.main()
+        ]), mock.patch.object(cfg, "TRUSTED_SRC_IPS", trusted_ips), \
+             mock.patch.object(cli_mod, "open_backend", return_value=backend) as open_backend, \
+             mock.patch.object(cli_mod, "sync_once") as sync_once:
+            cli_mod.main()
 
         open_backend.assert_called_once_with("nftables")
         sync_once.assert_called_once_with(backend, False)
@@ -587,11 +588,11 @@ class XdpPortSyncTests(unittest.TestCase):
             "--dry-run",
             "--backend",
             "auto",
-        ]), mock.patch.object(xdp, "watch") as watch:
-            xdp.main()
+        ]), mock.patch.object(cli_mod, "watch") as watch:
+            cli_mod.main()
 
         watch.assert_called_once_with(
-            5, True, "auto", xdp.TOML_CONFIG_PATH, {}, cli_log_level=None
+            5, True, "auto", cfg.TOML_CONFIG_PATH, {}, cli_log_level=None
         )
 
     def test_main_watch_mode_passes_custom_config_to_watch(self):
@@ -600,8 +601,8 @@ class XdpPortSyncTests(unittest.TestCase):
             "--watch",
             "--config",
             "/tmp/test.toml",
-        ]), mock.patch.object(xdp, "watch") as watch:
-            xdp.main()
+        ]), mock.patch.object(cli_mod, "watch") as watch:
+            cli_mod.main()
 
         watch.assert_called_once_with(
             mock.ANY, mock.ANY, mock.ANY, "/tmp/test.toml", {},
@@ -614,8 +615,8 @@ class XdpPortSyncTests(unittest.TestCase):
             "--watch",
             "--trusted-ip", "1.2.3.4", "myhost",
             "--trusted-ip", "10.0.0.0/8", "internal",
-        ]), mock.patch.object(xdp, "watch") as watch:
-            xdp.main()
+        ]), mock.patch.object(cli_mod, "watch") as watch:
+            cli_mod.main()
 
         watch.assert_called_once_with(
             mock.ANY, mock.ANY, mock.ANY, mock.ANY,
