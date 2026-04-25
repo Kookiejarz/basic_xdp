@@ -2,6 +2,7 @@ import socket
 import struct
 import subprocess
 import sys
+import re
 import types
 import unittest
 from pathlib import Path
@@ -124,6 +125,10 @@ class FakeSynRateMap:
         self.closed = True
 
 
+class FakeUdpPortMap(FakeSynRateMap):
+    pass
+
+
 def make_proc_event_message(what: int) -> bytes:
     payload = struct.pack("I", what)
     cn = struct.pack("IIIIHH", xdp._CN_IDX_PROC, 1, 0, 0, len(payload), 0) + payload
@@ -136,21 +141,38 @@ def make_proc_event_message(what: int) -> bytes:
 class XdpPortSyncTests(unittest.TestCase):
     def test_udp_malformed_drop_only_rejects_port_zero(self):
         source = (Path(__file__).resolve().parents[2] / "xdp_firewall.c").read_text()
-        self.assertIn("if (udp->source == 0 || udp->dest == 0) {", source)
+        self.assertRegex(
+            source,
+            r"if\s*\(\s*udp->source\s*==\s*0\s*\|\|\s*udp->dest\s*==\s*0\s*\)",
+        )
         self.assertNotIn("udp->source == udp->dest", source)
 
     def test_render_nft_ports_sorts_ports(self):
         self.assertEqual(xdp._render_nft_ports({443, 22, 80}), "{ 22, 80, 443 }")
 
     def test_port_rate_limit_prefers_process_name_then_service_name(self):
-        with mock.patch.object(xdp.socket, "getservbyport", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
-             mock.patch.object(xdp, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
-             mock.patch.object(xdp, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
+        import auto_xdp.policy as policy
+        with mock.patch.object(policy.socket, "getservbyport", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
+             mock.patch.object(policy, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
+             mock.patch.object(policy, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
             self.assertEqual(xdp._port_rate_limit(2222, "sshd"), 2)
             self.assertEqual(xdp._port_rate_limit(22), 2)
             self.assertEqual(xdp._port_rate_limit(80), 0)
 
-    def test_get_listening_ports_collects_tcp_udp_and_established_flows(self):
+    def test_bind_ip_is_exposed_keeps_wildcard_but_filters_loopback_and_private(self):
+        with mock.patch.object(xdp.cfg, "DISCOVERY_EXCLUDE_LOOPBACK", True), \
+             mock.patch.object(xdp, "DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
+            exclude_nets = xdp._discovery_exclude_networks()
+
+        self.assertTrue(xdp._bind_ip_is_exposed("0.0.0.0", exclude_nets))
+        self.assertTrue(xdp._bind_ip_is_exposed("::", exclude_nets))
+        self.assertFalse(xdp._bind_ip_is_exposed("127.0.0.1", exclude_nets))
+        self.assertFalse(xdp._bind_ip_is_exposed("::1", exclude_nets))
+        self.assertFalse(xdp._bind_ip_is_exposed("10.1.2.3", exclude_nets))
+        self.assertFalse(xdp._bind_ip_is_exposed("fd00::1234", exclude_nets))
+        self.assertTrue(xdp._bind_ip_is_exposed("203.0.113.10", exclude_nets))
+
+    def test_get_listening_ports_filters_loopback_and_configured_bind_cidrs(self):
         fake_psutil = types.SimpleNamespace(CONN_LISTEN="LISTEN", CONN_ESTABLISHED="ESTABLISHED")
         fake_connections = [
             make_conn(
@@ -162,16 +184,32 @@ class XdpPortSyncTests(unittest.TestCase):
             make_conn(
                 family=socket.AF_INET,
                 conn_type=socket.SOCK_STREAM,
-                status="ESTABLISHED",
-                laddr=make_addr("192.0.2.10", 443),
-                raddr=make_addr("198.51.100.20", 50000),
+                status="LISTEN",
+                laddr=make_addr("127.0.0.1", 8080),
             ),
             make_conn(
                 family=socket.AF_INET6,
                 conn_type=socket.SOCK_STREAM,
-                status="ESTABLISHED",
-                laddr=make_addr("2001:db8::10", 8443),
-                raddr=make_addr("2001:db8::20", 50001),
+                status="LISTEN",
+                laddr=make_addr("::1", 8443),
+            ),
+            make_conn(
+                family=socket.AF_INET,
+                conn_type=socket.SOCK_STREAM,
+                status="LISTEN",
+                laddr=make_addr("10.0.0.5", 9000),
+            ),
+            make_conn(
+                family=socket.AF_INET6,
+                conn_type=socket.SOCK_STREAM,
+                status="LISTEN",
+                laddr=make_addr("fd00::5", 9443),
+            ),
+            make_conn(
+                family=socket.AF_INET,
+                conn_type=socket.SOCK_STREAM,
+                status="LISTEN",
+                laddr=make_addr("203.0.113.10", 443),
             ),
             make_conn(
                 family=socket.AF_INET,
@@ -184,24 +222,34 @@ class XdpPortSyncTests(unittest.TestCase):
                 family=socket.AF_INET,
                 conn_type=socket.SOCK_DGRAM,
                 status="",
-                laddr=make_addr("192.0.2.10", 9999),
-                raddr=make_addr("198.51.100.99", 53),
+                laddr=make_addr("127.0.0.1", 5353),
+                raddr=None,
+            ),
+            make_conn(
+                family=socket.AF_INET,
+                conn_type=socket.SOCK_DGRAM,
+                status="",
+                laddr=make_addr("10.0.0.10", 9999),
+                raddr=None,
             ),
         ]
 
         with mock.patch.object(xdp, "psutil", fake_psutil), \
-             mock.patch.object(xdp, "_net_connections", return_value=fake_connections):
+             mock.patch.object(xdp, "_net_connections", return_value=fake_connections), \
+             mock.patch.object(xdp.cfg, "DISCOVERY_EXCLUDE_LOOPBACK", True), \
+             mock.patch.object(xdp, "DISCOVERY_EXCLUDE_BIND_CIDRS", ["10.0.0.0/8", "fd00::/8"]):
             state = xdp.get_listening_ports()
 
-        self.assertEqual(state.tcp, {22})
+        self.assertEqual(state.tcp, {22, 443})
         self.assertEqual(state.udp, {53})
-        self.assertEqual(len(state.established), 2)
+        self.assertEqual(state.established, set())
 
     def test_sync_once_merges_permanent_ports_and_trusted_ips(self):
         backend = mock.Mock()
         state = xdp.PortState(tcp={80}, udp={53}, sctp=set(), established={b"flow"})
 
         with mock.patch.object(xdp, "get_listening_ports", return_value=state), \
+             mock.patch.object(xdp, "_net_connections", return_value=[]), \
              mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(xdp, "UDP_PERMANENT", {123: "ntp"}), \
              mock.patch.object(xdp, "SCTP_PERMANENT", {3868: "diameter"}), \
@@ -213,8 +261,9 @@ class XdpPortSyncTests(unittest.TestCase):
             {53, 123},
             {3868},
             {"203.0.113.8/32"},
-            {b"flow"},
+            set(),
             True,
+            cached_conns=[],
         )
 
     def test_xdp_backend_sync_ports_adds_and_removes_runtime_state(self):
@@ -225,11 +274,17 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.trusted_map = FakeTrustedMap({"203.0.113.1/32"})
         backend.conntrack_map = FakeConntrackMap({b"keep"})
         backend.syn_rate_map = FakeSynRateMap({22: 1})
-        backend.udp_rate_map = FakeSynRateMap()
+        backend.syn_agg_rate_map = FakeSynRateMap()
+        backend.tcp_conn_limit_map = FakeSynRateMap()
+        backend.udp_rate_map = FakeUdpPortMap()
+        backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
         backend.bogon_cfg_map = None
         backend._sync_syn_rate = mock.Mock()
+        backend._sync_syn_agg_rate = mock.Mock()
+        backend._sync_tcp_conn_limit = mock.Mock()
         backend._sync_udp_rate = mock.Mock()
+        backend._sync_udp_agg_rate = mock.Mock()
 
         with mock.patch.object(xdp, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(xdp, "UDP_PERMANENT", {53: "dns"}), \
@@ -249,11 +304,15 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.sctp_map.ops, [(2905, 1, False), (9899, 0, False)])
         self.assertEqual(backend.trusted_map.set_ops, [("198.51.100.5/32", 1, False)])
         self.assertEqual(backend.trusted_map.delete_ops, [("203.0.113.1/32", False)])
-        self.assertEqual(backend.conntrack_map.ops, [(b"seed", False)])
-        backend._sync_syn_rate.assert_called_once_with({22, 443}, False)
-        backend._sync_udp_rate.assert_called_once_with({53}, False)
+        self.assertEqual(backend.conntrack_map.ops, [])
+        backend._sync_syn_rate.assert_called_once_with({22, 443}, False, None)
+        backend._sync_syn_agg_rate.assert_called_once_with({22, 443}, False, None)
+        backend._sync_tcp_conn_limit.assert_called_once_with({22, 443}, False, None)
+        backend._sync_udp_rate.assert_called_once_with({53}, False, None)
+        backend._sync_udp_agg_rate.assert_called_once_with({53}, False, None)
 
     def test_xdp_backend_sync_syn_rate_uses_proc_names_and_service_names(self):
+        import auto_xdp.policy as policy
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
         backend.syn_rate_map = FakeSynRateMap({22: 1, 8080: 5})
 
@@ -282,9 +341,9 @@ class XdpPortSyncTests(unittest.TestCase):
 
         with mock.patch.object(xdp, "psutil", FakePsutil), \
              mock.patch.object(xdp, "_net_connections", return_value=conns), \
-             mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport), \
-             mock.patch.object(xdp, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
-             mock.patch.object(xdp, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
+             mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(policy, "_SYN_RATE_BY_PROC", {"sshd": 2}), \
+             mock.patch.object(policy, "_SYN_RATE_BY_SERVICE", {"ssh": 2}):
             backend._sync_syn_rate({22, 80, 2222}, dry_run=False)
 
         self.assertCountEqual(
@@ -294,23 +353,51 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertEqual(backend.syn_rate_map.delete_ops, [(8080, False)])
 
     def test_udp_port_rate_limit_prefers_process_name_then_service_name(self):
+        import auto_xdp.policy as policy
         def fake_getservbyport(port, proto):
             services = {53: "domain", 123: "ntp"}
             if port not in services:
                 raise OSError("unknown service")
             return services[port]
 
-        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport), \
-             mock.patch.object(xdp, "_UDP_RATE_BY_PROC", {"named": 5000}), \
-             mock.patch.object(xdp, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
+        with mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(policy, "_UDP_RATE_BY_PROC", {"named": 5000}), \
+             mock.patch.object(policy, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
             self.assertEqual(xdp._udp_port_rate_limit(5353, "named"), 5000)
             self.assertEqual(xdp._udp_port_rate_limit(53), 5000)
             self.assertEqual(xdp._udp_port_rate_limit(123), 500)
             self.assertEqual(xdp._udp_port_rate_limit(12345), 0)
 
+    def test_syn_aggregate_and_tcp_conn_limits_derive_from_syn_rate(self):
+        import auto_xdp.policy as policy
+        with mock.patch.object(policy.socket, "getservbyport", side_effect=lambda port, proto: "ssh" if port == 22 else "http"), \
+             mock.patch.object(policy, "_SYN_RATE_BY_SERVICE", {"ssh": 2}), \
+             mock.patch.object(policy, "_SYN_AGG_RATE_BY_SERVICE", {}), \
+             mock.patch.object(policy, "_TCP_CONN_BY_SERVICE", {}):
+            self.assertEqual(xdp._syn_aggregate_rate_limit(22), 16)
+            self.assertEqual(xdp._tcp_conn_limit(22), 32)
+            self.assertEqual(xdp._syn_aggregate_rate_limit(80), 0)
+            self.assertEqual(xdp._tcp_conn_limit(80), 0)
+
+    def test_udp_aggregate_byte_limit_uses_explicit_or_derived_values(self):
+        import auto_xdp.policy as policy
+        def fake_getservbyport(port, proto):
+            services = {53: "domain", 123: "ntp"}
+            if port not in services:
+                raise OSError("unknown service")
+            return services[port]
+
+        with mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(policy, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}), \
+             mock.patch.object(policy, "_UDP_AGG_BYTES_BY_SERVICE", {"ntp": 900000}):
+            self.assertEqual(xdp._udp_aggregate_byte_limit(53), 6000000)
+            self.assertEqual(xdp._udp_aggregate_byte_limit(123), 900000)
+            self.assertEqual(xdp._udp_aggregate_byte_limit(9999), 0)
+
     def test_xdp_backend_sync_udp_rate_sets_rates_for_udp_ports(self):
+        import auto_xdp.policy as policy
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
-        backend.udp_rate_map = FakeSynRateMap({53: 1000, 9999: 5})
+        backend.udp_rate_map = FakeUdpPortMap({53: 1000, 9999: 5})
 
         def fake_getservbyport(port, proto):
             services = {53: "domain", 123: "ntp"}
@@ -318,8 +405,8 @@ class XdpPortSyncTests(unittest.TestCase):
                 raise OSError("unknown service")
             return services[port]
 
-        with mock.patch.object(xdp.socket, "getservbyport", side_effect=fake_getservbyport), \
-             mock.patch.object(xdp, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
+        with mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(policy, "_UDP_RATE_BY_SERVICE", {"domain": 5000, "ntp": 500}):
             backend._sync_udp_rate({53, 123}, dry_run=False)
 
         self.assertCountEqual(
@@ -327,6 +414,28 @@ class XdpPortSyncTests(unittest.TestCase):
             [(53, 5000, False), (123, 500, False)],
         )
         self.assertEqual(backend.udp_rate_map.delete_ops, [(9999, False)])
+
+    def test_xdp_backend_sync_udp_aggregate_sets_byte_limits_for_udp_ports(self):
+        import auto_xdp.policy as policy
+        backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
+        backend.udp_agg_rate_map = FakeUdpPortMap({53: 1000, 9999: 5})
+
+        def fake_getservbyport(port, proto):
+            services = {53: "domain", 123: "ntp"}
+            if port not in services:
+                raise OSError("unknown service")
+            return services[port]
+
+        with mock.patch.object(policy.socket, "getservbyport", side_effect=fake_getservbyport), \
+             mock.patch.object(policy, "_UDP_RATE_BY_SERVICE", {"domain": 5000}), \
+             mock.patch.object(policy, "_UDP_AGG_BYTES_BY_SERVICE", {"ntp": 900000}):
+            backend._sync_udp_agg_rate({53, 123}, dry_run=False)
+
+        self.assertCountEqual(
+            backend.udp_agg_rate_map.set_ops,
+            [(53, 6000000, False), (123, 900000, False)],
+        )
+        self.assertEqual(backend.udp_agg_rate_map.delete_ops, [(9999, False)])
 
     def test_xdp_backend_close_closes_all_maps(self):
         backend = xdp.XdpBackend.__new__(xdp.XdpBackend)
@@ -336,7 +445,10 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.trusted_map = FakeTrustedMap()
         backend.conntrack_map = FakeConntrackMap()
         backend.syn_rate_map = FakeSynRateMap()
-        backend.udp_rate_map = FakeSynRateMap()
+        backend.syn_agg_rate_map = FakeSynRateMap()
+        backend.tcp_conn_limit_map = FakeSynRateMap()
+        backend.udp_rate_map = FakeUdpPortMap()
+        backend.udp_agg_rate_map = FakeUdpPortMap()
         backend.acl_maps = None
         backend.bogon_cfg_map = None
 
@@ -348,7 +460,10 @@ class XdpPortSyncTests(unittest.TestCase):
         self.assertTrue(backend.trusted_map.closed)
         self.assertTrue(backend.conntrack_map.closed)
         self.assertTrue(backend.syn_rate_map.closed)
+        self.assertTrue(backend.syn_agg_rate_map.closed)
+        self.assertTrue(backend.tcp_conn_limit_map.closed)
         self.assertTrue(backend.udp_rate_map.closed)
+        self.assertTrue(backend.udp_agg_rate_map.closed)
 
     def test_nftables_backend_ensure_ruleset_keeps_existing_complete_ruleset(self):
         backend = xdp.NftablesBackend.__new__(xdp.NftablesBackend)
@@ -468,7 +583,9 @@ class XdpPortSyncTests(unittest.TestCase):
         ]), mock.patch.object(xdp, "watch") as watch:
             xdp.main()
 
-        watch.assert_called_once_with(5, True, "auto", xdp.TOML_CONFIG_PATH, {})
+        watch.assert_called_once_with(
+            5, True, "auto", xdp.TOML_CONFIG_PATH, {}, cli_log_level=None
+        )
 
     def test_main_watch_mode_passes_custom_config_to_watch(self):
         with mock.patch.object(sys, "argv", [
@@ -480,7 +597,8 @@ class XdpPortSyncTests(unittest.TestCase):
             xdp.main()
 
         watch.assert_called_once_with(
-            mock.ANY, mock.ANY, mock.ANY, "/tmp/test.toml", {}
+            mock.ANY, mock.ANY, mock.ANY, "/tmp/test.toml", {},
+            cli_log_level=None,
         )
 
     def test_main_watch_mode_passes_cli_trusted_ips_to_watch(self):
@@ -495,6 +613,7 @@ class XdpPortSyncTests(unittest.TestCase):
         watch.assert_called_once_with(
             mock.ANY, mock.ANY, mock.ANY, mock.ANY,
             {"1.2.3.4/32": "myhost", "10.0.0.0/8": "internal"},
+            cli_log_level=None,
         )
 
 

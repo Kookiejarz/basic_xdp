@@ -10,13 +10,9 @@ Fallback poll   : periodic scan every --interval seconds (default 30)
 from __future__ import annotations
 
 import argparse
-import ctypes
 import ipaddress
-import ctypes.util
-import errno
 import logging
 import os
-import platform
 import select
 import shutil
 import signal
@@ -28,142 +24,83 @@ import time
 from dataclasses import dataclass, field
 
 try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    try:
-        import tomli as tomllib  # type: ignore[no-redef]
-    except ImportError:
-        tomllib = None  # type: ignore[assignment]
-
-try:
     import psutil
 except ImportError:
     psutil = None
 
-TOML_CONFIG_PATH = "/etc/auto_xdp/config.toml"
-
-TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
-UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
-SCTP_MAP_PATH = "/sys/fs/bpf/xdp_fw/sctp_whitelist"
-TCP_CONNTRACK_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_conntrack"
-TRUSTED_IPS_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/trusted_ipv4"
-TRUSTED_IPS_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/trusted_ipv6"
-SYN_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/syn_rate_ports"
-UDP_RATE_MAP_PATH     = "/sys/fs/bpf/xdp_fw/udp_rate_ports"
-UDP_GLOBAL_RL_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_global_rl"
-BOGON_CFG_MAP_PATH     = "/sys/fs/bpf/xdp_fw/bogon_cfg"
-TCP_ACL_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/tcp_acl_v4"
-TCP_ACL_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/tcp_acl_v6"
-UDP_ACL_MAP_PATH4 = "/sys/fs/bpf/xdp_fw/udp_acl_v4"
-UDP_ACL_MAP_PATH6 = "/sys/fs/bpf/xdp_fw/udp_acl_v6"
-REQUIRED_XDP_MAP_PATHS = (
-    TCP_MAP_PATH,
-    UDP_MAP_PATH,
-    TCP_CONNTRACK_MAP_PATH,
-    TRUSTED_IPS_MAP_PATH4,
-    TRUSTED_IPS_MAP_PATH6,
+from auto_xdp import config as cfg
+from auto_xdp.config import apply_toml_config, load_toml_config
+from auto_xdp.bpf.maps import (
+    BpfAclMaps,
+    BpfArrayMap,
+    BpfConntrackMap,
+    BpfSynRatePortsMap,
+    BpfTrustedMaps,
+    render_nft_addrs as _render_nft_addrs,
+    render_nft_ports as _render_nft_ports,
+    run_nft as _run_nft,
+)
+from auto_xdp.policy import (
+    _port_rate_limit,
+    _syn_aggregate_rate_limit,
+    _tcp_conn_limit,
+    _udp_port_rate_limit,
+    _udp_aggregate_byte_limit,
 )
 
-_SYN_RATE_BY_PROC:    dict[str, int] = {}
-_SYN_RATE_BY_SERVICE: dict[str, int] = {}
-_UDP_RATE_BY_PROC:    dict[str, int] = {}
-_UDP_RATE_BY_SERVICE: dict[str, int] = {}
-
-BOGON_FILTER_ENABLED: bool = True
-
-NFT_FAMILY = "inet"
-NFT_TABLE = "auto_xdp"
-NFT_TCP_SET = "tcp_ports"
-NFT_UDP_SET = "udp_ports"
-NFT_SCTP_SET = "sctp_ports"
-NFT_TRUSTED_SET4 = "trusted_v4"
-NFT_TRUSTED_SET6 = "trusted_v6"
-
-BACKEND_AUTO = "auto"
-BACKEND_XDP = "xdp"
-BACKEND_NFTABLES = "nftables"
-
-TCP_PERMANENT:   dict[int, str] = {}
-UDP_PERMANENT:   dict[int, str] = {}
-SCTP_PERMANENT:  dict[int, str] = {}
-TRUSTED_SRC_IPS: dict[str, str] = {}
-ACL_RULES:       list[dict]     = []
-
-_ACL_MAX_PORTS = 64
-_ACL_VAL_SIZE  = 4 + _ACL_MAX_PORTS * 2  # u32 count + u16 ports[64] = 132 bytes
-
-
-def _normalize_cidr(cidr_str: str) -> str:
-    """Return the canonical network address form of a CIDR, e.g. 10.0.0.5/24 → 10.0.0.0/24."""
-    if ":" in cidr_str:
-        net = ipaddress.IPv6Network(cidr_str, strict=False)
-    else:
-        net = ipaddress.IPv4Network(cidr_str, strict=False)
-    return f"{net.network_address}/{net.prefixlen}"
-
-
-def load_toml_config(path: str = TOML_CONFIG_PATH) -> dict:
-    if tomllib is None:
-        log.debug("tomllib not available; skipping TOML config load.")
-        return {}
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        log.warning("Failed to load %s: %s", path, exc)
-        return {}
-
-
-def apply_toml_config(cfg: dict) -> None:
-    """Replace all config-driven globals from a parsed TOML dict.
-
-    Called at startup and on SIGHUP.  Always does a full reset so that
-    deletions in the config file take effect without a restart.
-    """
-    global TCP_PERMANENT, UDP_PERMANENT, SCTP_PERMANENT, ACL_RULES
-    global _SYN_RATE_BY_PROC, _SYN_RATE_BY_SERVICE, _UDP_RATE_BY_PROC, _UDP_RATE_BY_SERVICE
-    global BOGON_FILTER_ENABLED
-
-    TCP_PERMANENT = {}
-    UDP_PERMANENT = {}
-    SCTP_PERMANENT = {}
-    TRUSTED_SRC_IPS.clear()
-    ACL_RULES = []
-
-    perm = cfg.get("permanent_ports", {})
-    for p in perm.get("tcp", []):
-        TCP_PERMANENT[int(p)] = "config"
-    for p in perm.get("udp", []):
-        UDP_PERMANENT[int(p)] = "config"
-    for p in perm.get("sctp", []):
-        SCTP_PERMANENT[int(p)] = "config"
-
-    for cidr, label in cfg.get("trusted_ips", {}).items():
-        TRUSTED_SRC_IPS[_normalize_cidr(cidr)] = str(label)
-
-    for rule in cfg.get("acl", []):
-        ACL_RULES.append({
-            "proto": rule["proto"],
-            "cidr":  _normalize_cidr(rule["cidr"]),
-            "ports": [int(p) for p in rule.get("ports", [])],
-        })
-
-    rl = cfg.get("rate_limits", {})
-    _SYN_RATE_BY_PROC    = {k: int(v) for k, v in rl.get("syn_by_proc",    {}).items()}
-    _SYN_RATE_BY_SERVICE = {k: int(v) for k, v in rl.get("syn_by_service", {}).items()}
-    _UDP_RATE_BY_PROC    = {k: int(v) for k, v in rl.get("udp_by_proc",    {}).items()}
-    _UDP_RATE_BY_SERVICE = {k: int(v) for k, v in rl.get("udp_by_service", {}).items()}
-
-    BOGON_FILTER_ENABLED = bool(cfg.get("firewall", {}).get("bogon_filter", True))
+TOML_CONFIG_PATH = cfg.TOML_CONFIG_PATH
+TCP_MAP_PATH = cfg.TCP_MAP_PATH
+UDP_MAP_PATH = cfg.UDP_MAP_PATH
+SCTP_MAP_PATH = cfg.SCTP_MAP_PATH
+TCP_CONNTRACK_MAP_PATH = cfg.TCP_CONNTRACK_MAP_PATH
+TRUSTED_IPS_MAP_PATH4 = cfg.TRUSTED_IPS_MAP_PATH4
+TRUSTED_IPS_MAP_PATH6 = cfg.TRUSTED_IPS_MAP_PATH6
+SYN_RATE_MAP_PATH = cfg.SYN_RATE_MAP_PATH
+UDP_RATE_MAP_PATH = cfg.UDP_RATE_MAP_PATH
+SYN_AGG_RATE_MAP_PATH = cfg.SYN_AGG_RATE_MAP_PATH
+TCP_CONN_LIMIT_MAP_PATH = cfg.TCP_CONN_LIMIT_MAP_PATH
+UDP_AGG_RATE_MAP_PATH = cfg.UDP_AGG_RATE_MAP_PATH
+UDP_GLOBAL_RL_MAP_PATH = cfg.UDP_GLOBAL_RL_MAP_PATH
+BOGON_CFG_MAP_PATH = cfg.BOGON_CFG_MAP_PATH
+TCP_ACL_MAP_PATH4 = cfg.TCP_ACL_MAP_PATH4
+TCP_ACL_MAP_PATH6 = cfg.TCP_ACL_MAP_PATH6
+UDP_ACL_MAP_PATH4 = cfg.UDP_ACL_MAP_PATH4
+UDP_ACL_MAP_PATH6 = cfg.UDP_ACL_MAP_PATH6
+REQUIRED_XDP_MAP_PATHS = cfg.REQUIRED_XDP_MAP_PATHS
+NFT_FAMILY = cfg.NFT_FAMILY
+NFT_TABLE = cfg.NFT_TABLE
+NFT_TCP_SET = cfg.NFT_TCP_SET
+NFT_UDP_SET = cfg.NFT_UDP_SET
+NFT_SCTP_SET = cfg.NFT_SCTP_SET
+NFT_TRUSTED_SET4 = cfg.NFT_TRUSTED_SET4
+NFT_TRUSTED_SET6 = cfg.NFT_TRUSTED_SET6
+BACKEND_AUTO = cfg.BACKEND_AUTO
+BACKEND_XDP = cfg.BACKEND_XDP
+BACKEND_NFTABLES = cfg.BACKEND_NFTABLES
+TCP_PERMANENT = cfg.TCP_PERMANENT
+UDP_PERMANENT = cfg.UDP_PERMANENT
+SCTP_PERMANENT = cfg.SCTP_PERMANENT
+TRUSTED_SRC_IPS = cfg.TRUSTED_SRC_IPS
+ACL_RULES = cfg.ACL_RULES
+_SYN_RATE_BY_PROC = cfg._SYN_RATE_BY_PROC
+_SYN_RATE_BY_SERVICE = cfg._SYN_RATE_BY_SERVICE
+_SYN_AGG_RATE_BY_PROC = cfg._SYN_AGG_RATE_BY_PROC
+_SYN_AGG_RATE_BY_SERVICE = cfg._SYN_AGG_RATE_BY_SERVICE
+_TCP_CONN_BY_PROC = cfg._TCP_CONN_BY_PROC
+_TCP_CONN_BY_SERVICE = cfg._TCP_CONN_BY_SERVICE
+_UDP_RATE_BY_PROC = cfg._UDP_RATE_BY_PROC
+_UDP_RATE_BY_SERVICE = cfg._UDP_RATE_BY_SERVICE
+_UDP_AGG_BYTES_BY_PROC = cfg._UDP_AGG_BYTES_BY_PROC
+_UDP_AGG_BYTES_BY_SERVICE = cfg._UDP_AGG_BYTES_BY_SERVICE
+DISCOVERY_EXCLUDE_BIND_CIDRS = cfg.DISCOVERY_EXCLUDE_BIND_CIDRS
+_ACL_MAX_PORTS = cfg.ACL_MAX_PORTS
 
 
 # Wait this long after an EXEC/EXIT event before scanning,
 # giving the new process time to call bind().
-DEBOUNCE_S = 0.3
+DEBOUNCE_S = 0.4
 
-DEFAULT_LOG_LEVEL = os.environ.get("BASIC_XDP_LOG_LEVEL", "INFO").upper()
+DEFAULT_LOG_LEVEL = os.environ.get("BASIC_XDP_LOG_LEVEL", "WARNING").upper()
 
 logging.basicConfig(
     level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
@@ -177,672 +114,61 @@ _net_connections = None
 if psutil is not None:
     _net_connections = getattr(psutil, "connections", psutil.net_connections)
 
-# BPF syscall layer
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-_NR_BPF: int = {
-    "x86_64": 321,
-    "aarch64": 280,
-    "armv7l": 386,
-    "armv6l": 386,
-}.get(platform.machine(), 321)
-
-_BPF_MAP_LOOKUP_ELEM = 1
-_BPF_MAP_UPDATE_ELEM = 2
-BPF_MAP_DELETE_ELEM = 3
-_BPF_MAP_GET_NEXT_KEY = 4
-_BPF_OBJ_GET = 7
-
-
-def _bpf(cmd: int, attr: ctypes.Array) -> int:
-    ret = _libc.syscall(_NR_BPF, ctypes.c_int(cmd), attr, ctypes.c_uint(len(attr)))
-    if ret < 0:
-        err = ctypes.get_errno()
-        raise OSError(err, os.strerror(err))
-    return ret
-
-
-def _obj_get(path: str) -> int:
-    """Open a pinned BPF object and return its fd."""
-    path_b = ctypes.create_string_buffer(path.encode() + b"\x00")
-    attr = ctypes.create_string_buffer(128)
-    struct.pack_into("=Q", attr, 0, ctypes.cast(path_b, ctypes.c_void_p).value or 0)
-    return _bpf(_BPF_OBJ_GET, attr)
-
-
-def _render_nft_ports(ports: set[int]) -> str:
-    return "{ " + ", ".join(str(port) for port in sorted(ports)) + " }"
-
-
-def _render_nft_addrs(addrs: set[str]) -> str:
-    return "{ " + ", ".join(sorted(addrs)) + " }"
-
-
-def _run_nft(args: list[str], input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["nft", *args],
-        input=input_text,
-        text=True,
-        capture_output=True,
-        check=check,
-    )
-
-
-class BpfArrayMap:
-    """Pinned BPF ARRAY map (key = __u32 port, value = __u32 0/1)."""
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self.fd = _obj_get(path)
-        self._cache: set[int] = set()
-
-        self._key = ctypes.create_string_buffer(4)
-        self._val = ctypes.create_string_buffer(4)
-        self._update_attr = ctypes.create_string_buffer(128)
-        self._lookup_attr = ctypes.create_string_buffer(128)
-        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
-        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
-        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
-        self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def _update(self, port: int, val: int) -> None:
-        struct.pack_into("=I", self._key, 0, port)
-        struct.pack_into("=I", self._val, 0, val)
-        _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
-
-    def _lookup(self, port: int) -> int:
-        struct.pack_into("=I", self._key, 0, port)
-        _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-        return struct.unpack_from("=I", self._val, 0)[0]
-
-    def _load_cache(self) -> None:
-        for port in range(65536):
-            try:
-                if self._lookup(port):
-                    self._cache.add(port)
-            except OSError:
+def _listening_port_processes(ports: set[int], conn_type: int, cached_conns=None) -> dict[int, str]:
+    port_procs: dict[int, str] = {}
+    if psutil is None or _net_connections is None or not ports:
+        return port_procs
+    try:
+        for conn in (cached_conns if cached_conns is not None else _net_connections(kind="inet")):
+            if not (conn.laddr and conn.laddr.port in ports):
                 continue
-
-    def active_ports(self) -> set[int]:
-        return set(self._cache)
-
-    def set(self, port: int, val: int, dry_run: bool = False) -> bool:
-        if dry_run:
-            log.info("[DRY] %s port %d -> %d", self.path, port, val)
-            self._cache.add(port) if val else self._cache.discard(port)
-            return True
-        try:
-            self._update(port, val)
-            self._cache.add(port) if val else self._cache.discard(port)
-            return True
-        except OSError as exc:
-            log.warning("BPF update failed port=%d: %s", port, exc)
-            return False
-
-
-class BpfLpmMap:
-    """Pinned BPF LPM_TRIE map for CIDR prefix matching (IPv4 or IPv6)."""
-
-    def __init__(self, path: str, family: int) -> None:
-        self.path = path
-        self.fd = _obj_get(path)
-        self._family = family
-        self._addr_len = 4 if family == socket.AF_INET else 16
-        self._max_prefix = 32 if family == socket.AF_INET else 128
-        self._key_len = 4 + self._addr_len
-        self._cache: set[str] = set()
-        self._key = ctypes.create_string_buffer(self._key_len)
-        self._next_key = ctypes.create_string_buffer(self._key_len)
-        self._val = ctypes.create_string_buffer(4)
-        self._update_attr = ctypes.create_string_buffer(128)
-        self._lookup_attr = ctypes.create_string_buffer(128)
-        self._delete_attr = ctypes.create_string_buffer(128)
-        self._next_attr = ctypes.create_string_buffer(128)
-        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
-        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
-        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
-        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
-        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
-        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
-        self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def _pack_key(self, cidr_str: str) -> str:
-        if self._family == socket.AF_INET:
-            net = ipaddress.IPv4Network(cidr_str, strict=False)
-        else:
-            net = ipaddress.IPv6Network(cidr_str, strict=False)
-        addr_bytes = net.network_address.packed
-        ctypes.memmove(self._key, struct.pack("=I", net.prefixlen) + addr_bytes, self._key_len)
-        return f"{net.network_address}/{net.prefixlen}"
-
-    def _unpack_key(self, key_raw: bytes) -> str:
-        prefixlen = struct.unpack_from("=I", key_raw, 0)[0]
-        addr_raw = key_raw[4:4 + self._addr_len]
-        if self._family == socket.AF_INET:
-            ip_str = socket.inet_ntoa(addr_raw)
-        else:
-            ip_str = socket.inet_ntop(socket.AF_INET6, addr_raw)
-        return f"{ip_str}/{prefixlen}"
-
-    def _update(self, cidr_str: str, val: int) -> str:
-        normalized = self._pack_key(cidr_str)
-        struct.pack_into("=I", self._val, 0, val)
-        _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
-        return normalized
-
-    def _delete_key(self, cidr_str: str) -> str:
-        normalized = self._pack_key(cidr_str)
-        _bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
-        return normalized
-
-    def _lookup_raw_key(self, key_raw: bytes) -> int:
-        ctypes.memmove(self._key, key_raw, self._key_len)
-        _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-        return struct.unpack_from("=I", self._val, 0)[0]
-
-    def _iter_raw_keys(self):
-        current_ptr = 0
-        while True:
-            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr,
-                             ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
-            try:
-                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    break
-                raise
-            key_raw = bytes(self._next_key.raw[:self._key_len])
-            yield key_raw
-            ctypes.memmove(self._key, key_raw, self._key_len)
-            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-
-    def _load_cache(self) -> None:
-        try:
-            for key_raw in self._iter_raw_keys():
-                try:
-                    if self._lookup_raw_key(key_raw):
-                        self._cache.add(self._unpack_key(key_raw))
-                except OSError:
+            if conn.type != conn_type:
+                continue
+            if conn_type == socket.SOCK_STREAM:
+                if getattr(conn, "status", None) != psutil.CONN_LISTEN:
                     continue
-        except OSError:
-            return
-
-    def active_keys(self) -> set[str]:
-        return set(self._cache)
-
-    def set(self, cidr_str: str, val: int, dry_run: bool = False) -> bool:
-        if not val:
-            return self.delete(cidr_str, dry_run)
-        if dry_run:
-            log.info("[DRY] %s cidr %s -> 1", self.path, cidr_str)
-            self._cache.add(_normalize_cidr(cidr_str))
-            return True
-        try:
-            normalized = self._update(cidr_str, 1)
-            self._cache.add(normalized)
-            return True
-        except OSError as exc:
-            log.warning("BPF update failed cidr=%s: %s", cidr_str, exc)
-            return False
-
-    def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
-        if dry_run:
-            log.info("[DRY] %s delete cidr %s", self.path, cidr_str)
-            self._cache.discard(_normalize_cidr(cidr_str))
-            return True
-        try:
-            normalized = self._delete_key(cidr_str)
-            self._cache.discard(normalized)
-            return True
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                self._cache.discard(_normalize_cidr(cidr_str))
-                return True
-            log.warning("BPF delete failed cidr=%s: %s", cidr_str, exc)
-            return False
-
-
-class BpfTrustedMaps:
-    """Pair of IPv4/IPv6 LPM trie maps for trusted source CIDRs."""
-
-    def __init__(self, path4: str, path6: str) -> None:
-        self._map4 = BpfLpmMap(path4, socket.AF_INET)
-        self._map6 = BpfLpmMap(path6, socket.AF_INET6)
-
-    def close(self) -> None:
-        self._map4.close()
-        self._map6.close()
-
-    def active_keys(self) -> set[str]:
-        return self._map4.active_keys() | self._map6.active_keys()
-
-    def set(self, cidr_str: str, val: int, dry_run: bool = False) -> bool:
-        if ":" in cidr_str:
-            return self._map6.set(cidr_str, val, dry_run)
-        return self._map4.set(cidr_str, val, dry_run)
-
-    def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
-        if ":" in cidr_str:
-            return self._map6.delete(cidr_str, dry_run)
-        return self._map4.delete(cidr_str, dry_run)
-
-
-class BpfAclMap:
-    """Pinned BPF LPM_TRIE map for per-CIDR port ACLs (key=CIDR, value=port list)."""
-
-    def __init__(self, path: str, family: int) -> None:
-        self.path = path
-        self.fd = _obj_get(path)
-        self._family = family
-        self._addr_len = 4 if family == socket.AF_INET else 16
-        self._max_prefix = 32 if family == socket.AF_INET else 128
-        self._key_len = 4 + self._addr_len
-        self._cache: dict[str, frozenset[int]] = {}
-
-        self._key = ctypes.create_string_buffer(self._key_len)
-        self._next_key = ctypes.create_string_buffer(self._key_len)
-        self._val = ctypes.create_string_buffer(_ACL_VAL_SIZE)
-        self._update_attr = ctypes.create_string_buffer(128)
-        self._lookup_attr = ctypes.create_string_buffer(128)
-        self._delete_attr = ctypes.create_string_buffer(128)
-        self._next_attr = ctypes.create_string_buffer(128)
-        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
-        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
-        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
-        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
-        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
-        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
-        self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def _pack_key(self, cidr_str: str) -> str:
-        if self._family == socket.AF_INET:
-            net = ipaddress.IPv4Network(cidr_str, strict=False)
-        else:
-            net = ipaddress.IPv6Network(cidr_str, strict=False)
-        addr_bytes = net.network_address.packed
-        ctypes.memmove(self._key, struct.pack("=I", net.prefixlen) + addr_bytes, self._key_len)
-        return f"{net.network_address}/{net.prefixlen}"
-
-    def _unpack_key(self, key_raw: bytes) -> str:
-        prefixlen = struct.unpack_from("=I", key_raw, 0)[0]
-        addr_raw = key_raw[4:4 + self._addr_len]
-        if self._family == socket.AF_INET:
-            ip_str = socket.inet_ntoa(addr_raw)
-        else:
-            ip_str = socket.inet_ntop(socket.AF_INET6, addr_raw)
-        return f"{ip_str}/{prefixlen}"
-
-    def _pack_val(self, ports: list[int]) -> None:
-        clamped = ports[:_ACL_MAX_PORTS]
-        count = len(clamped)
-        padded = clamped + [0] * (_ACL_MAX_PORTS - count)
-        ctypes.memmove(self._val, struct.pack("=I" + "H" * _ACL_MAX_PORTS, count, *padded), _ACL_VAL_SIZE)
-
-    def _unpack_val(self) -> frozenset[int]:
-        count = struct.unpack_from("=I", self._val, 0)[0]
-        count = min(count, _ACL_MAX_PORTS)
-        ports = struct.unpack_from(f"={count}H", self._val, 4)
-        return frozenset(ports)
-
-    def _iter_raw_keys(self):
-        current_ptr = 0
-        while True:
-            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr,
-                             ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
+            elif getattr(conn, "raddr", None):
+                continue
+            pid = getattr(conn, "pid", None)
+            if pid is None:
+                continue
             try:
-                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    break
-                raise
-            key_raw = bytes(self._next_key.raw[:self._key_len])
-            yield key_raw
-            ctypes.memmove(self._key, key_raw, self._key_len)
-            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
+                port_procs[conn.laddr.port] = psutil.Process(pid).name()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return port_procs
 
-    def _load_cache(self) -> None:
+
+def _discovery_exclude_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for cidr in DISCOVERY_EXCLUDE_BIND_CIDRS:
         try:
-            for key_raw in self._iter_raw_keys():
-                try:
-                    ctypes.memmove(self._key, key_raw, self._key_len)
-                    _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                    cidr = self._unpack_key(key_raw)
-                    self._cache[cidr] = self._unpack_val()
-                except OSError:
-                    continue
-        except OSError:
-            return
-
-    def active_entries(self) -> dict[str, frozenset[int]]:
-        return dict(self._cache)
-
-    def set(self, cidr_str: str, ports: list[int], dry_run: bool = False) -> bool:
-        if dry_run:
-            log.info("[DRY] %s cidr %s ports %s", self.path, cidr_str, ports)
-            if self._family == socket.AF_INET:
-                net = ipaddress.IPv4Network(cidr_str, strict=False)
-            else:
-                net = ipaddress.IPv6Network(cidr_str, strict=False)
-            normalized = f"{net.network_address}/{net.prefixlen}"
-            self._cache[normalized] = frozenset(ports)
-            return True
-        try:
-            normalized = self._pack_key(cidr_str)
-            self._pack_val(ports)
-            _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
-            self._cache[normalized] = frozenset(ports)
-            return True
-        except OSError as exc:
-            log.warning("BPF ACL update failed cidr=%s: %s", cidr_str, exc)
-            return False
-
-    def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
-        if dry_run:
-            log.info("[DRY] %s delete cidr %s", self.path, cidr_str)
-            if self._family == socket.AF_INET:
-                net = ipaddress.IPv4Network(cidr_str, strict=False)
-            else:
-                net = ipaddress.IPv6Network(cidr_str, strict=False)
-            self._cache.pop(f"{net.network_address}/{net.prefixlen}", None)
-            return True
-        try:
-            normalized = self._pack_key(cidr_str)
-            _bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
-            self._cache.pop(normalized, None)
-            return True
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                if self._family == socket.AF_INET:
-                    net = ipaddress.IPv4Network(cidr_str, strict=False)
-                else:
-                    net = ipaddress.IPv6Network(cidr_str, strict=False)
-                self._cache.pop(f"{net.network_address}/{net.prefixlen}", None)
-                return True
-            log.warning("BPF ACL delete failed cidr=%s: %s", cidr_str, exc)
-            return False
+            nets.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            log.warning("Ignoring invalid discovery exclude_bind_cidrs entry: %s", cidr)
+    return tuple(nets)
 
 
-class BpfAclMaps:
-    """Four ACL LPM trie maps: TCP/UDP × IPv4/IPv6."""
-
-    def __init__(self, tcp4: str, tcp6: str, udp4: str, udp6: str) -> None:
-        self._tcp4 = BpfAclMap(tcp4, socket.AF_INET)
-        self._tcp6 = BpfAclMap(tcp6, socket.AF_INET6)
-        self._udp4 = BpfAclMap(udp4, socket.AF_INET)
-        self._udp6 = BpfAclMap(udp6, socket.AF_INET6)
-
-    def close(self) -> None:
-        for m in (self._tcp4, self._tcp6, self._udp4, self._udp6):
-            m.close()
-
-    def _map_for(self, proto: str, cidr: str) -> BpfAclMap:
-        is6 = ":" in cidr
-        if proto == "tcp":
-            return self._tcp6 if is6 else self._tcp4
-        return self._udp6 if is6 else self._udp4
-
-    def set(self, proto: str, cidr: str, ports: list[int], dry_run: bool = False) -> bool:
-        return self._map_for(proto, cidr).set(cidr, ports, dry_run)
-
-    def delete(self, proto: str, cidr: str, dry_run: bool = False) -> bool:
-        return self._map_for(proto, cidr).delete(cidr, dry_run)
-
-    def active_entries(self) -> dict[tuple[str, str], frozenset[int]]:
-        """Returns {(proto, cidr): ports} for all currently active ACL entries."""
-        result: dict[tuple[str, str], frozenset[int]] = {}
-        for cidr, ports in self._tcp4.active_entries().items():
-            result[("tcp", cidr)] = ports
-        for cidr, ports in self._tcp6.active_entries().items():
-            result[("tcp", cidr)] = ports
-        for cidr, ports in self._udp4.active_entries().items():
-            result[("udp", cidr)] = ports
-        for cidr, ports in self._udp6.active_entries().items():
-            result[("udp", cidr)] = ports
-        return result
-
-
-class BpfConntrackMap:
-    """Pinned BPF LRU_HASH map (key = struct ct_key, value = __u64)."""
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self.fd = _obj_get(path)
-        self._cache: set[bytes] = set()
-
-        self._key = ctypes.create_string_buffer(40)
-        self._next_key = ctypes.create_string_buffer(40)
-        self._val = ctypes.create_string_buffer(8)
-        self._attr = ctypes.create_string_buffer(128)
-        self._next_attr = ctypes.create_string_buffer(128)
-        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
-        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
-        struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
-        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
-        self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def active_keys(self) -> set[bytes]:
-        return set(self._cache)
-
-    def _iter_raw_keys(self):
-        current_ptr = 0
-        while True:
-            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
-            try:
-                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    break
-                raise
-            key_raw = bytes(self._next_key.raw[:40])
-            yield key_raw
-            ctypes.memmove(self._key, key_raw, 40)
-            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-
-    def _load_cache(self) -> None:
-        try:
-            for key_raw in self._iter_raw_keys():
-                self._cache.add(key_raw)
-        except OSError:
-            return
-
-    def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
-        if dry_run:
-            self._cache.add(key_bytes)
-            return True
-        try:
-            ctypes.memmove(self._key, key_bytes, 40)
-            # Use monotonic_ns as a stable timestamp for seeded flows.
-            struct.pack_into("=Q", self._val, 0, time.monotonic_ns())
-            _bpf(_BPF_MAP_UPDATE_ELEM, self._attr)
-            self._cache.add(key_bytes)
-            return True
-        except OSError as exc:
-            log.warning("BPF conntrack update failed: %s", exc)
-            return False
-
-
-def _port_rate_limit(port: int, proc: str = "") -> int:
-    """Return the SYN rate limit for a TCP port, or 0 to skip rate limiting.
-
-    Resolution order:
-      1. Process name (_SYN_RATE_BY_PROC) — catches services on non-standard ports.
-      2. IANA service name (_SYN_RATE_BY_SERVICE) — fallback for unknown processes.
-      3. Anything else → 0 (no rate limit).
-    """
-    if proc:
-        rate = _SYN_RATE_BY_PROC.get(proc)
-        if rate is not None:
-            return rate
+def _bind_ip_is_exposed(
+    ip_str: str,
+    exclude_nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> bool:
+    # Wildcard binds mean "all addresses" and should be treated as externally reachable.
+    if ip_str in ("0.0.0.0", "::", "*"):
+        return True
     try:
-        svc = socket.getservbyport(port, "tcp")
-    except OSError:
-        return 0
-    return _SYN_RATE_BY_SERVICE.get(svc, 0)
-
-
-def _udp_port_rate_limit(port: int, proc: str = "") -> int:
-    """Return the UDP rate limit for a port, or 0 to skip rate limiting."""
-    if proc:
-        rate = _UDP_RATE_BY_PROC.get(proc)
-        if rate is not None:
-            return rate
-    try:
-        svc = socket.getservbyport(port, "udp")
-    except OSError:
-        return 0
-    return _UDP_RATE_BY_SERVICE.get(svc, 0)
-
-
-class BpfSynRatePortsMap:
-    """Pinned BPF HASH map: key=__u32 dest_port, value=struct{u32 rate_max, u32 _pad}."""
-
-    _VAL_SIZE = 8  # rate_max (__u32) + _pad (__u32)
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self.fd = _obj_get(path)
-        self._cache: dict[int, int] = {}  # port -> rate_max currently in map
-
-        self._key = ctypes.create_string_buffer(4)
-        self._next_key = ctypes.create_string_buffer(4)
-        self._val = ctypes.create_string_buffer(self._VAL_SIZE)
-        self._update_attr = ctypes.create_string_buffer(128)
-        self._lookup_attr = ctypes.create_string_buffer(128)
-        self._delete_attr = ctypes.create_string_buffer(128)
-        self._next_attr = ctypes.create_string_buffer(128)
-        k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
-        v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
-        struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
-        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
-        struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
-        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
-        self._load_cache()
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def _iter_raw_keys(self):
-        current_ptr = 0
-        while True:
-            struct.pack_into(
-                "=I4xQQ", self._next_attr, 0, self.fd,
-                current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0,
-            )
-            try:
-                _bpf(_BPF_MAP_GET_NEXT_KEY, self._next_attr)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    break
-                raise
-            key_raw = bytes(self._next_key.raw[:4])
-            yield key_raw
-            ctypes.memmove(self._key, key_raw, 4)
-            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-
-    def _load_cache(self) -> None:
-        try:
-            for key_raw in self._iter_raw_keys():
-                port = struct.unpack_from("=I", key_raw)[0]
-                ctypes.memmove(self._key, key_raw, 4)
-                try:
-                    _bpf(_BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                    rate_max = struct.unpack_from("=I", self._val)[0]
-                    self._cache[port] = rate_max
-                except OSError:
-                    continue
-        except OSError:
-            return
-
-    def active(self) -> dict[int, int]:
-        return dict(self._cache)
-
-    def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
-        if dry_run:
-            log.info("[DRY] %s port %d rate_max=%d", self.path, port, rate_max)
-            self._cache[port] = rate_max
-            return True
-        try:
-            struct.pack_into("=I", self._key, 0, port)
-            struct.pack_into("=II", self._val, 0, rate_max, 0)
-            _bpf(_BPF_MAP_UPDATE_ELEM, self._update_attr)
-            self._cache[port] = rate_max
-            return True
-        except OSError as exc:
-            log.warning("BPF syn_rate_ports update failed port=%d: %s", port, exc)
+        addr = ipaddress.ip_address(ip_str.split("%", 1)[0])
+    except ValueError:
+        # If the address is malformed or uses an unexpected format, fail open.
+        return True
+    if cfg.DISCOVERY_EXCLUDE_LOOPBACK and addr.is_loopback:
+        return False
+    for net in exclude_nets:
+        if addr.version == net.version and addr in net:
             return False
-
-    def delete(self, port: int, dry_run: bool = False) -> bool:
-        if dry_run:
-            log.info("[DRY] %s delete port %d", self.path, port)
-            self._cache.pop(port, None)
-            return True
-        try:
-            struct.pack_into("=I", self._key, 0, port)
-            _bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
-            self._cache.pop(port, None)
-            return True
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                self._cache.pop(port, None)
-                return True
-            log.warning("BPF syn_rate_ports delete failed port=%d: %s", port, exc)
-            return False
+    return True
 
 
 class PortBackend:
@@ -856,6 +182,7 @@ class PortBackend:
         trusted_target: set[str],
         conntrack_target: set[bytes],
         dry_run: bool,
+        cached_conns=None,
     ) -> None:
         raise NotImplementedError
 
@@ -872,7 +199,10 @@ class XdpBackend(PortBackend):
         self.trusted_map = BpfTrustedMaps(TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6)
         self.conntrack_map = BpfConntrackMap(TCP_CONNTRACK_MAP_PATH)
         self.syn_rate_map: BpfSynRatePortsMap | None = None
+        self.syn_agg_rate_map: BpfSynRatePortsMap | None = None
+        self.tcp_conn_limit_map: BpfSynRatePortsMap | None = None
         self.udp_rate_map: BpfSynRatePortsMap | None = None
+        self.udp_agg_rate_map: BpfSynRatePortsMap | None = None
         self.acl_maps: BpfAclMaps | None = None
         self.bogon_cfg_map: BpfArrayMap | None = None
         self.sctp_map: BpfArrayMap | None = None
@@ -882,10 +212,25 @@ class XdpBackend(PortBackend):
         except OSError as exc:
             log.debug("syn_rate_ports map unavailable (%s); SYN rate limiting inactive.", exc)
         try:
+            self.syn_agg_rate_map = BpfSynRatePortsMap(SYN_AGG_RATE_MAP_PATH)
+            log.debug("syn_agg_rate_ports map opened; per-prefix SYN aggregate limiting active.")
+        except OSError as exc:
+            log.debug("syn_agg_rate_ports map unavailable (%s); per-prefix SYN aggregate limiting inactive.", exc)
+        try:
+            self.tcp_conn_limit_map = BpfSynRatePortsMap(TCP_CONN_LIMIT_MAP_PATH)
+            log.debug("tcp_conn_limit_ports map opened; per-source TCP concurrency limits active.")
+        except OSError as exc:
+            log.debug("tcp_conn_limit_ports map unavailable (%s); TCP concurrency limits inactive.", exc)
+        try:
             self.udp_rate_map = BpfSynRatePortsMap(UDP_RATE_MAP_PATH)
             log.debug("udp_rate_ports map opened; per-source UDP rate limiting active.")
         except OSError as exc:
             log.debug("udp_rate_ports map unavailable (%s); UDP rate limiting inactive.", exc)
+        try:
+            self.udp_agg_rate_map = BpfSynRatePortsMap(UDP_AGG_RATE_MAP_PATH)
+            log.debug("udp_agg_rate_ports map opened; byte-based UDP aggregate limiting active.")
+        except OSError as exc:
+            log.debug("udp_agg_rate_ports map unavailable (%s); byte-based UDP aggregate limiting inactive.", exc)
         try:
             self.acl_maps = BpfAclMaps(
                 TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6,
@@ -911,8 +256,14 @@ class XdpBackend(PortBackend):
         self.conntrack_map.close()
         if self.syn_rate_map is not None:
             self.syn_rate_map.close()
+        if self.syn_agg_rate_map is not None:
+            self.syn_agg_rate_map.close()
+        if self.tcp_conn_limit_map is not None:
+            self.tcp_conn_limit_map.close()
         if self.udp_rate_map is not None:
             self.udp_rate_map.close()
+        if self.udp_agg_rate_map is not None:
+            self.udp_agg_rate_map.close()
         if self.acl_maps is not None:
             self.acl_maps.close()
         if self.bogon_cfg_map is not None:
@@ -928,6 +279,7 @@ class XdpBackend(PortBackend):
         trusted_target: set[str],
         conntrack_target: set[bytes],
         dry_run: bool,
+        cached_conns=None,
     ) -> None:
         changed = False
         tcp_permanent = set(TCP_PERMANENT)
@@ -938,7 +290,7 @@ class XdpBackend(PortBackend):
         active_udp = self.udp_map.active_ports()
         active_sctp = self.sctp_map.active_ports() if self.sctp_map is not None else set()
         active_trusted = self.trusted_map.active_keys()
-        active_conntrack = self.conntrack_map.active_keys()
+        _ = conntrack_target
 
         for port in sorted(tcp_target - active_tcp):
             tag = f" [{TCP_PERMANENT[port]}]" if port in TCP_PERMANENT else ""
@@ -986,27 +338,30 @@ class XdpBackend(PortBackend):
                 log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
 
-        # Periodic conntrack sync (seeding established flows)
-        for flow in sorted(conntrack_target - active_conntrack):
-            if self.conntrack_map.set(flow, dry_run):
-                log.debug("CT +flow (established)")
-                changed = True
-
         if not changed:
             log.debug("Whitelist up-to-date.")
 
         # Sync per-port SYN rate limits based on detected service types.
         if self.syn_rate_map is not None:
-            self._sync_syn_rate(tcp_target, dry_run)
+            self._sync_syn_rate(tcp_target, dry_run, cached_conns)
+
+        if self.syn_agg_rate_map is not None:
+            self._sync_syn_agg_rate(tcp_target, dry_run, cached_conns)
+
+        if self.tcp_conn_limit_map is not None:
+            self._sync_tcp_conn_limit(tcp_target, dry_run, cached_conns)
 
         if self.udp_rate_map is not None:
-            self._sync_udp_rate(udp_target, dry_run)
+            self._sync_udp_rate(udp_target, dry_run, cached_conns)
+
+        if self.udp_agg_rate_map is not None:
+            self._sync_udp_agg_rate(udp_target, dry_run, cached_conns)
 
         if self.acl_maps is not None:
             self._sync_acl(dry_run)
 
         if self.bogon_cfg_map is not None:
-            self.bogon_cfg_map.set(0, 1 if BOGON_FILTER_ENABLED else 0, dry_run)
+            self.bogon_cfg_map.set(0, 1 if cfg.BOGON_FILTER_ENABLED else 0, dry_run)
 
     def _sync_acl(self, dry_run: bool) -> None:
         if self.acl_maps is None:
@@ -1032,31 +387,10 @@ class XdpBackend(PortBackend):
             if self.acl_maps.delete(proto, cidr, dry_run):
                 log.info("ACL %s %s removed", proto.upper(), cidr)
 
-    def _sync_syn_rate(self, tcp_ports: set[int], dry_run: bool) -> None:
+    def _sync_syn_rate(self, tcp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
         """Update syn_rate_ports to match the current set of whitelisted TCP ports."""
         active = self.syn_rate_map.active()  # type: ignore[union-attr]
-
-        # Resolve port → process name so _port_rate_limit can catch services
-        # on non-standard ports (e.g. sshd on 2222 won't match getservbyport).
-        port_procs: dict[int, str] = {}
-        if psutil is not None and _net_connections is not None:
-            try:
-                for conn in _net_connections(kind="inet"):
-                    if not (conn.laddr and conn.laddr.port in tcp_ports):
-                        continue
-                    if conn.type != socket.SOCK_STREAM:
-                        continue
-                    if getattr(conn, "status", None) != psutil.CONN_LISTEN:
-                        continue
-                    pid = getattr(conn, "pid", None)
-                    if pid is None:
-                        continue
-                    try:
-                        port_procs[conn.laddr.port] = psutil.Process(pid).name()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        port_procs = _listening_port_processes(tcp_ports, socket.SOCK_STREAM, cached_conns)
 
         # Desired state: port → rate_max (skip ports where rate=0, i.e. web).
         desired: dict[int, int] = {}
@@ -1080,13 +414,50 @@ class XdpBackend(PortBackend):
             if self.syn_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
                 log.info("SYN rate port %d removed (port no longer whitelisted)", port)
 
-    def _sync_udp_rate(self, udp_ports: set[int], dry_run: bool) -> None:
+    def _sync_syn_agg_rate(self, tcp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
+        active = self.syn_agg_rate_map.active()  # type: ignore[union-attr]
+        port_procs = _listening_port_processes(tcp_ports, socket.SOCK_STREAM, cached_conns)
+        desired: dict[int, int] = {}
+        for port in tcp_ports:
+            limit = _syn_aggregate_rate_limit(port, port_procs.get(port, ""))
+            if limit > 0:
+                desired[port] = limit
+
+        for port, limit in desired.items():
+            if active.get(port) != limit:
+                if self.syn_agg_rate_map.set(port, limit, dry_run):  # type: ignore[union-attr]
+                    log.info("SYN aggregate port %d rate_max=%d/s", port, limit)
+
+        for port in set(active) - set(desired):
+            if self.syn_agg_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
+                log.info("SYN aggregate port %d removed", port)
+
+    def _sync_tcp_conn_limit(self, tcp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
+        active = self.tcp_conn_limit_map.active()  # type: ignore[union-attr]
+        port_procs = _listening_port_processes(tcp_ports, socket.SOCK_STREAM, cached_conns)
+        desired: dict[int, int] = {}
+        for port in tcp_ports:
+            limit = _tcp_conn_limit(port, port_procs.get(port, ""))
+            if limit > 0:
+                desired[port] = limit
+
+        for port, limit in desired.items():
+            if active.get(port) != limit:
+                if self.tcp_conn_limit_map.set(port, limit, dry_run):  # type: ignore[union-attr]
+                    log.info("TCP conn limit port %d conn_max=%d", port, limit)
+
+        for port in set(active) - set(desired):
+            if self.tcp_conn_limit_map.delete(port, dry_run):  # type: ignore[union-attr]
+                log.info("TCP conn limit port %d removed", port)
+
+    def _sync_udp_rate(self, udp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
         """Update udp_rate_ports to match the current set of whitelisted UDP ports."""
         active = self.udp_rate_map.active()  # type: ignore[union-attr]
+        port_procs = _listening_port_processes(udp_ports, socket.SOCK_DGRAM, cached_conns)
 
         desired: dict[int, int] = {}
         for port in udp_ports:
-            rate = _udp_port_rate_limit(port)
+            rate = _udp_port_rate_limit(port, port_procs.get(port, ""))
             if rate > 0:
                 desired[port] = rate
 
@@ -1102,6 +473,25 @@ class XdpBackend(PortBackend):
         for port in set(active) - set(desired):
             if self.udp_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
                 log.info("UDP rate port %d removed (port no longer whitelisted)", port)
+
+    def _sync_udp_agg_rate(self, udp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
+        active = self.udp_agg_rate_map.active()  # type: ignore[union-attr]
+        port_procs = _listening_port_processes(udp_ports, socket.SOCK_DGRAM, cached_conns)
+
+        desired: dict[int, int] = {}
+        for port in udp_ports:
+            limit = _udp_aggregate_byte_limit(port, port_procs.get(port, ""))
+            if limit > 0:
+                desired[port] = limit
+
+        for port, limit in desired.items():
+            if active.get(port) != limit:
+                if self.udp_agg_rate_map.set(port, limit, dry_run):  # type: ignore[union-attr]
+                    log.info("UDP aggregate port %d byte_rate_max=%d/s", port, limit)
+
+        for port in set(active) - set(desired):
+            if self.udp_agg_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
+                log.info("UDP aggregate port %d removed", port)
 
 
 class NftablesBackend(PortBackend):
@@ -1240,6 +630,7 @@ class NftablesBackend(PortBackend):
         trusted_target: set[str],
         conntrack_target: set[bytes],
         dry_run: bool,
+        cached_conns=None,
     ) -> None:
         changed = False
         _ = conntrack_target  # kernel conntrack handles established flows natively
@@ -1295,58 +686,52 @@ class PortState:
     established: set[bytes] = field(default_factory=set)
 
 
-def get_listening_ports() -> PortState:
-    """Read listening TCP/UDP ports and established TCP flows via psutil."""
+def get_listening_ports(cached_conns=None) -> PortState:
+    """Read externally reachable listening TCP/UDP/SCTP ports via psutil."""
     if psutil is None or _net_connections is None:
         sys.exit("psutil not installed. Run: pip3 install psutil")
 
     state = PortState()
-    for conn in _net_connections(kind="inet"):
+    exclude_nets = _discovery_exclude_networks()
+    for conn in (cached_conns if cached_conns is not None else _net_connections(kind="inet")):
         if not (conn.laddr and conn.laddr.port):
             continue
 
         if conn.type == socket.SOCK_STREAM:
             if conn.status == psutil.CONN_LISTEN:
-                state.tcp.add(conn.laddr.port)
-            elif conn.status == psutil.CONN_ESTABLISHED and conn.raddr:
-                try:
-                    if conn.family == socket.AF_INET:
-                        family = 2  # CT_FAMILY_IPV4
-                        remote_ip = socket.inet_aton(conn.raddr.ip) + (b"\x00" * 12)
-                        local_ip = socket.inet_aton(conn.laddr.ip) + (b"\x00" * 12)
-                    elif conn.family == socket.AF_INET6:
-                        family = 10  # CT_FAMILY_IPV6
-                        remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
-                        local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
-                    else:
-                        continue
-                    # struct ct_key { u8 family, u8 pad[3], be16 sport, be16 dport, u32 saddr[4], u32 daddr[4] }
-                    key = struct.pack("!B3xHH16s16s", family, conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-                    state.established.add(key)
-                except Exception:
+                if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
                     continue
+                state.tcp.add(conn.laddr.port)
         elif conn.type == socket.SOCK_DGRAM:
             # UDP has no LISTEN state. Keep only bound sockets without a
             # connected remote peer, which better matches server-style ports.
             if conn.raddr:
+                continue
+            if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
                 continue
             state.udp.add(conn.laddr.port)
         elif conn.type == socket.SOCK_SEQPACKET:
             # Treat SOCK_SEQPACKET listeners as config-visible SCTP-style ports.
             if conn.raddr:
                 continue
+            if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
+                continue
             state.sctp.add(conn.laddr.port)
     return state
 
 
 def sync_once(backend: PortBackend, dry_run: bool) -> None:
-    current = get_listening_ports()
+    try:
+        all_conns = _net_connections(kind="inet") if (_net_connections is not None) else []
+    except Exception:
+        all_conns = []
+    current = get_listening_ports(cached_conns=all_conns)
     tcp_target = current.tcp | set(TCP_PERMANENT)
     udp_target = current.udp | set(UDP_PERMANENT)
     sctp_target = current.sctp | set(SCTP_PERMANENT)
     trusted_target = set(TRUSTED_SRC_IPS)
-    conntrack_target = current.established
-    backend.sync_ports(tcp_target, udp_target, sctp_target, trusted_target, conntrack_target, dry_run)
+    conntrack_target: set[bytes] = set()
+    backend.sync_ports(tcp_target, udp_target, sctp_target, trusted_target, conntrack_target, dry_run, cached_conns=all_conns)
 
 
 _NETLINK_CONNECTOR = 11
@@ -1433,7 +818,7 @@ def open_backend(name: str) -> PortBackend:
     return backend
 
 
-def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TOML_CONFIG_PATH, cli_trusted_ips: dict[str, str] | None = None) -> None:
+def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TOML_CONFIG_PATH, cli_trusted_ips: dict[str, str] | None = None, cli_log_level: str | None = None) -> None:
     backend = None
     nl = None
 
@@ -1489,10 +874,14 @@ def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TO
 
             if reload_requested:
                 reload_requested = False
-                log.info("SIGHUP received — reloading config from %s", config_path)
+                log.warning("SIGHUP received — reloading config from %s", config_path)
                 apply_toml_config(load_toml_config(config_path))
                 if cli_trusted_ips:
                     TRUSTED_SRC_IPS.update(cli_trusted_ips)
+                if cli_log_level is None:
+                    _lvl = getattr(logging, cfg.LOG_LEVEL.upper(), logging.WARNING)
+                    logging.getLogger().setLevel(_lvl)
+                    log.setLevel(_lvl)
                 last_sync_t = 0.0  # force sync on next iteration
 
             now = time.monotonic()
@@ -1528,16 +917,11 @@ def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TO
 def main() -> None:
     def _parse_trusted_ip(ip_str: str) -> str:
         try:
-            net = ipaddress.IPv4Network(ip_str, strict=False)
-            return f"{net.network_address}/{net.prefixlen}"
+            return cfg.normalize_cidr(ip_str)
         except ValueError:
-            pass
-        try:
-            net = ipaddress.IPv6Network(ip_str, strict=False)
-            return f"{net.network_address}/{net.prefixlen}"
-        except ValueError:
-            pass
-        raise argparse.ArgumentTypeError(f"invalid IPv4/IPv6 address or CIDR: {ip_str}")
+            raise argparse.ArgumentTypeError(
+                f"invalid IPv4/IPv6 address or CIDR: {ip_str}"
+            ) from None
 
     p = argparse.ArgumentParser(description="Auto XDP port-whitelist sync daemon")
     p.add_argument(
@@ -1565,8 +949,8 @@ def main() -> None:
     p.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error"],
-        default=DEFAULT_LOG_LEVEL.lower(),
-        help="Set daemon log level (default: %(default)s)",
+        default=None,
+        help="Set daemon log level (default: read from config.toml [daemon] log_level)",
     )
     p.add_argument(
         "--trusted-ip",
@@ -1583,10 +967,13 @@ def main() -> None:
         help=f"TOML config file path (default: {TOML_CONFIG_PATH})",
     )
     args = p.parse_args()
-    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
-    log.setLevel(getattr(logging, args.log_level.upper()))
 
     apply_toml_config(load_toml_config(args.config))
+
+    # CLI --log-level wins; fall back to TOML [daemon] log_level.
+    effective_level = (args.log_level or cfg.LOG_LEVEL).upper()
+    logging.getLogger().setLevel(getattr(logging, effective_level, logging.WARNING))
+    log.setLevel(getattr(logging, effective_level, logging.WARNING))
 
     cli_trusted_ips: dict[str, str] = {}
     try:
@@ -1600,7 +987,7 @@ def main() -> None:
     backend = None
     try:
         if args.watch:
-            watch(args.interval, args.dry_run, args.backend, args.config, cli_trusted_ips)
+            watch(args.interval, args.dry_run, args.backend, args.config, cli_trusted_ips, cli_log_level=args.log_level)
         else:
             backend = open_backend(args.backend)
             sync_once(backend, args.dry_run)
