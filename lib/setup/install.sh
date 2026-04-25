@@ -1,3 +1,8 @@
+#!/bin/bash
+
+# lib/setup/install.sh — runtime file installation and system service setup
+# Sourced by setup_xdp.sh after backend_xdp.sh and backend_nft.sh.
+
 stop_existing_service() {
     case "$INIT_SYSTEM" in
         systemd)

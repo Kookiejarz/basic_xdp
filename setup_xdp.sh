@@ -182,7 +182,7 @@ load_runtime_common_lib() {
 }
 
 load_runtime_common_lib
-source_setup_lib "lib/setup/runtime.sh"
+source_setup_lib "lib/setup/install.sh"
 
 main() {
     parse_args "$@"

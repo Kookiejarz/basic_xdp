@@ -9,6 +9,12 @@ export PYTHONDONTWRITEBYTECODE=1
 
 bash -n ./setup_xdp.sh
 bash -n ./axdp
+bash -n ./runtime/auto_xdp_runtime_common.sh
+bash -n ./runtime/auto_xdp_start.sh
+bash -n ./lib/setup/build.sh
+bash -n ./lib/setup/backend_xdp.sh
+bash -n ./lib/setup/backend_nft.sh
+bash -n ./lib/setup/install.sh
 
 python3 - <<'PY'
 import ast
