@@ -49,7 +49,7 @@ resolve_bpf_build_env || {
 }
 
 make -C handlers clean >/dev/null 2>&1 || true
-make -C handlers --no-print-directory \
+make -C handlers -f Makefile --no-print-directory \
     CLANG="clang" \
     ASM_INC="$ASM_INC" \
     ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}"

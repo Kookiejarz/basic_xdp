@@ -7,6 +7,23 @@
 # Set to false on private/internal networks where RFC1918 source addresses are legitimate.
 bogon_filter = false
 
+[daemon]
+# Log verbosity for the Python sync daemon: debug, info, warning, error.
+log_level = "warning"
+
+# Event debounce window before reconciling after proc connector activity.
+debounce_seconds = 0.4
+
+# Preferred runtime backend: auto, xdp, nftables.
+preferred_backend = "auto"
+
+[discovery]
+# Exclude loopback-only listeners from exposure discovery.
+exclude_loopback = true
+
+# Exclude listeners bound to these addresses/CIDRs from automatic exposure.
+exclude_bind_cidrs = []
+
 [permanent_ports]
 # Ports always kept open regardless of which services are running.
 # SCTP is config-managed only; it is not auto-discovered from listening sockets.
@@ -58,6 +75,14 @@ mongodb         = 2
 vnc             = 2
 telnet          = 2
 
+[rate_limits.syn_agg_by_proc]
+
+[rate_limits.syn_agg_by_service]
+
+[rate_limits.tcp_conn_by_proc]
+
+[rate_limits.tcp_conn_by_service]
+
 
 # UDP rate limits (packets per second per source IP).
 
@@ -72,6 +97,10 @@ domain  = 5000
 ntp     = 500
 isakmp  = 100
 openvpn = 200
+
+[rate_limits.udp_agg_bytes_by_proc]
+
+[rate_limits.udp_agg_bytes_by_service]
 
 # Per-CIDR port ACL rules.
 # These bypass rate limiting and take priority over the port whitelist.
@@ -94,3 +123,7 @@ default_action = "drop"
 # "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
 # enabled = ["sctp", "gre", "esp"]
 enabled = []
+
+[xdp]
+# Remove stale conntrack entries after N consecutive reconcile rounds miss them.
+conntrack_stale_reconciles = 2

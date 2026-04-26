@@ -17,13 +17,17 @@ stop_existing_service() {
     pkill -f "xdp_port_sync.py" 2>/dev/null || true
 }
 
+stop_existing_service_step() {
+    step_begin "Stopping existing service"
+    stop_existing_service
+    step_ok
+}
+
 write_config() {
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<EOF_CFG
 IFACES="${IFACES[*]}"
 IFACE="${IFACES[0]}"
-SYNC_INTERVAL="${SYNC_INTERVAL}"
-LOG_LEVEL="${LOG_LEVEL}"
 SYNC_SCRIPT="${SYNC_SCRIPT}"
 PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
@@ -40,25 +44,33 @@ EOF_CFG
 
 install_python_support_package() {
     local pkg_root="${AUTO_XDP_PACKAGE_DIR}"
-    local bpf_root="${pkg_root}/bpf"
+    local files rel target
 
-    mkdir -p "$bpf_root"
-    mkdir -p "${pkg_root}/backends"
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        local api_url
+        api_url="$(sed \
+            -e 's|https://raw\.githubusercontent\.com/|https://api.github.com/repos/|' \
+            -e 's|/\([^/]*\)$|/git/trees/\1?recursive=1|' \
+            <<< "$RAW_URL")"
+        mapfile -t files < <(
+            curl -fsSL "$api_url" \
+            | python3 -c "
+import json, sys
+for e in json.load(sys.stdin).get('tree', []):
+    p = e['path']
+    if p.startswith('auto_xdp/') and p.endswith('.py'):
+        print(p)
+" | sort
+        )
+    else
+        mapfile -t files < <(find auto_xdp -name "*.py" -type f | sort)
+    fi
 
-    fetch_local_or_remote "auto_xdp/__init__.py" "auto_xdp/__init__.py" "${pkg_root}/__init__.py" || return 1
-    fetch_local_or_remote "auto_xdp/config.py" "auto_xdp/config.py" "${pkg_root}/config.py" || return 1
-    fetch_local_or_remote "auto_xdp/bpf/__init__.py" "auto_xdp/bpf/__init__.py" "${bpf_root}/__init__.py" || return 1
-    fetch_local_or_remote "auto_xdp/bpf/maps.py" "auto_xdp/bpf/maps.py" "${bpf_root}/maps.py" || return 1
-    fetch_local_or_remote "auto_xdp/bpf/syscall.py" "auto_xdp/bpf/syscall.py" "${bpf_root}/syscall.py" || return 1
-    fetch_local_or_remote "auto_xdp/policy.py" "auto_xdp/policy.py" "${pkg_root}/policy.py" || return 1
-    fetch_local_or_remote "auto_xdp/discovery.py" "auto_xdp/discovery.py" "${pkg_root}/discovery.py" || return 1
-    fetch_local_or_remote "auto_xdp/proc_events.py" "auto_xdp/proc_events.py" "${pkg_root}/proc_events.py" || return 1
-    fetch_local_or_remote "auto_xdp/backends/__init__.py" "auto_xdp/backends/__init__.py" "${pkg_root}/backends/__init__.py" || return 1
-    fetch_local_or_remote "auto_xdp/backends/base.py" "auto_xdp/backends/base.py" "${pkg_root}/backends/base.py" || return 1
-    fetch_local_or_remote "auto_xdp/backends/xdp.py" "auto_xdp/backends/xdp.py" "${pkg_root}/backends/xdp.py" || return 1
-    fetch_local_or_remote "auto_xdp/backends/nftables.py" "auto_xdp/backends/nftables.py" "${pkg_root}/backends/nftables.py" || return 1
-    fetch_local_or_remote "auto_xdp/syncer.py" "auto_xdp/syncer.py" "${pkg_root}/syncer.py" || return 1
-    fetch_local_or_remote "auto_xdp/cli.py" "auto_xdp/cli.py" "${pkg_root}/cli.py" || return 1
+    for rel in "${files[@]}"; do
+        target="${pkg_root}/${rel#auto_xdp/}"
+        mkdir -p "$(dirname "$target")"
+        fetch_local_or_remote "$rel" "$rel" "$target" || return 1
+    done
 }
 
 install_runner_script() {
@@ -108,10 +120,7 @@ install_toml_config() {
     mkdir -p "$CONFIG_DIR"
 
     if [[ -f "$toml_target" ]]; then
-        if confirm_yes_no "config.toml already exists at ${toml_target}. Replace with repo default? [y/N] "; then
-            info "Replacing config.toml with repo default."
-        else
-            info "Keeping existing config.toml."
+        if ! confirm_yes_no "config.toml already exists at ${toml_target}. Replace with repo default? [y/N] "; then
             return 0
         fi
     fi
@@ -122,22 +131,43 @@ install_toml_config() {
 }
 
 install_runtime_files() {
-    info "Installing runtime files..."
     mkdir -p "$INSTALL_DIR"
-    install_sync_script
-    install_python_support_package
-    install_relay_script
-    install_bpf_helper
-    install_axdp_command
-    install_runtime_common_script
-    write_config
-    install_toml_config
-    install_runner_script
-    ok "Runtime installed under $INSTALL_DIR and $CONFIG_DIR"
+
+    _install_runtime_common_assets() {
+        install_runtime_common_script
+        write_config
+    }
+
+    substep_run "Installing sync daemon" install_sync_script
+    substep_run "Installing Python support package" install_python_support_package
+    substep_run "Installing relay helper" install_relay_script
+    substep_run "Installing BPF helper script" install_bpf_helper
+    substep_run "Installing axdp command" install_axdp_command
+    substep_run "Installing shared runtime library" _install_runtime_common_assets
+    substep_run "Installing default TOML config" install_toml_config
+    substep_run "Installing launcher script" install_runner_script
+
+    unset -f _install_runtime_common_assets
+}
+
+install_runtime_files_step() {
+    step_begin "Installing runtime files"
+    install_runtime_files
+    IN_STEP=0; _STEP_NEWLINED=0
+}
+
+load_configured_slot_handlers_step() {
+    [[ "${ACTIVE_BACKEND:-nftables}" == "xdp" ]] || return 0
+
+    step_begin "Loading configured slot handlers"
+    if load_slot_handlers; then
+        step_ok
+    else
+        step_warn "slot handlers unavailable"
+    fi
 }
 
 install_systemd_service() {
-    info "Creating systemd service: $SERVICE_NAME..."
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF_UNIT
 [Unit]
 Description=Auto XDP Loader + Port Whitelist Auto-Sync
@@ -158,11 +188,9 @@ EOF_UNIT
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
     systemctl restart "$SERVICE_NAME"
-    ok "Service started and enabled: $SERVICE_NAME"
 }
 
 install_openrc_service() {
-    info "Creating OpenRC service: $SERVICE_NAME..."
     cat > "/etc/init.d/${SERVICE_NAME}" <<EOF_OPENRC
 #!/sbin/openrc-run
 description="Auto XDP loader + port whitelist auto-sync"
@@ -178,10 +206,32 @@ EOF_OPENRC
     chmod +x "/etc/init.d/${SERVICE_NAME}"
     rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
     rc-service "$SERVICE_NAME" restart
-    ok "OpenRC service started and enabled: $SERVICE_NAME"
 }
 
 run_initial_sync() {
     info "Running initial sync..."
     "$RUNNER_SCRIPT" --sync-once
+}
+
+run_initial_sync_step() {
+    step_begin "Pre-seeding IPv4/IPv6 established TCP sessions"
+    run_initial_sync >/dev/null 2>&1 || true
+    step_ok
+}
+
+install_runtime_service_step() {
+    step_begin "Installing and enabling system service"
+    case "$INIT_SYSTEM" in
+        systemd)
+            install_systemd_service
+            step_ok "systemd: $SERVICE_NAME"
+            ;;
+        openrc)
+            install_openrc_service
+            step_ok "openrc: $SERVICE_NAME"
+            ;;
+        *)
+            step_warn "no init system detected — start manually: $RUNNER_SCRIPT"
+            ;;
+    esac
 }

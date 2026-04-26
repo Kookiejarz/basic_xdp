@@ -147,3 +147,28 @@ ensure_psutil() {
             ;;
     esac
 }
+
+check_required_tools_step() {
+    local missing=()
+    local cmd
+
+    step_begin "Checking required tools"
+    for cmd in clang bpftool python3 curl ip tc nft; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        step_warn "Missing: ${missing[*]} — installing via $PKG_MANAGER"
+        step_begin "Installing missing packages via $PKG_MANAGER"
+        install_packages || die "Package installation failed."
+        step_ok
+        step_begin "Verifying installed tools"
+    fi
+
+    command -v python3 &>/dev/null || die "python3 not found after installation."
+    command -v curl &>/dev/null || die "curl not found after installation."
+    command -v ip &>/dev/null || die "ip command not found after installation."
+    ensure_psutil
+    PYTHON3_BIN=$(command -v python3)
+    step_ok
+}

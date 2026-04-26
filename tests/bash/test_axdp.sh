@@ -40,9 +40,15 @@ test_parse_ports_args_sets_expected_flags() (
     PORTS_WATCH=0
     PORTS_INTERVAL=2
 
-    parse_ports_args --watch --interval 7 || return 1
+    parse_ports_args watch --interval 7 || return 1
     assert_eq "$PORTS_WATCH" "1" || return 1
-    assert_eq "$PORTS_INTERVAL" "7"
+    assert_eq "$PORTS_INTERVAL" "7" || return 1
+
+    PORTS_WATCH=0
+    PORTS_INTERVAL=2
+
+    parse_ports_args --watch || return 1
+    assert_eq "$PORTS_WATCH" "1"
 )
 
 test_csv_helpers_sort_and_diff_ports() (
@@ -70,7 +76,6 @@ test_valid_log_level_and_config_updates() (
     CONFIG_FILE="$tmpdir/auto_xdp.env"
     cat >"$CONFIG_FILE" <<'EOF_CFG'
 LOG_LEVEL="info"
-SYNC_INTERVAL="30"
 EOF_CFG
 
     set_config_var "LOG_LEVEL" "debug" || return 1
@@ -83,20 +88,23 @@ test_run_log_level_reads_and_updates_config() (
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    CONFIG_FILE="$tmpdir/auto_xdp.env"
-    cat >"$CONFIG_FILE" <<'EOF_CFG'
-LOG_LEVEL="info"
+    TOML_CONFIG="$tmpdir/config.toml"
+    cat >"$TOML_CONFIG" <<'EOF_CFG'
+[daemon]
+log_level = "info"
 EOF_CFG
 
     PATH="$tmpdir/empty-bin:$BASE_PATH"
     mkdir -p "$tmpdir/empty-bin"
+    reload_daemon() { :; }
 
     assert_eq "$(run_log_level)" "info" || return 1
 
     local output
     output=$(run_log_level DEBUG 2>&1) || return 1
-    assert_contains "$output" "LOG_LEVEL=debug" || return 1
-    assert_file_contains "$CONFIG_FILE" 'LOG_LEVEL="debug"'
+    assert_contains "$output" "daemon.log_level=debug" || return 1
+    assert_file_contains "$TOML_CONFIG" "[daemon]"
+    assert_file_contains "$TOML_CONFIG" 'log_level = "debug"'
 )
 
 test_config_updates_preserve_unrelated_sections() (

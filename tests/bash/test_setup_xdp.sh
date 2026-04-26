@@ -172,7 +172,7 @@ test_dry_run_report_emits_ci_fields() (
     assert_contains "$output" "mode=dry-run" || return 1
     assert_contains "$output" "package_manager=apk" || return 1
     assert_contains "$output" "init_system=openrc" || return 1
-    assert_contains "$output" "interface=eth9" || return 1
+    assert_contains "$output" "interfaces=eth9" || return 1
     assert_contains "$output" "planned_packages=pkg-a pkg-b" || return 1
     assert_contains "$output" "planned_actions=check-dependencies,compile-xdp,deploy-backend,install-runtime,initial-sync,install-service"
 )
@@ -245,6 +245,50 @@ test_warn_from_log_file_prefixes_and_truncates_output() (
     assert_contains "$output" "handler build: (additional output truncated)"
 )
 
+test_info_prints_within_active_step() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local output
+    output=$(
+        step_begin "Testing info output"
+        info "Preparing runtime files"
+        step_ok
+    )
+
+    assert_contains "$output" "[INFO]" || return 1
+    assert_contains "$output" "Preparing runtime files"
+)
+
+test_substep_run_prints_success_and_failure_markers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local success_output failure_output status
+
+    success_output=$(
+        step_begin "Testing substep success"
+        substep_run "Installing thing" true
+        step_ok
+    )
+    assert_contains "$success_output" "Installing thing" || return 1
+    assert_contains "$success_output" "✓" || return 1
+
+    local failure_log
+    failure_log=$(mktemp)
+    set +e
+    (
+        step_begin "Testing substep failure"
+        substep_run "Installing broken thing" false
+    ) >"$failure_log" 2>&1
+    status=$?
+    set -e
+    failure_output=$(<"$failure_log")
+    assert_eq "$status" "1" || return 1
+    assert_contains "$failure_output" "Installing broken thing" || return 1
+    assert_contains "$failure_output" "✗"
+)
+
 test_xdp_maps_ready_requires_all_expected_pins() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -269,7 +313,13 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     touch \
         "$tmpdir/trusted_ipv4" \
         "$tmpdir/trusted_ipv6" \
+        "$tmpdir/syn_rate_ports" \
+        "$tmpdir/udp_rate_ports" \
+        "$tmpdir/syn_agg_rate_ports" \
+        "$tmpdir/tcp_conn_limit_ports" \
+        "$tmpdir/udp_agg_rate_ports" \
         "$tmpdir/udp_global_rl" \
+        "$tmpdir/bogon_cfg" \
         "$tmpdir/proto_handlers" \
         "$tmpdir/slot_ctx_map" \
         "$tmpdir/slot_def_action"
@@ -287,6 +337,7 @@ test_load_tc_egress_program_reuses_sctp_conntrack_map() (
     BPF_PIN_DIR="$tmpdir/bpf"
     TC_OBJ_INSTALLED="$tmpdir/tc_flow_track.o"
     IFACE="eth9"
+    IFACES=("eth9")
     mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
     touch "$TC_OBJ_INSTALLED" \
         "$BPF_PIN_DIR/tcp_conntrack" \
@@ -311,6 +362,158 @@ EOF_TCSH
     assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
 )
 
+test_resolve_target_interfaces_step_uses_default_route_interface() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    ALL_IFACES=0
+    IFACE=""
+    IFACES=()
+
+    ip() {
+        case "$*" in
+            "route show default")
+                echo "default via 192.0.2.1 dev eth9"
+                ;;
+            "link show eth9")
+                return 0
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    }
+
+    resolve_target_interfaces_step >/dev/null || return 1
+    assert_eq "$IFACE" "eth9" || return 1
+    assert_eq "${IFACES[*]}" "eth9"
+)
+
+test_check_required_tools_step_only_requires_runtime_commands() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/bin"
+
+    local cmd
+    for cmd in python3 curl ip tc nft; do
+        cat >"$tmpdir/bin/$cmd" <<'EOF_CMD'
+#!/bin/sh
+exit 0
+EOF_CMD
+        chmod +x "$tmpdir/bin/$cmd"
+    done
+
+    PATH="$tmpdir/bin"
+    PKG_MANAGER="apk"
+    PYTHON3_BIN=""
+
+    install_packages() { :; }
+    ensure_psutil() { :; }
+
+    check_required_tools_step >/dev/null || return 1
+    assert_eq "$PYTHON3_BIN" "$tmpdir/bin/python3"
+)
+
+test_deploy_backend_step_falls_back_to_nftables() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    IFACES=("eth9")
+    ACTIVE_BACKEND="xdp"
+    ACTIVE_XDP_MODE="native"
+
+    deploy_xdp_backend() { return 1; }
+    ensure_nftables_available() { return 0; }
+
+    deploy_backend_step >/dev/null || return 1
+    assert_eq "$ACTIVE_BACKEND" "nftables" || return 1
+    assert_eq "$ACTIVE_XDP_MODE" "none"
+)
+
+test_install_runtime_service_step_warns_without_init_system() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    INIT_SYSTEM="none"
+    RUNNER_SCRIPT="/tmp/auto_xdp_start.sh"
+
+    local output
+    output=$(install_runtime_service_step)
+    assert_contains "$output" "start manually: $RUNNER_SCRIPT"
+)
+
+test_load_configured_slot_handlers_step_only_runs_for_xdp() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local called=0
+    load_slot_handlers() { called=$((called + 1)); }
+
+    ACTIVE_BACKEND="nftables"
+    load_configured_slot_handlers_step >/dev/null || return 1
+    assert_eq "$called" "0" || return 1
+
+    ACTIVE_BACKEND="xdp"
+    load_configured_slot_handlers_step >/dev/null || return 1
+    assert_eq "$called" "1"
+)
+
+test_cleanup_build_artifacts_step_preserves_local_sources() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    XDP_OBJ="$tmpdir/xdp_firewall.o"
+    TC_OBJ="$tmpdir/tc_flow_track.o"
+    XDP_SRC="$tmpdir/xdp_firewall.c"
+    TC_SRC="$tmpdir/tc_flow_track.c"
+    BPF_HELPER_SRC="$tmpdir/auto_xdp_bpf_helpers.py"
+    BPF_HELPER_BOOTSTRAP="$tmpdir/bootstrap-helper.py"
+    PREFER_REMOTE_SOURCES=0
+
+    : >"$XDP_OBJ"
+    : >"$TC_OBJ"
+    : >"$XDP_SRC"
+    : >"$TC_SRC"
+    : >"$BPF_HELPER_SRC"
+    : >"$BPF_HELPER_BOOTSTRAP"
+
+    cleanup_build_artifacts_step >/dev/null || return 1
+
+    [[ ! -f "$XDP_OBJ" && ! -f "$TC_OBJ" && ! -f "$BPF_HELPER_BOOTSTRAP" ]] || {
+        printf 'expected objects and bootstrap helper to be removed\n'
+        return 1
+    }
+    [[ -f "$XDP_SRC" && -f "$TC_SRC" && -f "$BPF_HELPER_SRC" ]] || {
+        printf 'expected local source files to be preserved\n'
+        return 1
+    }
+)
+
+test_install_python_support_package_includes_state_module() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir fetched
+    tmpdir=$(mktemp -d)
+    AUTO_XDP_PACKAGE_DIR="$tmpdir/auto_xdp"
+    fetched="$tmpdir/fetched.log"
+
+    fetch_local_or_remote() {
+        printf '%s -> %s\n' "$1" "$3" >>"$fetched"
+        mkdir -p "$(dirname "$3")"
+        : >"$3"
+    }
+
+    install_python_support_package || return 1
+    assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
+)
+
 run_test "setup_xdp detects distro families" test_detect_os_release_maps_supported_families
 run_test "setup_xdp prefers distro package-manager order" test_detect_pkg_manager_prefers_family_order
 run_test "setup_xdp reports missing package managers" test_detect_pkg_manager_fails_when_no_manager_exists
@@ -321,7 +524,16 @@ run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_ye
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
 run_test "setup_xdp detects required BPF headers across include roots" test_bpf_header_exists_checks_multiple_include_roots
 run_test "setup_xdp surfaces truncated handler build logs" test_warn_from_log_file_prefixes_and_truncates_output
+run_test "setup_xdp prints info lines within active step output" test_info_prints_within_active_step
+run_test "setup_xdp prints substep success and failure markers" test_substep_run_prints_success_and_failure_markers
 run_test "setup_xdp validates pinned map set completeness" test_xdp_maps_ready_requires_all_expected_pins
 run_test "setup_xdp reuses SCTP conntrack map for tc egress" test_load_tc_egress_program_reuses_sctp_conntrack_map
+run_test "setup_xdp resolves default route interface for step helper" test_resolve_target_interfaces_step_uses_default_route_interface
+run_test "setup_xdp keeps clang and bpftool optional for runtime tool checks" test_check_required_tools_step_only_requires_runtime_commands
+run_test "setup_xdp backend step falls back to nftables" test_deploy_backend_step_falls_back_to_nftables
+run_test "setup_xdp service step warns when no init system exists" test_install_runtime_service_step_warns_without_init_system
+run_test "setup_xdp loads configured slot handlers only for xdp backend" test_load_configured_slot_handlers_step_only_runs_for_xdp
+run_test "setup_xdp cleanup step preserves local sources" test_cleanup_build_artifacts_step_preserves_local_sources
+run_test "setup_xdp installs auto_xdp state module into runtime package" test_install_python_support_package_includes_state_module
 
 finish_tests

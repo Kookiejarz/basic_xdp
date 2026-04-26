@@ -11,16 +11,29 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 IN_STEP=0
 _STEP_NEWLINED=0
+_PENDING_NL=0
 # Prefix used to indent sub-lines inside a step (aligns with label text).
 _STEP_INDENT="             "
 
-info()  { if [[ $IN_STEP -eq 0 ]]; then echo -e "${CYAN}[INFO]${NC}  $*"; fi; }
+info()  {
+    if [[ $IN_STEP -eq 1 ]]; then
+        if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
+        if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; fi
+        printf "${_STEP_INDENT}${CYAN}↳ [INFO]${NC}  %s" "$*"
+        _PENDING_NL=1
+    else
+        if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
+        echo -e "${CYAN}[INFO]${NC}  $*"
+    fi
+}
 ok()    { if [[ $IN_STEP -eq 0 ]]; then echo -e "${GREEN}[ OK ]${NC}  $*"; fi; }
 warn()  {
     if [[ $IN_STEP -eq 1 ]]; then
         if [[ $_STEP_NEWLINED -eq 0 ]]; then printf "\n"; _STEP_NEWLINED=1; fi
+        if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
         printf "${_STEP_INDENT}${YELLOW}↳ [WARN]${NC}  %s\n" "$*"
     else
+        if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; _PENDING_NL=0; fi
         echo -e "${YELLOW}[WARN]${NC}  $*"
     fi
 }
@@ -29,48 +42,13 @@ die()   {
         if [[ $_STEP_NEWLINED -eq 0 ]]; then
             printf " ${RED}✗${NC}\n"
         else
+            if [[ $_PENDING_NL -eq 1 ]]; then printf "\n"; fi
             printf "${_STEP_INDENT}${RED}✗${NC}\n"
         fi
-        IN_STEP=0; _STEP_NEWLINED=0
+        IN_STEP=0; _STEP_NEWLINED=0; _PENDING_NL=0
     fi
     echo -e "${RED}[ERR ]${NC}  $*" >&2
     exit 1
-}
-
-_step_tag() {
-    case "${1:-INFO}" in
-        COMPILE) printf "${YELLOW}[COMPILING]${NC}" ;;
-        *)       printf "${CYAN}[INFO]${NC}     " ;;
-    esac
-}
-step_begin() {
-    IN_STEP=1; _STEP_NEWLINED=0
-    _step_tag "${2:-INFO}"
-    printf " %-60s" "$1 …"
-}
-step_ok() {
-    local nl=$_STEP_NEWLINED
-    IN_STEP=0; _STEP_NEWLINED=0
-    if [[ $nl -eq 1 ]]; then
-        printf "${_STEP_INDENT}${GREEN}✓${NC}%s\n" "${1:+  ($1)}"
-    else
-        [[ -n "${1:-}" ]] && printf "${GREEN}($1)${NC} ${GREEN}✓${NC}\n" || printf " ${GREEN}✓${NC}\n"
-    fi
-}
-step_fail() {
-    local nl=$_STEP_NEWLINED
-    IN_STEP=0; _STEP_NEWLINED=0
-    if [[ $nl -eq 0 ]]; then printf " ${RED}✗${NC}\n"; fi
-    printf "${_STEP_INDENT}${RED}[ERROR]${NC}  %s\n" "${1:-Failed}" >&2
-}
-step_warn() {
-    local nl=$_STEP_NEWLINED
-    IN_STEP=0; _STEP_NEWLINED=0
-    if [[ $nl -eq 1 ]]; then
-        printf "${_STEP_INDENT}${YELLOW}⚠${NC}%s\n" "${1:+  ($1)}"
-    else
-        printf " ${YELLOW}⚠${NC}%s\n" "${1:+  ($1)}"
-    fi
 }
 
 IFACE=""
@@ -80,7 +58,6 @@ XDP_SRC="bpf/xdp_firewall.c"
 XDP_OBJ="xdp_firewall.o"
 TC_SRC="tc_flow_track.c"
 TC_OBJ="tc_flow_track.o"
-SYNC_INTERVAL=30
 
 INSTALL_DIR="/usr/local/lib/auto_xdp"
 PYTHON_LIB_DIR="${INSTALL_DIR}/python"
@@ -131,7 +108,6 @@ OPENRC_AVAILABLE=0
 ACTIVE_BACKEND="nftables"
 ACTIVE_XDP_MODE="none"
 PYTHON3_BIN=""
-LOG_LEVEL="info"
 CHECK_UPDATES=0
 FORCE=0
 CHECK_ENV=0
@@ -204,200 +180,21 @@ main() {
         exit 0
     fi
 
-    echo -e "\n${BOLD}${CYAN}  ╔═══════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}  ║      Auto XDP Installer           ║${NC}"
-    echo -e "${BOLD}${CYAN}  ╚═══════════════════════════════════╝${NC}\n"
-
-    # 1. Root check
-    step_begin "Checking root privileges"
-    [[ $EUID -eq 0 ]] || die "Please run this script with sudo."
-    step_ok
-
-    # 2. Interface detection
-    step_begin "Detecting network interfaces"
-    if [[ $ALL_IFACES -eq 1 ]]; then
-        mapfile -t IFACES < <(get_active_interfaces)
-        [[ ${#IFACES[@]} -gt 0 ]] || die "No active non-loopback interfaces found."
-    elif [[ ${#IFACES[@]} -eq 0 ]]; then
-        local _default_iface
-        _default_iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-        [[ -n "$_default_iface" ]] || die "Cannot detect default interface. Specify manually: sudo bash $0 eth0"
-        IFACES=("$_default_iface")
-    fi
-    local _iface
-    for _iface in "${IFACES[@]}"; do
-        ip link show "$_iface" &>/dev/null || die "Interface '$_iface' does not exist."
-    done
-    IFACE="${IFACES[0]}"
-    step_ok "Found: ${IFACES[*]}"
-
-    # 3. Package manager
-    step_begin "Detecting default package manager"
-    detect_pkg_manager || die "No supported package manager found."
-    detect_init_system
-    step_ok "Found: $PKG_MANAGER"
-
-    # 4. Dependencies
-    step_begin "Checking required tools"
-    MISSING=()
-    for cmd in clang bpftool python3 curl ip tc nft; do
-        command -v "$cmd" &>/dev/null || MISSING+=("$cmd")
-    done
-    if [[ ${#MISSING[@]} -gt 0 ]]; then
-        step_warn "Missing: ${MISSING[*]} — installing via $PKG_MANAGER"
-        step_begin "Installing missing packages via $PKG_MANAGER"
-        install_packages || die "Package installation failed."
-        step_ok
-        step_begin "Verifying installed tools"
-    fi
-    command -v python3 &>/dev/null || die "python3 not found after installation."
-    command -v curl    &>/dev/null || die "curl not found after installation."
-    command -v ip      &>/dev/null || die "ip command not found after installation."
-    ensure_psutil
-    PYTHON3_BIN=$(command -v python3)
-    step_ok
-
-    # 5. BPF helper
-    step_begin "Fetching BPF helper script"
-    if ensure_bpf_helper_bootstrap; then
-        step_ok
-    else
-        step_warn "map operations limited"
-    fi
-
-    if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
-        echo -e "  ${YELLOW}[WARN]${NC}  bpftool or clang still missing — XDP backend may be unavailable."
-    fi
-
-    # 6. Stop existing runtime
-    step_begin "Stopping existing service"
-    stop_existing_service
-    step_ok
-
-    # 7. Compile BPF objects
-    step_begin "Compiling XDP and tc BPF objects" COMPILE
-    if compile_xdp_program; then
-        step_ok
-    else
-        step_warn "compile failed — nftables fallback will be used"
-    fi
-
-    # 8. Deploy backend
-    step_begin "Loading backend on ${IFACES[*]}"
-    if deploy_xdp_backend; then
-        cleanup_existing_nftables
-        step_ok "XDP $ACTIVE_XDP_MODE mode"
-    else
-        ACTIVE_BACKEND="nftables"
-        ACTIVE_XDP_MODE="none"
-        if ensure_nftables_available; then
-            step_ok "nftables fallback"
-        else
-            die "Neither XDP nor nftables backend is available."
-        fi
-    fi
-
-    # 9. Install runtime files
-    step_begin "Installing runtime files"
-    install_runtime_files
-    step_ok
-
-    # 10. Initial sync — pre-seeds existing TCP sessions into conntrack map
-    step_begin "Pre-seeding IPv4/IPv6 established TCP sessions"
-    run_initial_sync >/dev/null 2>&1 || true
-    step_ok
-
-    # 11. Install system service
-    step_begin "Installing and enabling system service"
-    case "$INIT_SYSTEM" in
-        systemd)
-            install_systemd_service
-            step_ok "systemd: $SERVICE_NAME"
-            ;;
-        openrc)
-            install_openrc_service
-            step_ok "openrc: $SERVICE_NAME"
-            ;;
-        *)
-            step_warn "no init system detected — start manually: $RUNNER_SCRIPT"
-            ;;
-    esac
-
-    # 12. Cleanup build artifacts
-    step_begin "Cleaning up build artifacts"
-    local _cleaned=()
-    for _f in "$XDP_OBJ" "$TC_OBJ"; do
-        if [[ -f "$_f" ]]; then
-            rm -f "$_f" && _cleaned+=("$_f")
-        fi
-    done
-    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
-        for _f in "$XDP_SRC" "$TC_SRC"; do
-            if [[ -f "$_f" ]]; then
-                rm -f "$_f" && _cleaned+=("$_f")
-            fi
-        done
-    fi
-    if [[ -n "$BPF_HELPER_BOOTSTRAP" && "$BPF_HELPER_BOOTSTRAP" != "$BPF_HELPER_SRC" && -f "$BPF_HELPER_BOOTSTRAP" ]]; then
-        rm -f "$BPF_HELPER_BOOTSTRAP" && _cleaned+=("$BPF_HELPER_BOOTSTRAP")
-    fi
-    if [[ ${#_cleaned[@]} -gt 0 ]]; then
-        step_ok "Removed: ${_cleaned[*]}"
-    else
-        step_ok "Nothing to remove"
-    fi
-
-    # Summary
-    echo ""
-    cat <<'EOF'
-      █████████   █████  █████ ███████████    ███████       █████ █████ ██████████   ███████████
-     ███▒▒▒▒▒███ ▒▒███  ▒▒███ ▒█▒▒▒███▒▒▒█  ███▒▒▒▒▒███    ▒▒███ ▒▒███ ▒▒███▒▒▒▒███ ▒▒███▒▒▒▒▒███
-    ▒███    ▒███  ▒███   ▒███ ▒   ▒███  ▒  ███     ▒▒███    ▒▒███ ███   ▒███   ▒▒███ ▒███    ▒███
-    ▒███████████  ▒███   ▒███     ▒███    ▒███      ▒███     ▒▒█████    ▒███    ▒███ ▒██████████
-    ▒███▒▒▒▒▒███  ▒███   ▒███     ▒███    ▒███      ▒███      ███▒███   ▒███    ▒███ ▒███▒▒▒▒▒▒
-    ▒███    ▒███  ▒███   ▒███     ▒███    ▒▒███     ███      ███ ▒▒███  ▒███    ███  ▒███
-    █████   █████ ▒▒████████      █████    ▒▒▒███████▒      █████ █████ ██████████   █████
-    ▒▒▒▒▒   ▒▒▒▒▒   ▒▒▒▒▒▒▒▒      ▒▒▒▒▒       ▒▒▒▒▒▒▒       ▒▒▒▒▒ ▒▒▒▒▒ ▒▒▒▒▒▒▒▒▒▒   ▒▒▒▒▒
-EOF
-    echo -e "${GREEN}════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  Deployment Complete!                  ${NC}"
-    echo -e "${GREEN}════════════════════════════════════════${NC}"
-    echo ""
-    if [[ ${#IFACES[@]} -eq 1 ]]; then
-        echo "  Interface      : ${IFACES[0]}"
-    else
-        echo "  Interfaces     : ${IFACES[*]}"
-    fi
-    echo "  Active backend : $ACTIVE_BACKEND"
-    if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
-        echo "  XDP mode       : $ACTIVE_XDP_MODE"
-        echo "  BPF maps       : $BPF_PIN_DIR/"
-        echo "  TC egress obj  : $TC_OBJ_INSTALLED"
-    else
-        echo "  nftables table : inet auto_xdp"
-    fi
-    echo "  Init system    : $INIT_SYSTEM"
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        echo "  Service        : systemctl status $SERVICE_NAME"
-    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        echo "  Service        : rc-service $SERVICE_NAME status"
-    else
-        echo "  Service        : not installed"
-    fi
-    echo "  Launcher       : $RUNNER_SCRIPT"
-    echo "  Command        : $AXDP_CMD"
-    echo ""
-    echo "  Next Commands"
-    echo "  axdp           : sudo axdp"
-    echo "  axdp watch     : sudo axdp watch"
-    echo "  axdp rates     : sudo axdp stats --rates"
-    echo "  axdp live      : sudo axdp stats --watch --rates --interval 2"
-    echo "  axdp sync      : sudo axdp sync"
-    echo "  axdp ports      : sudo axdp ports"
-    if [[ "$INIT_SYSTEM" == "systemd" || "$INIT_SYSTEM" == "openrc" ]]; then
-        echo "  service status : sudo axdp status"
-        echo "  service restart: sudo axdp restart"
-    fi
+    print_installer_banner
+    check_root_privileges
+    resolve_target_interfaces_step
+    detect_environment_step
+    check_required_tools_step
+    bootstrap_bpf_helper_step
+    stop_existing_service_step
+    compile_bpf_objects_step
+    deploy_backend_step
+    install_runtime_files_step
+    load_configured_slot_handlers_step
+    run_initial_sync_step
+    install_runtime_service_step
+    cleanup_build_artifacts_step
+    print_deployment_summary
 }
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then

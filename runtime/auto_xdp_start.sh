@@ -38,26 +38,60 @@ IFS=' ' read -ra _IFACES <<< "${IFACES:-${IFACE:-}}"
     exit 1
 }
 
-sync_script_supports_log_level() {
-    "$PYTHON3_BIN" "$SYNC_SCRIPT" --help 2>/dev/null | grep -q -- "--log-level"
+resolve_preferred_backend() {
+    local preferred="${PREFERRED_BACKEND:-auto}"
+
+    [[ -f "${TOML_CONFIG:-}" ]] || {
+        printf '%s\n' "$preferred"
+        return 0
+    }
+
+    preferred=$("$PYTHON3_BIN" - "$TOML_CONFIG" "$preferred" <<'PY'
+import os
+import sys
+
+path, default = sys.argv[1], sys.argv[2]
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        print(default)
+        raise SystemExit(0)
+
+if not os.path.exists(path):
+    print(default)
+    raise SystemExit(0)
+
+try:
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    print(default)
+    raise SystemExit(0)
+
+preferred = str(cfg.get("daemon", {}).get("preferred_backend", default)).lower()
+if preferred not in {"auto", "xdp", "nftables"}:
+    preferred = default
+print(preferred)
+PY
+) || preferred="${PREFERRED_BACKEND:-auto}"
+
+    printf '%s\n' "$preferred"
 }
 
 run_sync_script() {
     local mode="$1"
     shift || true
+    local backend
+    backend=$(cat "${RUN_STATE_DIR}/backend")
 
-    if sync_script_supports_log_level; then
-        if [[ "$mode" == "watch" ]]; then
-            exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
-        fi
-        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --log-level "$LOG_LEVEL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
-    fi
-
-    echo "[auto_xdp] warning: installed xdp_port_sync.py does not support --log-level; running without it" >&2
     if [[ "$mode" == "watch" ]]; then
-        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --interval "$SYNC_INTERVAL" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+        exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --backend "$backend" "$@"
     fi
-    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --backend "$(cat "${RUN_STATE_DIR}/backend")" "$@"
+    exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --backend "$backend" "$@"
 }
 
 ensure_xdp_loaded() {
@@ -132,8 +166,10 @@ ensure_xdp_loaded() {
 
 select_backend() {
     mkdir -p "$RUN_STATE_DIR"
+    local preferred_backend
+    preferred_backend=$(resolve_preferred_backend)
 
-    if [[ "${PREFERRED_BACKEND}" != "nftables" ]] && ensure_xdp_loaded; then
+    if [[ "$preferred_backend" != "nftables" ]] && ensure_xdp_loaded; then
         echo "xdp" > "${RUN_STATE_DIR}/backend"
         if command -v nft &>/dev/null && nft list table inet auto_xdp &>/dev/null 2>&1; then
             if nft delete table inet auto_xdp 2>/dev/null; then

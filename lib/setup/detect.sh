@@ -77,3 +77,10 @@ detect_init_system() {
         return
     fi
 }
+
+detect_environment_step() {
+    step_begin "Detecting default package manager"
+    detect_pkg_manager || die "No supported package manager found."
+    detect_init_system
+    step_ok "Found: $PKG_MANAGER"
+}

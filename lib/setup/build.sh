@@ -14,6 +14,19 @@ ensure_bpf_helper_bootstrap() {
     return 0
 }
 
+bootstrap_bpf_helper_step() {
+    step_begin "Fetching BPF helper script"
+    if ensure_bpf_helper_bootstrap; then
+        step_ok
+    else
+        step_warn "map operations limited"
+    fi
+
+    if ! command -v bpftool &>/dev/null || ! command -v clang &>/dev/null; then
+        echo -e "  ${YELLOW}[WARN]${NC}  bpftool or clang still missing — XDP backend may be unavailable."
+    fi
+}
+
 compile_bpf_object() {
     local src_path="$1"
     local obj_path="$2"
@@ -139,6 +152,37 @@ warn_from_log_file() {
     done <"$log_path"
 }
 
+prepare_slot_handler_sources() {
+    local _handler_artifacts=(
+        "handlers/Makefile"
+        "handlers/gre_handler.c"
+        "handlers/esp_handler.c"
+        "handlers/sctp_handler.c"
+        "handlers/xdp_slot_ctx.h"
+    )
+    local _handler_file=""
+    local _missing=()
+
+    mkdir -p handlers
+    for _handler_file in "${_handler_artifacts[@]}"; do
+        if ! fetch_local_or_remote "${_handler_file}" "${_handler_file}" "${_handler_file}"; then
+            _missing+=("${_handler_file}")
+        fi
+    done
+
+    if [[ ${#_missing[@]} -gt 0 ]]; then
+        warn "Slot handlers skipped: failed to prepare sources: ${_missing[*]}"
+        return 1
+    fi
+
+    if [[ ! -f "handlers/Makefile" ]]; then
+        warn "Slot handlers skipped: handlers/Makefile not found"
+        return 1
+    fi
+
+    return 0
+}
+
 compile_xdp_program() {
     if ! command -v clang &>/dev/null || ! command -v bpftool &>/dev/null; then
         warn "clang or bpftool missing; XDP backend will be skipped."
@@ -155,14 +199,15 @@ compile_xdp_program() {
     for _hdr in "${_bpf_headers[@]}"; do
         fetch_local_or_remote "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
     done
-    fetch_local_or_remote "handlers/xdp_slot_ctx.h" "handlers/xdp_slot_ctx.h" "handlers/xdp_slot_ctx.h" || true
+    local _handlers_ready=0
+    if prepare_slot_handler_sources; then
+        _handlers_ready=1
+    fi
 
-    info "Compiling ${XDP_SRC}..."
     if ! resolve_bpf_build_env || [[ -z "$ASM_INC" ]]; then
         warn "ASM headers not found; XDP backend will be skipped."
         return 1
     fi
-    info "Using ASM headers: $ASM_INC"
 
     if ! compile_bpf_object "$XDP_SRC" "$XDP_OBJ"; then
         warn "Failed to compile ${XDP_SRC}; XDP backend will be skipped."
@@ -171,7 +216,6 @@ compile_xdp_program() {
 
     mkdir -p "$INSTALL_DIR"
     cp "$XDP_OBJ" "$XDP_OBJ_INSTALLED"
-    ok "Compiled -> $XDP_OBJ"
 
     if ! fetch_local_or_remote "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
         warn "Unable to fetch ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
@@ -182,9 +226,8 @@ compile_xdp_program() {
         return 0
     fi
     cp "$TC_OBJ" "$TC_OBJ_INSTALLED"
-    ok "Compiled -> $TC_OBJ"
 
-    if [[ -d "handlers" ]] && command -v make &>/dev/null; then
+    if [[ $_handlers_ready -eq 1 && -d "handlers" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
             warn "Slot handlers skipped: missing linux/bpf.h in /usr/include or ${ASM_INC}"
         elif ! bpf_header_exists "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
@@ -192,15 +235,13 @@ compile_xdp_program() {
         else
             local handler_log
             handler_log=$(mktemp)
-            info "Compiling slot handlers..."
-            if make -C handlers --no-print-directory \
+            if make -C handlers -f Makefile --no-print-directory \
                     CLANG="clang" \
                     ASM_INC="$ASM_INC" \
                     ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}" \
                     >"$handler_log" 2>&1; then
                 mkdir -p "${INSTALL_DIR}/handlers"
                 cp handlers/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
-                ok "Slot handlers compiled and installed"
             else
                 warn "Slot handler compilation failed; handlers will be unavailable"
                 warn_from_log_file "$handler_log" "handler build: "
@@ -209,4 +250,43 @@ compile_xdp_program() {
         fi
     fi
     return 0
+}
+
+compile_bpf_objects_step() {
+    step_begin "Compiling XDP and tc BPF objects" COMPILE
+    if compile_xdp_program; then
+        step_ok
+    else
+        step_warn "compile failed — nftables fallback will be used"
+    fi
+}
+
+cleanup_build_artifacts_step() {
+    local _f
+    local _cleaned=()
+
+    step_begin "Cleaning up build artifacts"
+    for _f in "$XDP_OBJ" "$TC_OBJ"; do
+        if [[ -f "$_f" ]]; then
+            rm -f "$_f" && _cleaned+=("$_f")
+        fi
+    done
+
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        for _f in "$XDP_SRC" "$TC_SRC"; do
+            if [[ -f "$_f" ]]; then
+                rm -f "$_f" && _cleaned+=("$_f")
+            fi
+        done
+    fi
+
+    if [[ -n "$BPF_HELPER_BOOTSTRAP" && "$BPF_HELPER_BOOTSTRAP" != "$BPF_HELPER_SRC" && -f "$BPF_HELPER_BOOTSTRAP" ]]; then
+        rm -f "$BPF_HELPER_BOOTSTRAP" && _cleaned+=("$BPF_HELPER_BOOTSTRAP")
+    fi
+
+    if [[ ${#_cleaned[@]} -gt 0 ]]; then
+        step_ok "Removed: ${_cleaned[*]}"
+    else
+        step_ok "Nothing to remove"
+    fi
 }

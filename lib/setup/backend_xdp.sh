@@ -30,7 +30,6 @@ cleanup_existing_xdp() {
         fi
 
         for iface in "${IFACES[@]}"; do
-            info "Detaching XDP from $iface..."
             ip link set dev "$iface" xdp off 2>/dev/null || true
             ip link set dev "$iface" xdp generic off 2>/dev/null || true
         done
@@ -40,7 +39,6 @@ cleanup_existing_xdp() {
                 die "Failed to clear the existing XDP program from $iface. Detach it manually and rerun."
             fi
         done
-        ok "Existing XDP program removed from all interfaces."
     fi
 
     if [[ -d "$BPF_PIN_DIR" ]]; then
@@ -59,7 +57,6 @@ deploy_xdp_backend() {
     ensure_bpffs
     cleanup_existing_xdp
 
-    info "Loading XDP program (shared across ${#IFACES[@]} interface(s))..."
     if ! bpftool prog load "$XDP_OBJ_INSTALLED" "$BPF_PIN_DIR/prog" type xdp \
             pinmaps "$BPF_PIN_DIR"; then
         warn "bpftool prog load failed; falling back from XDP."
@@ -75,17 +72,14 @@ deploy_xdp_backend() {
 
     seed_existing_tcp_conntrack
     load_tc_egress_program || true
-    load_slot_handlers || true
 
     local iface attached=0 _native_err _generic_err
     ACTIVE_XDP_MODE="native"
     for iface in "${IFACES[@]}"; do
         ethtool -K "$iface" lro off 2>/dev/null || true
         if _native_err=$(ip link set dev "$iface" xdp pinned "$BPF_PIN_DIR/prog" 2>&1); then
-            ok "XDP attached in native mode on $iface"
             attached=$((attached + 1))
         elif _generic_err=$(ip link set dev "$iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>&1); then
-            ok "XDP attached in generic mode on $iface"
             ACTIVE_XDP_MODE="generic"
             attached=$((attached + 1))
         else
@@ -107,4 +101,20 @@ deploy_xdp_backend() {
     done
     rm -rf "$BPF_PIN_DIR"
     return 1
+}
+
+deploy_backend_step() {
+    step_begin "Loading backend on ${IFACES[*]}"
+    if deploy_xdp_backend; then
+        cleanup_existing_nftables
+        step_ok "XDP $ACTIVE_XDP_MODE mode"
+    else
+        ACTIVE_BACKEND="nftables"
+        ACTIVE_XDP_MODE="none"
+        if ensure_nftables_available; then
+            step_ok "nftables fallback"
+        else
+            die "Neither XDP nor nftables backend is available."
+        fi
+    fi
 }
