@@ -118,10 +118,12 @@ class BpfArrayMap:
     def active_ports(self) -> set[int]:
         return set(self._cache)
 
+    def get(self, port: int) -> int:
+        return 1 if port in self._cache else 0
+
     def set(self, port: int, val: int, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s port %d -> %d", self.path, port, val)
-            self._cache.add(port) if val else self._cache.discard(port)
             return True
         try:
             self._update(port, val)
@@ -235,7 +237,6 @@ class BpfLpmMap:
             return self.delete(cidr_str, dry_run)
         if dry_run:
             log.info("[DRY] %s cidr %s -> 1", self.path, cidr_str)
-            self._cache.add(cfg.normalize_cidr(cidr_str))
             return True
         try:
             normalized = self._update(cidr_str, 1)
@@ -248,7 +249,6 @@ class BpfLpmMap:
     def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s delete cidr %s", self.path, cidr_str)
-            self._cache.discard(cfg.normalize_cidr(cidr_str))
             return True
         try:
             normalized = self._delete_key(cidr_str)
@@ -384,11 +384,6 @@ class BpfAclMap:
     def set(self, cidr_str: str, ports: list[int], dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s cidr %s ports %s", self.path, cidr_str, ports)
-            if self._family == socket.AF_INET:
-                net = ipaddress.IPv4Network(cidr_str, strict=False)
-            else:
-                net = ipaddress.IPv6Network(cidr_str, strict=False)
-            self._cache[f"{net.network_address}/{net.prefixlen}"] = frozenset(ports)
             return True
         try:
             normalized = self._pack_key(cidr_str)
@@ -403,11 +398,6 @@ class BpfAclMap:
     def delete(self, cidr_str: str, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s delete cidr %s", self.path, cidr_str)
-            if self._family == socket.AF_INET:
-                net = ipaddress.IPv4Network(cidr_str, strict=False)
-            else:
-                net = ipaddress.IPv6Network(cidr_str, strict=False)
-            self._cache.pop(f"{net.network_address}/{net.prefixlen}", None)
             return True
         try:
             normalized = self._pack_key(cidr_str)
@@ -471,14 +461,17 @@ class BpfConntrackMap:
         self._next_key = ctypes.create_string_buffer(40)
         self._val = ctypes.create_string_buffer(8)
         self._attr = ctypes.create_string_buffer(128)
+        self._lookup_attr = ctypes.create_string_buffer(128)
         self._delete_attr = ctypes.create_string_buffer(128)
         self._next_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
         next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
         v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
         struct.pack_into("=I4xQQQ", self._attr, 0, self.fd, k_ptr, v_ptr, 0)
+        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
         struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
         struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
+        self._load_cache()
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -520,9 +513,26 @@ class BpfConntrackMap:
         self._cache.clear()
         self._load_cache()
 
+    def existing_keys(self, keys: set[bytes]) -> set[bytes]:
+        present: set[bytes] = set()
+        for key_bytes in keys:
+            try:
+                ctypes.memmove(self._key, key_bytes, 40)
+                bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
+                self._cache.add(key_bytes)
+                present.add(key_bytes)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    self._cache.discard(key_bytes)
+                    continue
+                log.warning("BPF conntrack lookup failed: %s", exc)
+                if key_bytes in self._cache:
+                    present.add(key_bytes)
+        return present
+
     def delete(self, key_bytes: bytes, dry_run: bool = False) -> bool:
         if dry_run:
-            self._cache.discard(key_bytes)
+            log.info("[DRY] %s delete conntrack entry", self.path)
             return True
         try:
             ctypes.memmove(self._key, key_bytes, 40)
@@ -542,7 +552,7 @@ class BpfConntrackMap:
 
         matches = [
             key_raw
-            for key_raw in self._iter_raw_keys()
+            for key_raw in self._cache
             if struct.unpack_from("!H", key_raw, 6)[0] in ports
         ]
 
@@ -554,7 +564,7 @@ class BpfConntrackMap:
 
     def set(self, key_bytes: bytes, dry_run: bool = False) -> bool:
         if dry_run:
-            self._cache.add(key_bytes)
+            log.info("[DRY] %s seed conntrack entry", self.path)
             return True
         try:
             ctypes.memmove(self._key, key_bytes, 40)
@@ -634,7 +644,6 @@ class BpfSynRatePortsMap:
     def set(self, port: int, rate_max: int, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s port %d rate_max=%d", self.path, port, rate_max)
-            self._cache[port] = rate_max
             return True
         try:
             struct.pack_into("=I", self._key, 0, port)
@@ -649,7 +658,6 @@ class BpfSynRatePortsMap:
     def delete(self, port: int, dry_run: bool = False) -> bool:
         if dry_run:
             log.info("[DRY] %s delete port %d", self.path, port)
-            self._cache.pop(port, None)
             return True
         try:
             struct.pack_into("=I", self._key, 0, port)

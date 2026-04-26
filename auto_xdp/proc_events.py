@@ -34,7 +34,7 @@ def open_proc_connector() -> socket.socket | None:
         log.info("Netlink proc connector active -> event-driven mode.")
         return sock
     except OSError as exc:
-        log.warning("Netlink unavailable (%s); falling back to poll-only mode.", exc)
+        log.warning("Netlink unavailable (%s); live reconciliation paused until proc connector is available.", exc)
         return None
 
 

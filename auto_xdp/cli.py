@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 
 from auto_xdp import config as cfg
 from auto_xdp.config import apply_toml_config, load_toml_config
@@ -20,6 +21,15 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument(
+        "--config",
+        default=cfg.TOML_CONFIG_PATH,
+        metavar="PATH",
+    )
+    bootstrap_args, _ = bootstrap.parse_known_args(sys.argv[1:])
+    apply_toml_config(load_toml_config(bootstrap_args.config))
+
     def _parse_trusted_ip(ip_str: str) -> str:
         try:
             return cfg.normalize_cidr(ip_str)
@@ -32,19 +42,13 @@ def main() -> None:
     p.add_argument(
         "--backend",
         choices=[cfg.BACKEND_AUTO, cfg.BACKEND_XDP, cfg.BACKEND_NFTABLES],
-        default=cfg.BACKEND_AUTO,
-        help="Sync backend to use (default: auto)",
+        default=cfg.PREFERRED_BACKEND,
+        help=f"Sync backend to use (default: {cfg.PREFERRED_BACKEND})",
     )
     p.add_argument(
         "--watch",
         action="store_true",
-        help="Run as a daemon (event-driven + fallback poll)",
-    )
-    p.add_argument(
-        "--interval",
-        type=int,
-        default=30,
-        help="Fallback poll interval in seconds (default: 30)",
+        help="Run as a daemon (event-driven reconciliation)",
     )
     p.add_argument(
         "--dry-run",
@@ -73,8 +77,6 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    apply_toml_config(load_toml_config(args.config))
-
     # CLI --log-level wins; fall back to TOML [daemon] log_level.
     effective_level = (args.log_level or cfg.LOG_LEVEL).upper()
     logging.getLogger().setLevel(getattr(logging, effective_level, logging.WARNING))
@@ -93,7 +95,7 @@ def main() -> None:
     try:
         if args.watch:
             watch(
-                args.interval, args.dry_run, args.backend, args.config,
+                args.dry_run, args.backend, args.config,
                 cli_trusted_ips, cli_log_level=args.log_level,
             )
         else:

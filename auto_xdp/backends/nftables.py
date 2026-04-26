@@ -2,22 +2,38 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 
 from auto_xdp import config as cfg
-from auto_xdp.backends.base import PortBackend
+from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.bpf.maps import (
     render_nft_addrs as _render_nft_addrs,
     render_nft_ports as _render_nft_ports,
     run_nft as _run_nft,
 )
+from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
 log = logging.getLogger(__name__)
 
 
 class NftablesBackend(PortBackend):
     name = cfg.BACKEND_NFTABLES
+
+    @classmethod
+    def probe(cls) -> BackendStatus:
+        nft_path = shutil.which("nft")
+        checks = {"nft": nft_path is not None}
+        if nft_path is None:
+            return BackendStatus(
+                name=cls.name,
+                available=False,
+                reason="nft command not found",
+                details={"nft": "not found"},
+                checks=checks,
+            )
+        return BackendStatus(name=cls.name, available=True, checks=checks)
 
     def __init__(self) -> None:
         if shutil.which("nft") is None:
@@ -27,6 +43,40 @@ class NftablesBackend(PortBackend):
         self._sctp_cache: set[int] = set()
         self._trusted_cache: set[str] = set()
         self._ensure_ruleset()
+        self._refresh_caches()
+
+    def _parse_set_elements(self, body: str) -> list[str]:
+        match = re.search(r"elements\s*=\s*\{(.*?)\}", body, re.DOTALL)
+        if not match:
+            return []
+        raw = match.group(1).replace("\n", " ").strip()
+        if not raw:
+            return []
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def _list_set_elements(self, set_name: str) -> list[str]:
+        result = _run_nft(
+            ["list", "set", cfg.NFT_FAMILY, cfg.NFT_TABLE, set_name],
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        return self._parse_set_elements(result.stdout)
+
+    def _refresh_caches(self) -> None:
+        self._tcp_cache = {int(item) for item in self._list_set_elements(cfg.NFT_TCP_SET)}
+        self._udp_cache = {int(item) for item in self._list_set_elements(cfg.NFT_UDP_SET)}
+        self._sctp_cache = {int(item) for item in self._list_set_elements(cfg.NFT_SCTP_SET)}
+        self._trusted_cache = set(self._list_set_elements(cfg.NFT_TRUSTED_SET4))
+        self._trusted_cache.update(self._list_set_elements(cfg.NFT_TRUSTED_SET6))
+
+    def get_applied_state(self) -> AppliedState:
+        return AppliedState(
+            tcp_ports=set(self._tcp_cache),
+            udp_ports=set(self._udp_cache),
+            sctp_ports=set(self._sctp_cache),
+            trusted_cidrs=set(self._trusted_cache),
+        )
 
     def _ensure_ruleset(self) -> None:
         result = _run_nft(["list", "table", cfg.NFT_FAMILY, cfg.NFT_TABLE], check=False)
@@ -81,58 +131,9 @@ class NftablesBackend(PortBackend):
 """
         _run_nft(["-f", "-"], input_text=script, check=True)
 
-    def _apply_targets(
-        self,
-        tcp_target: set[int],
-        udp_target: set[int],
-        sctp_target: set[int],
-        dry_run: bool,
-    ) -> None:
-        lines = [
-            f"flush set {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TCP_SET}",
-            f"flush set {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_UDP_SET}",
-            f"flush set {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_SCTP_SET}",
-        ]
-        if tcp_target:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TCP_SET} {_render_nft_ports(tcp_target)}"
-            )
-        if udp_target:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_UDP_SET} {_render_nft_ports(udp_target)}"
-            )
-        if sctp_target:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_SCTP_SET} {_render_nft_ports(sctp_target)}"
-            )
-        script = "\n".join(lines) + "\n"
-
-        if dry_run:
-            for line in lines:
-                log.info("[DRY] nft %s", line)
+    def _apply_lines(self, lines: list[str], dry_run: bool, error_prefix: str) -> None:
+        if not lines:
             return
-
-        try:
-            _run_nft(["-f", "-"], input_text=script, check=True)
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.strip() if exc.stderr else str(exc)
-            raise RuntimeError(f"nftables update failed: {stderr}") from exc
-
-    def _apply_trusted(self, trusted_target: set[str], dry_run: bool) -> None:
-        v4 = {a for a in trusted_target if ":" not in a}
-        v6 = {a for a in trusted_target if ":" in a}
-        lines = [
-            f"flush set {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET4}",
-            f"flush set {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET6}",
-        ]
-        if v4:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET4} {_render_nft_addrs(v4)}"
-            )
-        if v6:
-            lines.append(
-                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET6} {_render_nft_addrs(v6)}"
-            )
         script = "\n".join(lines) + "\n"
         if dry_run:
             for line in lines:
@@ -142,59 +143,108 @@ class NftablesBackend(PortBackend):
             _run_nft(["-f", "-"], input_text=script, check=True)
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.strip() if exc.stderr else str(exc)
-            raise RuntimeError(f"nftables trusted-ip update failed: {stderr}") from exc
+            raise RuntimeError(f"{error_prefix}: {stderr}") from exc
 
-    def sync_ports(
+    def _port_diff_lines(self, set_name: str, to_add: set[int], to_remove: set[int]) -> list[str]:
+        lines: list[str] = []
+        if to_remove:
+            lines.append(
+                f"delete element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {set_name} {_render_nft_ports(to_remove)}"
+            )
+        if to_add:
+            lines.append(
+                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {set_name} {_render_nft_ports(to_add)}"
+            )
+        return lines
+
+    def _trusted_diff_lines(self, to_add: set[str], to_remove: set[str]) -> list[str]:
+        lines: list[str] = []
+        remove_v4 = {a for a in to_remove if ":" not in a}
+        remove_v6 = {a for a in to_remove if ":" in a}
+        add_v4 = {a for a in to_add if ":" not in a}
+        add_v6 = {a for a in to_add if ":" in a}
+        if remove_v4:
+            lines.append(
+                f"delete element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET4} {_render_nft_addrs(remove_v4)}"
+            )
+        if remove_v6:
+            lines.append(
+                f"delete element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET6} {_render_nft_addrs(remove_v6)}"
+            )
+        if add_v4:
+            lines.append(
+                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET4} {_render_nft_addrs(add_v4)}"
+            )
+        if add_v6:
+            lines.append(
+                f"add element {cfg.NFT_FAMILY} {cfg.NFT_TABLE} {cfg.NFT_TRUSTED_SET6} {_render_nft_addrs(add_v6)}"
+            )
+        return lines
+
+    def apply_reconcile_plan(
         self,
-        tcp_target: set[int],
-        udp_target: set[int],
-        sctp_target: set[int],
-        trusted_target: set[str],
-        conntrack_target: set[bytes],
+        plan: ReconcilePlan,
         dry_run: bool,
-        cached_conns=None,
+        desired_state: DesiredState,
+        observed_state: ObservedState | None = None,
     ) -> None:
         changed = False
-        _ = conntrack_target  # kernel conntrack handles established flows natively
+        _ = observed_state  # kernel conntrack handles established flows natively
 
-        for ip_str in sorted(trusted_target - self._trusted_cache):
+        for ip_str in sorted(plan.trusted_cidrs_to_add):
             tag = f" [{cfg.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in cfg.TRUSTED_SRC_IPS else ""
             log.info("TRUST +%s%s", ip_str, tag)
             changed = True
-        for ip_str in sorted(self._trusted_cache - trusted_target):
+        for ip_str in sorted(plan.trusted_cidrs_to_remove):
             log.info("TRUST -%s  (removed)", ip_str)
             changed = True
 
-        for port in sorted(tcp_target - self._tcp_cache):
+        for port in sorted(plan.tcp_ports_to_add):
             tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
             log.info("TCP +%d%s", port, tag)
             changed = True
-        for port in sorted(self._tcp_cache - tcp_target - set(cfg.TCP_PERMANENT)):
+        for port in sorted(plan.tcp_ports_to_remove):
             log.info("TCP -%d  (stopped)", port)
             changed = True
 
-        for port in sorted(udp_target - self._udp_cache):
+        for port in sorted(plan.udp_ports_to_add):
             tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
             log.info("UDP +%d%s", port, tag)
             changed = True
-        for port in sorted(self._udp_cache - udp_target - set(cfg.UDP_PERMANENT)):
+        for port in sorted(plan.udp_ports_to_remove):
             log.info("UDP -%d  (stopped)", port)
             changed = True
 
-        for port in sorted(sctp_target - self._sctp_cache):
+        for port in sorted(plan.sctp_ports_to_add):
             tag = f" [{cfg.SCTP_PERMANENT[port]}]" if port in cfg.SCTP_PERMANENT else ""
             log.info("SCTP +%d%s", port, tag)
             changed = True
-        for port in sorted(self._sctp_cache - sctp_target - set(cfg.SCTP_PERMANENT)):
+        for port in sorted(plan.sctp_ports_to_remove):
             log.info("SCTP -%d  (stopped)", port)
             changed = True
 
-        self._apply_targets(tcp_target, udp_target, sctp_target, dry_run)
-        self._apply_trusted(trusted_target, dry_run)
-        self._tcp_cache = set(tcp_target)
-        self._udp_cache = set(udp_target)
-        self._sctp_cache = set(sctp_target)
-        self._trusted_cache = set(trusted_target)
+        self._apply_lines(
+            self._port_diff_lines(cfg.NFT_TCP_SET, plan.tcp_ports_to_add, plan.tcp_ports_to_remove)
+            + self._port_diff_lines(cfg.NFT_UDP_SET, plan.udp_ports_to_add, plan.udp_ports_to_remove)
+            + self._port_diff_lines(cfg.NFT_SCTP_SET, plan.sctp_ports_to_add, plan.sctp_ports_to_remove),
+            dry_run,
+            "nftables update failed",
+        )
+        self._apply_lines(
+            self._trusted_diff_lines(plan.trusted_cidrs_to_add, plan.trusted_cidrs_to_remove),
+            dry_run,
+            "nftables trusted-ip update failed",
+        )
+        if dry_run:
+            return
+        self._tcp_cache.update(plan.tcp_ports_to_add)
+        self._tcp_cache.difference_update(plan.tcp_ports_to_remove)
+        self._udp_cache.update(plan.udp_ports_to_add)
+        self._udp_cache.difference_update(plan.udp_ports_to_remove)
+        self._sctp_cache.update(plan.sctp_ports_to_add)
+        self._sctp_cache.difference_update(plan.sctp_ports_to_remove)
+        self._trusted_cache.update(plan.trusted_cidrs_to_add)
+        self._trusted_cache.difference_update(plan.trusted_cidrs_to_remove)
 
         if not changed:
             log.debug("Whitelist up-to-date.")

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import logging
-import socket
+import os
+import shutil
 
 from auto_xdp import config as cfg
-from auto_xdp.backends.base import PortBackend
+from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
     BpfArrayMap,
@@ -13,14 +14,8 @@ from auto_xdp.bpf.maps import (
     BpfSynRatePortsMap,
     BpfTrustedMaps,
 )
-from auto_xdp.discovery import _listening_port_processes
-from auto_xdp.policy import (
-    _port_rate_limit,
-    _syn_aggregate_rate_limit,
-    _tcp_conn_limit,
-    _udp_port_rate_limit,
-    _udp_aggregate_byte_limit,
-)
+from auto_xdp.services import service_name
+from auto_xdp.state import AppliedState, DesiredState, ObservedState, ReconcilePlan
 
 log = logging.getLogger(__name__)
 
@@ -28,12 +23,68 @@ log = logging.getLogger(__name__)
 class XdpBackend(PortBackend):
     name = cfg.BACKEND_XDP
 
+    @classmethod
+    def probe(cls) -> BackendStatus:
+        checks: dict[str, bool] = {}
+        details: dict[str, str] = {}
+
+        bpftool_path = shutil.which("bpftool")
+        checks["bpftool"] = bpftool_path is not None
+        if bpftool_path is None:
+            details["bpftool"] = "not found"
+            return BackendStatus(
+                name=cls.name,
+                available=False,
+                reason="bpftool not found",
+                details=details,
+                checks=checks,
+            )
+
+        missing_maps = [path for path in cfg.REQUIRED_XDP_MAP_PATHS if not os.path.exists(path)]
+        checks["required_maps"] = not missing_maps
+        if missing_maps:
+            details["missing_maps"] = ", ".join(missing_maps)
+            return BackendStatus(
+                name=cls.name,
+                available=False,
+                reason="required XDP maps missing",
+                details=details,
+                checks=checks,
+            )
+
+        if cfg.XDP_OBJ_PATH:
+            checks["xdp_obj"] = os.path.exists(cfg.XDP_OBJ_PATH)
+            if not checks["xdp_obj"]:
+                details["xdp_obj_path"] = cfg.XDP_OBJ_PATH
+                return BackendStatus(
+                    name=cls.name,
+                    available=False,
+                    reason="configured XDP object file missing",
+                    details=details,
+                    checks=checks,
+                )
+
+        if cfg.TC_OBJ_PATH:
+            checks["tc_obj"] = os.path.exists(cfg.TC_OBJ_PATH)
+            if not checks["tc_obj"]:
+                details["tc_obj_path"] = cfg.TC_OBJ_PATH
+                return BackendStatus(
+                    name=cls.name,
+                    available=False,
+                    reason="configured tc object file missing",
+                    details=details,
+                    checks=checks,
+                )
+
+        return BackendStatus(name=cls.name, available=True, checks=checks)
+
     def __init__(self) -> None:
         self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH)
         self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
         self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
         self.conntrack_map = BpfConntrackMap(cfg.TCP_CONNTRACK_MAP_PATH)
         self.udp_conntrack_map = BpfConntrackMap(cfg.UDP_CONNTRACK_MAP_PATH)
+        self._conntrack_stale_rounds: dict[bytes, int] = {}
         self.syn_rate_map: BpfSynRatePortsMap | None = None
         self.syn_agg_rate_map: BpfSynRatePortsMap | None = None
         self.tcp_conn_limit_map: BpfSynRatePortsMap | None = None
@@ -110,91 +161,146 @@ class XdpBackend(PortBackend):
         if self.sctp_map is not None:
             self.sctp_map.close()
 
-    def sync_ports(
+    def get_applied_state(self) -> AppliedState:
+        bogon_enabled = None
+        if self.bogon_cfg_map is not None:
+            bogon_enabled = bool(self.bogon_cfg_map.get(0))
+        return AppliedState(
+            tcp_ports=self.tcp_map.active_ports(),
+            udp_ports=self.udp_map.active_ports(),
+            sctp_ports=self.sctp_map.active_ports() if self.sctp_map is not None else set(),
+            trusted_cidrs=self.trusted_map.active_keys(),
+            conntrack_entries=self.conntrack_map.active_keys(),
+            tcp_syn_rate_limits=self.syn_rate_map.active() if self.syn_rate_map is not None else {},
+            tcp_syn_agg_rate_limits=self.syn_agg_rate_map.active() if self.syn_agg_rate_map is not None else {},
+            tcp_conn_limits=self.tcp_conn_limit_map.active() if self.tcp_conn_limit_map is not None else {},
+            udp_rate_limits=self.udp_rate_map.active() if self.udp_rate_map is not None else {},
+            udp_agg_rate_limits=self.udp_agg_rate_map.active() if self.udp_agg_rate_map is not None else {},
+            acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
+            bogon_filter_enabled=bogon_enabled,
+        )
+
+    def build_reconcile_plan(
         self,
-        tcp_target: set[int],
-        udp_target: set[int],
-        sctp_target: set[int],
-        trusted_target: set[str],
-        conntrack_target: set[bytes],
+        desired_state: DesiredState,
+        applied_state: AppliedState,
+    ) -> ReconcilePlan:
+        if not hasattr(self, "_conntrack_stale_rounds"):
+            self._conntrack_stale_rounds = {}
+        plan = super().build_reconcile_plan(desired_state, applied_state)
+        present_desired = self.conntrack_map.existing_keys(desired_state.conntrack_entries)
+        plan.conntrack_entries_to_add = desired_state.conntrack_entries - present_desired
+
+        for key in desired_state.conntrack_entries:
+            self._conntrack_stale_rounds.pop(key, None)
+
+        stale_ready: set[bytes] = set()
+        for key in plan.conntrack_entries_to_remove:
+            rounds = self._conntrack_stale_rounds.get(key, 0) + 1
+            self._conntrack_stale_rounds[key] = rounds
+            if rounds >= cfg.XDP_CONNTRACK_STALE_RECONCILES:
+                stale_ready.add(key)
+
+        for key in set(self._conntrack_stale_rounds) - plan.conntrack_entries_to_remove:
+            self._conntrack_stale_rounds.pop(key, None)
+
+        plan.conntrack_entries_to_remove = stale_ready
+        return plan
+
+    def apply_reconcile_plan(
+        self,
+        plan: ReconcilePlan,
         dry_run: bool,
-        cached_conns=None,
+        desired_state: DesiredState,
+        observed_state: ObservedState | None = None,
     ) -> None:
         changed = False
-        tcp_permanent = set(cfg.TCP_PERMANENT)
-        udp_permanent = set(cfg.UDP_PERMANENT)
-        sctp_permanent = set(cfg.SCTP_PERMANENT)
         trusted_permanent = set(cfg.TRUSTED_SRC_IPS)
-        active_tcp = self.tcp_map.active_ports()
-        active_udp = self.udp_map.active_ports()
-        active_sctp = self.sctp_map.active_ports() if self.sctp_map is not None else set()
-        active_trusted = self.trusted_map.active_keys()
-        _ = conntrack_target
-        closed_tcp_ports = active_tcp - tcp_target - tcp_permanent
-        closed_udp_ports = active_udp - udp_target - udp_permanent
 
-        for port in sorted(tcp_target - active_tcp):
+        for port in sorted(plan.tcp_ports_to_add):
             tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
             if self.tcp_map.set(port, 1, dry_run):
                 log.debug("TCP +%d%s", port, tag)
                 changed = True
 
-        for port in sorted(closed_tcp_ports):
+        for port in sorted(plan.tcp_ports_to_remove):
             if self.tcp_map.set(port, 0, dry_run):
                 log.debug("TCP -%d  (stopped)", port)
                 changed = True
 
-        if closed_tcp_ports:
-            deleted = self.conntrack_map.delete_dest_ports(closed_tcp_ports, dry_run)
+        if plan.tcp_ports_to_remove:
+            deleted = self.conntrack_map.delete_dest_ports(plan.tcp_ports_to_remove, dry_run)
             if deleted:
                 log.info(
                     "TCP conntrack -%d entr%s for closed port(s): %s",
                     deleted,
                     "y" if deleted == 1 else "ies",
-                    ", ".join(str(port) for port in sorted(closed_tcp_ports)),
+                    ", ".join(str(port) for port in sorted(plan.tcp_ports_to_remove)),
                 )
 
-        for port in sorted(udp_target - active_udp):
+        for key in plan.conntrack_entries_to_add:
+            if self.conntrack_map.set(key, dry_run):
+                self._conntrack_stale_rounds.pop(key, None)
+                changed = True
+
+        if plan.conntrack_entries_to_add:
+            log.info("TCP conntrack +%d entr%s seeded from observed established flows.", len(plan.conntrack_entries_to_add), "y" if len(plan.conntrack_entries_to_add) == 1 else "ies")
+
+        removed_conntrack = 0
+        for key in plan.conntrack_entries_to_remove:
+            if self.conntrack_map.delete(key, dry_run):
+                self._conntrack_stale_rounds.pop(key, None)
+                removed_conntrack += 1
+                changed = True
+
+        if removed_conntrack:
+            log.info(
+                "TCP conntrack -%d stale entr%s removed after repeated misses.",
+                removed_conntrack,
+                "y" if removed_conntrack == 1 else "ies",
+            )
+
+        for port in sorted(plan.udp_ports_to_add):
             tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
             if self.udp_map.set(port, 1, dry_run):
                 log.debug("UDP +%d%s", port, tag)
                 changed = True
 
-        for port in sorted(closed_udp_ports):
+        for port in sorted(plan.udp_ports_to_remove):
             if self.udp_map.set(port, 0, dry_run):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
 
-        if closed_udp_ports:
-            deleted = self.udp_conntrack_map.delete_dest_ports(closed_udp_ports, dry_run)
+        if plan.udp_ports_to_remove:
+            deleted = self.udp_conntrack_map.delete_dest_ports(plan.udp_ports_to_remove, dry_run)
             if deleted:
                 log.info(
                     "UDP conntrack -%d entr%s for closed port(s): %s",
                     deleted,
                     "y" if deleted == 1 else "ies",
-                    ", ".join(str(port) for port in sorted(closed_udp_ports)),
+                    ", ".join(str(port) for port in sorted(plan.udp_ports_to_remove)),
                 )
 
         if self.sctp_map is not None:
-            for port in sorted(sctp_target - active_sctp):
+            for port in sorted(plan.sctp_ports_to_add):
                 tag = f" [{cfg.SCTP_PERMANENT[port]}]" if port in cfg.SCTP_PERMANENT else ""
                 if self.sctp_map.set(port, 1, dry_run):
                     log.info("SCTP +%d%s", port, tag)
                     changed = True
 
-            for port in sorted(active_sctp - sctp_target - sctp_permanent):
+            for port in sorted(plan.sctp_ports_to_remove):
                 if self.sctp_map.set(port, 0, dry_run):
                     log.info("SCTP -%d  (stopped)", port)
                     changed = True
 
         # HASH maps need delete, not write-zero, when trust entries disappear.
-        for ip_str in sorted(trusted_target - active_trusted):
+        for ip_str in sorted(plan.trusted_cidrs_to_add):
             tag = f" [{cfg.TRUSTED_SRC_IPS[ip_str]}]" if ip_str in cfg.TRUSTED_SRC_IPS else ""
             if self.trusted_map.set(ip_str, 1, dry_run):
                 log.info("TRUST +%s%s", ip_str, tag)
                 changed = True
 
-        for ip_str in sorted(active_trusted - trusted_target - trusted_permanent):
+        for ip_str in sorted(plan.trusted_cidrs_to_remove - trusted_permanent):
             if self.trusted_map.delete(ip_str, dry_run):
                 log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
@@ -202,154 +308,117 @@ class XdpBackend(PortBackend):
         if not changed:
             log.debug("Whitelist up-to-date.")
 
-        # Sync per-port SYN rate limits based on detected service types.
         if self.syn_rate_map is not None:
-            self._sync_syn_rate(tcp_target, dry_run, cached_conns)
+            self._apply_rate_map_delta(
+                self.syn_rate_map,
+                plan.tcp_syn_rate_limits_to_upsert,
+                plan.tcp_syn_rate_limits_to_remove,
+                dry_run,
+                "tcp",
+                {} if observed_state is None else observed_state.tcp_processes,
+            )
 
         if self.syn_agg_rate_map is not None:
-            self._sync_syn_agg_rate(tcp_target, dry_run, cached_conns)
+            self._apply_rate_map_delta(
+                self.syn_agg_rate_map,
+                plan.tcp_syn_agg_rate_limits_to_upsert,
+                plan.tcp_syn_agg_rate_limits_to_remove,
+                dry_run,
+                "tcp_syn_agg",
+            )
 
         if self.tcp_conn_limit_map is not None:
-            self._sync_tcp_conn_limit(tcp_target, dry_run, cached_conns)
+            self._apply_rate_map_delta(
+                self.tcp_conn_limit_map,
+                plan.tcp_conn_limits_to_upsert,
+                plan.tcp_conn_limits_to_remove,
+                dry_run,
+                "tcp_conn_limit",
+            )
 
         if self.udp_rate_map is not None:
-            self._sync_udp_rate(udp_target, dry_run, cached_conns)
+            self._apply_rate_map_delta(
+                self.udp_rate_map,
+                plan.udp_rate_limits_to_upsert,
+                plan.udp_rate_limits_to_remove,
+                dry_run,
+                "udp",
+                {} if observed_state is None else observed_state.udp_processes,
+            )
 
         if self.udp_agg_rate_map is not None:
-            self._sync_udp_agg_rate(udp_target, dry_run, cached_conns)
+            self._apply_rate_map_delta(
+                self.udp_agg_rate_map,
+                plan.udp_agg_rate_limits_to_upsert,
+                plan.udp_agg_rate_limits_to_remove,
+                dry_run,
+                "udp_agg",
+            )
 
         if self.acl_maps is not None:
-            self._sync_acl(dry_run)
+            self._apply_acl_delta(plan, dry_run)
 
-        if self.bogon_cfg_map is not None:
-            self.bogon_cfg_map.set(0, 1 if cfg.BOGON_FILTER_ENABLED else 0, dry_run)
+        if self.bogon_cfg_map is not None and plan.bogon_filter_update is not None:
+            self.bogon_cfg_map.set(0, 1 if plan.bogon_filter_update else 0, dry_run)
 
-    def _sync_acl(self, dry_run: bool) -> None:
+    def reconcile(
+        self,
+        desired_state: DesiredState,
+        dry_run: bool,
+        observed_state: ObservedState | None = None,
+    ) -> None:
+        stale_rounds_snapshot = dict(getattr(self, "_conntrack_stale_rounds", {}))
+        try:
+            super().reconcile(desired_state, dry_run, observed_state)
+        finally:
+            if dry_run:
+                self._conntrack_stale_rounds = stale_rounds_snapshot
+
+    def _apply_acl_delta(self, plan: ReconcilePlan, dry_run: bool) -> None:
         if self.acl_maps is None:
             return
-        desired: dict[tuple[str, str], frozenset[int]] = {}
-        for rule in cfg.ACL_RULES:
-            proto = rule["proto"]
-            cidr = rule["cidr"]
-            ports = rule["ports"]
-            if not ports:
-                continue
-            key = (proto, cidr)
-            desired[key] = frozenset(ports)
+        for (proto, cidr), ports in plan.acl_rules_to_upsert.items():
+            if self.acl_maps.set(proto, cidr, sorted(ports), dry_run):
+                log.info("ACL %s %s ports %s", proto.upper(), cidr, sorted(ports))
 
-        active = self.acl_maps.active_entries()
-
-        for (proto, cidr), ports in desired.items():
-            if active.get((proto, cidr)) != ports:
-                if self.acl_maps.set(proto, cidr, sorted(ports), dry_run):
-                    log.info("ACL %s %s ports %s", proto.upper(), cidr, sorted(ports))
-
-        for (proto, cidr) in set(active) - set(desired):
+        for (proto, cidr) in plan.acl_rules_to_remove:
             if self.acl_maps.delete(proto, cidr, dry_run):
                 log.info("ACL %s %s removed", proto.upper(), cidr)
 
-    def _sync_syn_rate(self, tcp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
-        """Update syn_rate_ports to match the current set of whitelisted TCP ports."""
-        active = self.syn_rate_map.active()  # type: ignore[union-attr]
-        port_procs = _listening_port_processes(tcp_ports, socket.SOCK_STREAM, cached_conns)
-
-        # Desired state: port → rate_max (skip ports where rate=0, i.e. web).
-        desired: dict[int, int] = {}
-        for port in tcp_ports:
-            rate = _port_rate_limit(port, port_procs.get(port, ""))
-            if rate > 0:
-                desired[port] = rate
-
-        for port, rate_max in desired.items():
-            if active.get(port) != rate_max:
-                if self.syn_rate_map.set(port, rate_max, dry_run):  # type: ignore[union-attr]
-                    svc: str = port_procs.get(port, "")
-                    if not svc:
-                        try:
-                            svc = socket.getservbyport(port, "tcp")
-                        except OSError:
-                            svc = "unknown"
+    def _apply_rate_map_delta(
+        self,
+        rate_map: BpfSynRatePortsMap,
+        upserts: dict[int, int],
+        removals: set[int],
+        dry_run: bool,
+        kind: str,
+        port_procs: dict[int, str] | None = None,
+    ) -> None:
+        port_procs = {} if port_procs is None else port_procs
+        for port, rate_max in upserts.items():
+            if rate_map.set(port, rate_max, dry_run):
+                if kind == "tcp":
+                    svc = port_procs.get(port) or service_name(port, "tcp") or "unknown"
                     log.info("SYN rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
-
-        for port in set(active) - set(desired):
-            if self.syn_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
-                log.info("SYN rate port %d removed (port no longer whitelisted)", port)
-
-    def _sync_syn_agg_rate(self, tcp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
-        active = self.syn_agg_rate_map.active()  # type: ignore[union-attr]
-        port_procs = _listening_port_processes(tcp_ports, socket.SOCK_STREAM, cached_conns)
-        desired: dict[int, int] = {}
-        for port in tcp_ports:
-            limit = _syn_aggregate_rate_limit(port, port_procs.get(port, ""))
-            if limit > 0:
-                desired[port] = limit
-
-        for port, limit in desired.items():
-            if active.get(port) != limit:
-                if self.syn_agg_rate_map.set(port, limit, dry_run):  # type: ignore[union-attr]
-                    log.info("SYN aggregate port %d rate_max=%d/s", port, limit)
-
-        for port in set(active) - set(desired):
-            if self.syn_agg_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
-                log.info("SYN aggregate port %d removed", port)
-
-    def _sync_tcp_conn_limit(self, tcp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
-        active = self.tcp_conn_limit_map.active()  # type: ignore[union-attr]
-        port_procs = _listening_port_processes(tcp_ports, socket.SOCK_STREAM, cached_conns)
-        desired: dict[int, int] = {}
-        for port in tcp_ports:
-            limit = _tcp_conn_limit(port, port_procs.get(port, ""))
-            if limit > 0:
-                desired[port] = limit
-
-        for port, limit in desired.items():
-            if active.get(port) != limit:
-                if self.tcp_conn_limit_map.set(port, limit, dry_run):  # type: ignore[union-attr]
-                    log.info("TCP conn limit port %d conn_max=%d", port, limit)
-
-        for port in set(active) - set(desired):
-            if self.tcp_conn_limit_map.delete(port, dry_run):  # type: ignore[union-attr]
-                log.info("TCP conn limit port %d removed", port)
-
-    def _sync_udp_rate(self, udp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
-        """Update udp_rate_ports to match the current set of whitelisted UDP ports."""
-        active = self.udp_rate_map.active()  # type: ignore[union-attr]
-        port_procs = _listening_port_processes(udp_ports, socket.SOCK_DGRAM, cached_conns)
-
-        desired: dict[int, int] = {}
-        for port in udp_ports:
-            rate = _udp_port_rate_limit(port, port_procs.get(port, ""))
-            if rate > 0:
-                desired[port] = rate
-
-        for port, rate_max in desired.items():
-            if active.get(port) != rate_max:
-                if self.udp_rate_map.set(port, rate_max, dry_run):  # type: ignore[union-attr]
-                    try:
-                        svc = socket.getservbyport(port, "udp")
-                    except OSError:
-                        svc = "unknown"
+                elif kind == "tcp_syn_agg":
+                    log.info("SYN aggregate port %d rate_max=%d/s", port, rate_max)
+                elif kind == "tcp_conn_limit":
+                    log.info("TCP conn limit port %d conn_max=%d", port, rate_max)
+                elif kind == "udp":
+                    svc = port_procs.get(port) or service_name(port, "udp") or "unknown"
                     log.info("UDP rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
+                elif kind == "udp_agg":
+                    log.info("UDP aggregate port %d byte_rate_max=%d/s", port, rate_max)
 
-        for port in set(active) - set(desired):
-            if self.udp_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
-                log.info("UDP rate port %d removed (port no longer whitelisted)", port)
-
-    def _sync_udp_agg_rate(self, udp_ports: set[int], dry_run: bool, cached_conns=None) -> None:
-        active = self.udp_agg_rate_map.active()  # type: ignore[union-attr]
-        port_procs = _listening_port_processes(udp_ports, socket.SOCK_DGRAM, cached_conns)
-
-        desired: dict[int, int] = {}
-        for port in udp_ports:
-            limit = _udp_aggregate_byte_limit(port, port_procs.get(port, ""))
-            if limit > 0:
-                desired[port] = limit
-
-        for port, limit in desired.items():
-            if active.get(port) != limit:
-                if self.udp_agg_rate_map.set(port, limit, dry_run):  # type: ignore[union-attr]
-                    log.info("UDP aggregate port %d byte_rate_max=%d/s", port, limit)
-
-        for port in set(active) - set(desired):
-            if self.udp_agg_rate_map.delete(port, dry_run):  # type: ignore[union-attr]
-                log.info("UDP aggregate port %d removed", port)
+        for port in removals:
+            if rate_map.delete(port, dry_run):
+                if kind == "tcp":
+                    log.info("SYN rate port %d removed (port no longer whitelisted)", port)
+                elif kind == "tcp_syn_agg":
+                    log.info("SYN aggregate port %d removed", port)
+                elif kind == "tcp_conn_limit":
+                    log.info("TCP conn limit port %d removed", port)
+                elif kind == "udp":
+                    log.info("UDP rate port %d removed (port no longer whitelisted)", port)
+                elif kind == "udp_agg":
+                    log.info("UDP aggregate port %d removed", port)

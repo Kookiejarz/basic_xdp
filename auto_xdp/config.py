@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 
 try:
     import tomllib  # Python 3.11+
@@ -15,6 +16,10 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 TOML_CONFIG_PATH = "/etc/auto_xdp/config.toml"
+
+BACKEND_AUTO = "auto"
+BACKEND_XDP = "xdp"
+BACKEND_NFTABLES = "nftables"
 
 TCP_MAP_PATH = "/sys/fs/bpf/xdp_fw/tcp_whitelist"
 UDP_MAP_PATH = "/sys/fs/bpf/xdp_fw/udp_whitelist"
@@ -41,6 +46,8 @@ REQUIRED_XDP_MAP_PATHS = (
     TRUSTED_IPS_MAP_PATH4,
     TRUSTED_IPS_MAP_PATH6,
 )
+XDP_OBJ_PATH = os.environ.get("XDP_OBJ_PATH", "")
+TC_OBJ_PATH = os.environ.get("TC_OBJ_PATH", "")
 
 _SYN_RATE_BY_PROC: dict[str, int] = {}
 _SYN_RATE_BY_SERVICE: dict[str, int] = {}
@@ -55,8 +62,11 @@ _UDP_AGG_BYTES_BY_SERVICE: dict[str, int] = {}
 
 BOGON_FILTER_ENABLED = True
 LOG_LEVEL: str = "warning"
+DEBOUNCE_SECONDS = 0.4
 DISCOVERY_EXCLUDE_LOOPBACK = True
 DISCOVERY_EXCLUDE_BIND_CIDRS: list[str] = []
+PREFERRED_BACKEND = BACKEND_AUTO
+XDP_CONNTRACK_STALE_RECONCILES = 2
 
 NFT_FAMILY = "inet"
 NFT_TABLE = "auto_xdp"
@@ -65,10 +75,6 @@ NFT_UDP_SET = "udp_ports"
 NFT_SCTP_SET = "sctp_ports"
 NFT_TRUSTED_SET4 = "trusted_v4"
 NFT_TRUSTED_SET6 = "trusted_v6"
-
-BACKEND_AUTO = "auto"
-BACKEND_XDP = "xdp"
-BACKEND_NFTABLES = "nftables"
 
 TCP_PERMANENT: dict[int, str] = {}
 UDP_PERMANENT: dict[int, str] = {}
@@ -102,9 +108,50 @@ def load_toml_config(path: str = TOML_CONFIG_PATH) -> dict:
         return {}
 
 
+def _coerce_log_level(value: object, default: str = "warning") -> str:
+    level = str(value).lower()
+    if level not in {"debug", "info", "warning", "error"}:
+        log.warning("Invalid daemon.log_level %r; using %s", value, default)
+        return default
+    return level
+
+
+def _coerce_backend(value: object, default: str = BACKEND_AUTO) -> str:
+    backend = str(value).lower()
+    if backend not in {BACKEND_AUTO, BACKEND_XDP, BACKEND_NFTABLES}:
+        log.warning("Invalid daemon.preferred_backend %r; using %s", value, default)
+        return default
+    return backend
+
+
+def _coerce_positive_float(value: object, path: str, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    if parsed <= 0:
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    return parsed
+
+
+def _coerce_positive_int(value: object, path: str, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    if parsed <= 0:
+        log.warning("Invalid %s %r; using %s", path, value, default)
+        return default
+    return parsed
+
+
 def apply_toml_config(cfg: dict) -> None:
-    global BOGON_FILTER_ENABLED, LOG_LEVEL
+    global BOGON_FILTER_ENABLED, LOG_LEVEL, DEBOUNCE_SECONDS
     global DISCOVERY_EXCLUDE_LOOPBACK, DISCOVERY_EXCLUDE_BIND_CIDRS
+    global PREFERRED_BACKEND, XDP_CONNTRACK_STALE_RECONCILES
 
     TCP_PERMANENT.clear()
     UDP_PERMANENT.clear()
@@ -155,10 +202,24 @@ def apply_toml_config(cfg: dict) -> None:
     _UDP_AGG_BYTES_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_service", {}).items()})
 
     BOGON_FILTER_ENABLED = bool(cfg.get("firewall", {}).get("bogon_filter", True))
-    LOG_LEVEL = cfg.get("daemon", {}).get("log_level", "warning").lower()
+    daemon = cfg.get("daemon", {})
+    LOG_LEVEL = _coerce_log_level(daemon.get("log_level", "warning"))
+    DEBOUNCE_SECONDS = _coerce_positive_float(
+        daemon.get("debounce_seconds", 0.4),
+        "daemon.debounce_seconds",
+        0.4,
+    )
+    PREFERRED_BACKEND = _coerce_backend(daemon.get("preferred_backend", BACKEND_AUTO))
 
     discovery = cfg.get("discovery", {})
     DISCOVERY_EXCLUDE_LOOPBACK = bool(discovery.get("exclude_loopback", True))
     DISCOVERY_EXCLUDE_BIND_CIDRS.extend(
         normalize_cidr(cidr) for cidr in discovery.get("exclude_bind_cidrs", [])
+    )
+
+    xdp = cfg.get("xdp", {})
+    XDP_CONNTRACK_STALE_RECONCILES = _coerce_positive_int(
+        xdp.get("conntrack_stale_reconciles", 2),
+        "xdp.conntrack_stale_reconciles",
+        2,
     )

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import select
 import signal
 import time
@@ -11,68 +10,82 @@ from auto_xdp import config as cfg
 from auto_xdp.backends import NftablesBackend, PortBackend, XdpBackend
 from auto_xdp.config import apply_toml_config, load_toml_config
 from auto_xdp.discovery import _net_connections, get_listening_ports
+from auto_xdp.policy import resolve_desired_state
 from auto_xdp.proc_events import drain_proc_events, open_proc_connector
 
 log = logging.getLogger(__name__)
 
-DEBOUNCE_S = 0.4
 TOML_CONFIG_PATH = cfg.TOML_CONFIG_PATH
-REQUIRED_XDP_MAP_PATHS = cfg.REQUIRED_XDP_MAP_PATHS
 BACKEND_AUTO = cfg.BACKEND_AUTO
 BACKEND_XDP = cfg.BACKEND_XDP
 BACKEND_NFTABLES = cfg.BACKEND_NFTABLES
-TCP_PERMANENT = cfg.TCP_PERMANENT
-UDP_PERMANENT = cfg.UDP_PERMANENT
-SCTP_PERMANENT = cfg.SCTP_PERMANENT
 TRUSTED_SRC_IPS = cfg.TRUSTED_SRC_IPS
 
 
-def sync_once(backend: PortBackend, dry_run: bool) -> None:
+def observe_system_state():
     try:
         all_conns = _net_connections(kind="inet") if (_net_connections is not None) else []
     except Exception:
         all_conns = []
-    current = get_listening_ports(cached_conns=all_conns)
-    tcp_target = current.tcp | set(TCP_PERMANENT)
-    udp_target = current.udp | set(UDP_PERMANENT)
-    sctp_target = current.sctp | set(SCTP_PERMANENT)
-    trusted_target = set(TRUSTED_SRC_IPS)
-    conntrack_target: set[bytes] = set()
-    backend.sync_ports(tcp_target, udp_target, sctp_target, trusted_target, conntrack_target, dry_run, cached_conns=all_conns)
+    return get_listening_ports(cached_conns=all_conns)
+
+
+def sync_once(backend: PortBackend, dry_run: bool) -> None:
+    observed = observe_system_state()
+    desired = resolve_desired_state(observed)
+    backend.reconcile(desired, dry_run, observed)
+
+
+def _format_backend_status(status) -> str:
+    return status.format_message()
+
+
+def _probe_backend(backend_cls: type[PortBackend]):
+    status = backend_cls.probe()
+    if status.available:
+        return status
+    log.warning("%s backend unavailable (%s).", status.name, _format_backend_status(status))
+    return status
 
 
 def open_backend(name: str) -> PortBackend:
-    missing_xdp_maps = [path for path in REQUIRED_XDP_MAP_PATHS if not os.path.exists(path)]
-
     if name == BACKEND_XDP:
-        if missing_xdp_maps:
-            raise RuntimeError(f"required XDP maps missing: {', '.join(missing_xdp_maps)}")
+        status = XdpBackend.probe()
+        if not status.available:
+            raise RuntimeError(_format_backend_status(status))
         return XdpBackend()
     if name == BACKEND_NFTABLES:
+        status = NftablesBackend.probe()
+        if not status.available:
+            raise RuntimeError(_format_backend_status(status))
         return NftablesBackend()
     if name != BACKEND_AUTO:
         raise RuntimeError(f"Unsupported backend: {name}")
 
-    if not missing_xdp_maps:
-        try:
-            backend = XdpBackend()
-            log.info("Backend selected: xdp")
-            return backend
-        except OSError as exc:
-            log.warning("XDP backend unavailable (%s); trying nftables.", exc)
-    else:
-        log.warning("XDP maps incomplete (%s); trying nftables.", ", ".join(missing_xdp_maps))
+    xdp_status = _probe_backend(XdpBackend)
+    if xdp_status.available:
+        backend = XdpBackend()
+        log.info("Backend selected: xdp")
+        return backend
 
+    nft_status = _probe_backend(NftablesBackend)
+    if not nft_status.available:
+        raise RuntimeError(_format_backend_status(nft_status))
     backend = NftablesBackend()
     log.info("Backend selected: nftables")
     return backend
 
 
-def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TOML_CONFIG_PATH, cli_trusted_ips: dict[str, str] | None = None, cli_log_level: str | None = None) -> None:
+def watch(
+    dry_run: bool,
+    backend_name: str,
+    config_path: str = TOML_CONFIG_PATH,
+    cli_trusted_ips: dict[str, str] | None = None,
+    cli_log_level: str | None = None,
+) -> None:
     backend = None
     nl = None
 
-    last_sync_t = 0.0
     last_event_t = 0.0
     reload_requested = False
 
@@ -89,9 +102,7 @@ def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TO
                 try:
                     backend = open_backend(backend_name)
                     log.info("Backend initialized.")
-                    # Force a sync after (re)initialization
                     sync_once(backend, dry_run)
-                    last_sync_t = time.monotonic()
                     last_event_t = 0.0
                 except Exception as exc:
                     log.error("Failed to open backend: %s. Retrying in 5s...", exc)
@@ -101,22 +112,20 @@ def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TO
             # Re-subscribe to netlink if needed
             if nl is None:
                 nl = open_proc_connector()
+                if nl is None:
+                    time.sleep(5)
+                    continue
 
-            now = time.monotonic()
-            poll_due = last_sync_t + interval
-            deb_due = (last_event_t + DEBOUNCE_S) if last_event_t else float("inf")
-            sleep_for = max(0.05, min(poll_due, deb_due) - now)
+            debounce_s = cfg.DEBOUNCE_SECONDS
+            timeout = max(0.05, debounce_s - (time.monotonic() - last_event_t)) if last_event_t else 1.0
 
             try:
-                if nl and not last_event_t:
-                    rdy, _, _ = select.select([nl], [], [], sleep_for)
-                    if rdy and drain_proc_events(nl):
-                        log.debug("Proc event -> debounce armed.")
-                        last_event_t = time.monotonic()
-                else:
-                    time.sleep(sleep_for)
+                rdy, _, _ = select.select([nl], [], [], timeout)
+                if rdy and drain_proc_events(nl):
+                    log.debug("Proc event -> debounce armed.")
+                    last_event_t = time.monotonic()
             except OSError as exc:
-                log.warning("Netlink error (%s); switching to poll-only mode.", exc)
+                log.warning("Netlink error (%s); reconnecting proc connector.", exc)
                 if nl:
                     nl.close()
                 nl = None
@@ -132,27 +141,21 @@ def watch(interval: int, dry_run: bool, backend_name: str, config_path: str = TO
                     _lvl = getattr(logging, cfg.LOG_LEVEL.upper(), logging.WARNING)
                     logging.getLogger().setLevel(_lvl)
                     log.setLevel(_lvl)
-                last_sync_t = 0.0  # force sync on next iteration
+                last_event_t = time.monotonic() - cfg.DEBOUNCE_SECONDS
 
-            now = time.monotonic()
-            debounce_fired = bool(last_event_t) and (now - last_event_t >= DEBOUNCE_S)
-            fallback_fired = now - last_sync_t >= interval
-
-            if debounce_fired or fallback_fired:
+            if last_event_t and (time.monotonic() - last_event_t >= cfg.DEBOUNCE_SECONDS):
                 if nl:
                     drain_proc_events(nl)
-                log.debug("Sync triggered by %s.", "event" if debounce_fired else "poll")
+                log.debug("Sync triggered by event.")
                 try:
                     sync_once(backend, dry_run)
                 except Exception as exc:
                     log.error("Sync error: %s", exc)
-                    # If it's a BPF/backend error, reset it for re-init
                     if isinstance(exc, (OSError, RuntimeError)):
                         log.warning("Backend may be broken; will attempt to re-initialize.")
                         backend.close()
                         backend = None
 
-                last_sync_t = time.monotonic()
                 last_event_t = 0.0
 
     except KeyboardInterrupt:
