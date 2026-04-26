@@ -156,6 +156,24 @@ load_config() {
     fi
 }
 
+run_admin_config() {
+    python3 -m auto_xdp.admin_cli \
+        --config "$TOML_CONFIG" \
+        --bpf-pin-dir "$BPF_PIN_DIR" \
+        --install-dir "$INSTALL_DIR" \
+        "$@"
+}
+
+run_admin_runtime() {
+    python3 -m auto_xdp.admin.main \
+        --env-config "$CONFIG_FILE" \
+        --bpf-pin-dir "$BPF_PIN_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
+        --nft-family "$NFT_FAMILY" \
+        --nft-table "$NFT_TABLE" \
+        "$@"
+}
+
 valid_log_level() {
     case "$1" in
         debug|info|warning|error)
@@ -196,37 +214,14 @@ set_config_var() {
 run_log_level() {
     local level="${1:-}"
 
-    load_config
-    local current="${LOG_LEVEL:-info}"
-
     if [[ -z "$level" ]]; then
-        printf "%s\n" "$current"
-        return 0
+        run_admin_config log-level
+        return $?
     fi
 
-    level=$(printf "%s" "$level" | tr '[:upper:]' '[:lower:]')
-    valid_log_level "$level" || {
-        echo "Invalid log level: $level" >&2
-        echo "Valid values: debug, info, warning, error" >&2
-        exit 1
-    }
-
-    set_config_var "LOG_LEVEL" "$level"
-    echo "LOG_LEVEL=$level"
-
-    if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
-        systemctl restart "$SERVICE_NAME"
-        systemctl --no-pager --full status "$SERVICE_NAME"
-        return 0
-    fi
-
-    if command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" restart
-        rc-service "$SERVICE_NAME" status
-        return 0
-    fi
-
-    echo "No supported init system detected for service restart." >&2
+    [[ -f "$TOML_CONFIG" ]] || run_config init
+    run_admin_config log-level "$level"
+    reload_daemon
     return 0
 }
 
@@ -426,39 +421,7 @@ render_conntrack_summary() {
 }
 
 run_backend() {
-    local iface_list xdp_mode tcp_ct udp_ct first_iface xdp_states=() tc_states=() iface state
-
-    load_config
-    iface_list=$(configured_ifaces || true)
-    if [[ -z "$iface_list" ]]; then
-        autodetect_iface
-        iface_list="$IFACE"
-    else
-        first_iface="${iface_list%% *}"
-        IFACE="${IFACE:-$first_iface}"
-    fi
-
-    detect_backend
-
-    xdp_mode="-"
-    [[ -f "${RUN_STATE_DIR}/xdp_mode" ]] && xdp_mode=$(<"${RUN_STATE_DIR}/xdp_mode")
-    tcp_ct=$(conntrack_entry_count "${BPF_PIN_DIR}/tcp_conntrack")
-    udp_ct=$(conntrack_entry_count "${BPF_PIN_DIR}/udp_conntrack")
-
-    for iface in $iface_list; do
-        state=$(iface_xdp_state "$iface")
-        xdp_states+=("${iface}=${state}")
-        state=$(iface_tc_egress_state "$iface")
-        tc_states+=("${iface}=${state}")
-    done
-
-    printf 'Backend   : %s\n' "$BACKEND"
-    printf 'Preferred : %s\n' "${PREFERRED_BACKEND:-auto}"
-    printf 'Interfaces: %s\n' "$iface_list"
-    printf 'XDP mode  : %s\n' "$xdp_mode"
-    printf 'XDP attach: %s\n' "${xdp_states[*]:--}"
-    printf 'tc egress : %s\n' "${tc_states[*]:--}"
-    printf 'Conntrack : tcp=%s udp=%s\n' "$tcp_ct" "$udp_ct"
+    run_admin_runtime backend "$@"
 }
 
 run_conntrack() {
@@ -734,15 +697,18 @@ def key_to_port(key):
         return norm(key)
     return 0
 
-rows = json.load(sys.stdin)
-ports = []
-for row in rows:
-    if norm(row.get("value", row.get("values", 0))) <= 0:
-        continue
-    port = key_to_port(row.get("key"))
-    if 0 < port <= 65535:
-        ports.append(port)
-print(",".join(str(p) for p in sorted(set(ports))))
+try:
+    rows = json.load(sys.stdin)
+    ports = []
+    for row in rows:
+        if norm(row.get("value", row.get("values", 0))) <= 0:
+            continue
+        port = key_to_port(row.get("key"))
+        if 0 < port <= 65535:
+            ports.append(port)
+    print(",".join(str(p) for p in sorted(set(ports))))
+except KeyboardInterrupt:
+    sys.exit(130)
 '
     bpftool -j map dump pinned "$udp_map" | python3 -c '
 import json
@@ -786,15 +752,18 @@ def key_to_port(key):
         return norm(key)
     return 0
 
-rows = json.load(sys.stdin)
-ports = []
-for row in rows:
-    if norm(row.get("value", row.get("values", 0))) <= 0:
-        continue
-    port = key_to_port(row.get("key"))
-    if 0 < port <= 65535:
-        ports.append(port)
-print(",".join(str(p) for p in sorted(set(ports))))
+try:
+    rows = json.load(sys.stdin)
+    ports = []
+    for row in rows:
+        if norm(row.get("value", row.get("values", 0))) <= 0:
+            continue
+        port = key_to_port(row.get("key"))
+        if 0 < port <= 65535:
+            ports.append(port)
+    print(",".join(str(p) for p in sorted(set(ports))))
+except KeyboardInterrupt:
+    sys.exit(130)
 '
 }
 
@@ -848,7 +817,7 @@ print(",".join(str(p) for p in sorted(ports)))
 parse_ports_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --watch)
+            watch|--watch)
                 PORTS_WATCH=1
                 shift
                 ;;
@@ -890,96 +859,120 @@ proto = sys.argv[1]
 csv = sys.argv[2]
 syn_rate_map_path = sys.argv[3] if len(sys.argv) > 3 else ""
 udp_rate_map_path = sys.argv[4] if len(sys.argv) > 4 else ""
-ports = [int(p) for p in csv.split(",") if p]
-proc_by_port = {p: set() for p in ports}
-
 try:
-    import psutil  # type: ignore
-except Exception:
-    psutil = None
+    ports = [int(p) for p in csv.split(",") if p]
+    proc_by_port = {p: set() for p in ports}
 
-if psutil is not None:
-    getter = getattr(psutil, "connections", psutil.net_connections)
-    for conn in getter(kind="inet"):
-        laddr = getattr(conn, "laddr", None)
-        if not laddr:
-            continue
+    def _parse_proc_net(path, state_filter, check_no_remote=False):
+        result = {}
         try:
-            lport = laddr.port
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local, remote, st, inode_str = parts[1], parts[2], parts[3], parts[9]
+                    if st != state_filter:
+                        continue
+                    if check_no_remote and not remote.endswith(':0000'):
+                        continue
+                    port = int(local.split(':')[1], 16)
+                    if port > 0:
+                        result[port] = int(inode_str)
         except Exception:
+            pass
+        return result
+
+    if proto == "tcp":
+        port_to_inode = {}
+        port_to_inode.update(_parse_proc_net('/proc/net/tcp', '0A'))
+        port_to_inode.update(_parse_proc_net('/proc/net/tcp6', '0A'))
+    else:
+        port_to_inode = {}
+        port_to_inode.update(_parse_proc_net('/proc/net/udp', '07', check_no_remote=True))
+        port_to_inode.update(_parse_proc_net('/proc/net/udp6', '07', check_no_remote=True))
+
+    wanted_inodes = {inode for port, inode in port_to_inode.items() if port in proc_by_port}
+    inode_map = {}
+    if wanted_inodes:
+        try:
+            for entry in os.scandir('/proc'):
+                if not entry.name.isdigit():
+                    continue
+                pid = entry.name
+                try:
+                    for fd_entry in os.scandir(f'/proc/{pid}/fd'):
+                        try:
+                            link = os.readlink(fd_entry.path)
+                            if link.startswith('socket:['):
+                                inode = int(link[8:-1])
+                                if inode in wanted_inodes:
+                                    with open(f'/proc/{pid}/comm') as cf:
+                                        inode_map[inode] = cf.read().strip()
+                                    wanted_inodes.discard(inode)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if not wanted_inodes:
+                    break
+        except Exception:
+            pass
+
+    for port, inode in port_to_inode.items():
+        if port in proc_by_port and inode in inode_map:
+            proc_by_port[port].add(inode_map[inode])
+
+    import subprocess
+    import json as _json
+
+    def _b(v):
+        if isinstance(v, int):
+            return v & 0xFF
+        if isinstance(v, str):
             try:
-                lport = laddr[1]
-            except Exception:
-                continue
-        if lport not in proc_by_port:
-            continue
+                return int(v, 0) & 0xFF
+            except ValueError:
+                return 0
+        return 0
 
-        if proto == "tcp":
-            if conn.type != socket.SOCK_STREAM:
-                continue
-            if conn.status != psutil.CONN_LISTEN:
-                continue
-        else:
-            if conn.type != socket.SOCK_DGRAM:
-                continue
-            if conn.raddr:
-                continue
-
-        pid = getattr(conn, "pid", None)
-        if pid is None:
-            continue
+    def _read_rate_map(path):
+        rates = {}
+        if not (path and os.path.exists(path)):
+            return rates
         try:
-            proc_by_port[lport].add(psutil.Process(pid).name())
+            out = subprocess.check_output(
+                ["bpftool", "-j", "map", "dump", "pinned", path],
+                stderr=subprocess.DEVNULL,
+            )
+            for row in _json.loads(out):
+                key = row.get("key", [])
+                val = row.get("value", [])
+                if isinstance(key, list) and len(key) >= 4:
+                    port = _b(key[0]) | (_b(key[1]) << 8) | (_b(key[2]) << 16) | (_b(key[3]) << 24)
+                    if isinstance(val, list) and len(val) >= 4:
+                        rate = _b(val[0]) | (_b(val[1]) << 8) | (_b(val[2]) << 16) | (_b(val[3]) << 24)
+                        if rate > 0:
+                            rates[port] = rate
         except Exception:
-            continue
-
-import subprocess
-import json as _json
-
-def _b(v):
-    if isinstance(v, int):
-        return v & 0xFF
-    if isinstance(v, str):
-        try:
-            return int(v, 0) & 0xFF
-        except ValueError:
-            return 0
-    return 0
-
-def _read_rate_map(path):
-    rates = {}
-    if not (path and os.path.exists(path)):
+            pass
         return rates
-    try:
-        out = subprocess.check_output(
-            ["bpftool", "-j", "map", "dump", "pinned", path],
-            stderr=subprocess.DEVNULL,
-        )
-        for row in _json.loads(out):
-            key = row.get("key", [])
-            val = row.get("value", [])
-            if isinstance(key, list) and len(key) >= 4:
-                port = _b(key[0]) | (_b(key[1]) << 8) | (_b(key[2]) << 16) | (_b(key[3]) << 24)
-                if isinstance(val, list) and len(val) >= 4:
-                    rate = _b(val[0]) | (_b(val[1]) << 8) | (_b(val[2]) << 16) | (_b(val[3]) << 24)
-                    if rate > 0:
-                        rates[port] = rate
-    except Exception:
-        pass
-    return rates
 
-rate_map_path = syn_rate_map_path if proto == "tcp" else udp_rate_map_path
-port_rates = _read_rate_map(rate_map_path)
+    rate_map_path = syn_rate_map_path if proto == "tcp" else udp_rate_map_path
+    port_rates = _read_rate_map(rate_map_path)
 
-for p in sorted(set(ports)):
-    try:
-        svc = socket.getservbyport(p, proto)
-    except Exception:
-        svc = "-"
-    procs = ",".join(sorted(proc_by_port.get(p, set()))) or "-"
-    rate = port_rates.get(p)
-    rate_str = f"{rate}/s" if rate else "-"
-    print(f"  {p:5d}  {svc:<14}  {procs:<14}  {rate_str}")
+    for p in sorted(set(ports)):
+        try:
+            svc = socket.getservbyport(p, proto)
+        except Exception:
+            svc = "-"
+        procs = ",".join(sorted(proc_by_port.get(p, set()))) or "-"
+        rate = port_rates.get(p)
+        rate_str = f"{rate}/s" if rate else "-"
+        print(f"  {p:5d}  {svc:<14}  {procs:<14}  {rate_str}")
+except KeyboardInterrupt:
+    sys.exit(130)
 PY
 }
 
@@ -1197,6 +1190,7 @@ run_stats() {
             prev_ts=$(read -r ts _ < /proc/uptime && echo "$ts")
         fi
 
+        printf '\033[H\033[2J'
         while true; do
             if [[ $SHOW_RATES -eq 1 ]]; then
                 sleep "$INTERVAL"
@@ -1208,12 +1202,9 @@ run_stats() {
                 elapsed=0
             fi
 
-            if [[ -n "${TERM:-}" ]] && command -v clear >/dev/null 2>&1; then
-                clear
-            else
-                printf '\033[H\033[2J'
-            fi
+            printf '\033[H'
             render_stats "$elapsed"
+            printf '\033[J'
 
             if [[ $SHOW_RATES -eq 1 ]]; then
                 copy_current_to_prev
@@ -1292,207 +1283,15 @@ reload_daemon() {
     command -v systemctl >/dev/null 2>&1 && systemctl restart "$SERVICE_NAME" 2>/dev/null || true
 }
 
-# Read the TOML config via Python and print as JSON (internal use).
-toml_to_json() {
-    python3 - "$TOML_CONFIG" <<'PY'
-import sys, json, os
-
-path = sys.argv[1]
-if not os.path.exists(path):
-    print("{}")
-    sys.exit(0)
-
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        import re as _re
-
-        def _tok(s):
-            items, cur, depth, in_str, esc, sc = [], [], 0, False, False, None
-            for c in s[1:-1]:
-                if esc: cur.append(c); esc = False; continue
-                if c == '\\' and in_str: cur.append(c); esc = True; continue
-                if c in ('"', "'") and not in_str: in_str = True; sc = c; cur.append(c); continue
-                if c == sc and in_str: in_str = False; sc = None; cur.append(c); continue
-                if not in_str:
-                    if c in ('[', '{'): depth += 1
-                    elif c in (']', '}'): depth -= 1
-                    elif c == ',' and depth == 0: items.append(''.join(cur).strip()); cur = []; continue
-                cur.append(c)
-            if cur: items.append(''.join(cur).strip())
-            return [i for i in items if i]
-
-        def _val(s):
-            s = s.strip()
-            if s.startswith('"'):
-                try: return json.loads(s)
-                except Exception: return s[1:-1]
-            if s.startswith("'"): return s[1:-1]
-            if s == 'true': return True
-            if s == 'false': return False
-            if s.startswith('['): return [_val(i) for i in _tok(s)]
-            if s.startswith('{'):
-                return {k.strip(): _val(v) for k, sep, v in
-                        (p.partition('=') for p in _tok(s)) if sep}
-            try: return int(s)
-            except ValueError: pass
-            try: return float(s)
-            except ValueError: return s
-
-        def _parse_toml(text):
-            root = cur = {}
-            for raw in text.splitlines():
-                line = raw.strip()
-                if not line or line.startswith('#'): continue
-                m = _re.match(r'^\[([^\[\]]+)\]$', line)
-                if m:
-                    cur = root
-                    for k in m.group(1).split('.'): cur = cur.setdefault(k.strip(), {})
-                    continue
-                m = _re.match(r'^([A-Za-z0-9_-]+)\s*=\s*(.+)$', line)
-                if m: cur[m.group(1)] = _val(m.group(2).strip())
-            return root
-
-        class tomllib:
-            @staticmethod
-            def load(f): return _parse_toml(f.read().decode())
-
-with open(path, "rb") as f:
-    data = tomllib.load(f)
-print(json.dumps(data))
-PY
-}
-
-# Write the config dict (JSON on stdin) back to the TOML file.
-json_to_toml() {
-    local path="$TOML_CONFIG"
-    local script
-    script=$(cat <<'PY'
-import json
-import math
-import os
-import re
-import sys
-
-path = sys.argv[1]
-data = json.load(sys.stdin)
-
-_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-def fmt_key(key):
-    key = str(key)
-    return key if _BARE_KEY_RE.match(key) else json.dumps(key)
-
-
-def fmt_path(parts):
-    return ".".join(fmt_key(part) for part in parts)
-
-
-def is_array_of_tables(value):
-    return isinstance(value, list) and value and all(isinstance(item, dict) for item in value)
-
-
-def fmt_value(value):
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            raise ValueError("TOML does not support NaN or infinity")
-        return repr(value)
-    if isinstance(value, str):
-        return json.dumps(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(fmt_value(item) for item in value) + "]"
-    if isinstance(value, dict):
-        inner = ", ".join(f"{fmt_key(k)} = {fmt_value(v)}" for k, v in value.items())
-        return "{ " + inner + " }"
-    raise TypeError(f"unsupported TOML value: {type(value).__name__}")
-
-
-def emit_table_body(table, path_parts):
-    lines = []
-    scalar_items = []
-    array_table_items = []
-    table_items = []
-
-    for key, value in table.items():
-        if is_array_of_tables(value):
-            array_table_items.append((key, value))
-        elif isinstance(value, dict):
-            table_items.append((key, value))
-        else:
-            scalar_items.append((key, value))
-
-    for key, value in scalar_items:
-        lines.append(f"{fmt_key(key)} = {fmt_value(value)}")
-
-    for key, value in array_table_items:
-        if lines:
-            lines.append("")
-        child_path = path_parts + [key]
-        for idx, item in enumerate(value):
-            if idx > 0:
-                lines.append("")
-            lines.append(f"[[{fmt_path(child_path)}]]")
-            lines.extend(emit_table_body(item, child_path))
-
-    for key, value in table_items:
-        if lines:
-            lines.append("")
-        child_path = path_parts + [key]
-        lines.append(f"[{fmt_path(child_path)}]")
-        lines.extend(emit_table_body(value, child_path))
-
-    return lines
-
-
-lines = emit_table_body(data, [])
-
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, "w") as f:
-    f.write("\n".join(lines).rstrip() + "\n")
-PY
-)
-    python3 -c "$script" "$path"
-}
-
-mutate_toml_json() {
-    local json script
-    json=$(toml_to_json) || return 1
-    script=$(cat) || return 1
-    printf '%s\n' "$json" | python3 -c "$script" "$@"
-}
-
 run_config() {
     local sub="${1:-show}"
     shift || true
     case "$sub" in
         show)
-            if [[ ! -f "$TOML_CONFIG" ]]; then
-                echo "(no config file at $TOML_CONFIG — run: axdp config init)"
-                return 0
-            fi
-            cat "$TOML_CONFIG"
+            run_admin_config config show "$@"
             ;;
         init)
-            if [[ -f "$TOML_CONFIG" ]]; then
-                echo "Config already exists: $TOML_CONFIG  (use 'axdp config show' to view)"
-                return 0
-            fi
-            command -v curl >/dev/null 2>&1 || { echo "curl required to fetch config template" >&2; exit 1; }
-            mkdir -p "$(dirname "$TOML_CONFIG")"
-            echo "Fetching default config.toml from GitHub..."
-            if ! curl --proto '=https' --tlsv1.2 -sSfL "${RAW_URL}/config.toml" -o "$TOML_CONFIG"; then
-                echo "Failed to fetch config.toml" >&2
-                exit 1
-            fi
-            echo "Created: $TOML_CONFIG"
+            run_admin_config config init "$@"
             ;;
         -h|--help)
             echo "Usage: axdp config show|init"
@@ -1507,42 +1306,15 @@ run_trust() {
     shift || true
     case "$sub" in
         list)
-            toml_to_json | python3 -c '
-import sys, json
-cfg = json.load(sys.stdin)
-tips = cfg.get("trusted_ips", {})
-if not tips:
-    print("  (none)")
-else:
-    for cidr, label in sorted(tips.items()):
-        print(f"  {cidr:<20}  {label}")
-'
+            run_admin_config trust list
             ;;
         add)
-            local cidr="${1:-}"
-            local label="${2:-manual}"
-            [[ -n "$cidr" ]] || { echo "Usage: axdp trust add CIDR [LABEL]" >&2; exit 1; }
             [[ -f "$TOML_CONFIG" ]] || run_config init
-            mutate_toml_json "$cidr" "$label" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-cidr, label = sys.argv[1], sys.argv[2]
-data.setdefault("trusted_ips", {})[cidr] = label
-print(json.dumps(data))
-PY
-            echo "Added trusted: $cidr ($label)"
+            run_admin_config trust add "$@"
             reload_daemon
             ;;
         del)
-            local cidr="${1:-}"
-            [[ -n "$cidr" ]] || { echo "Usage: axdp trust del CIDR" >&2; exit 1; }
-            mutate_toml_json "$cidr" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-data.setdefault("trusted_ips", {}).pop(sys.argv[1], None)
-print(json.dumps(data))
-PY
-            echo "Removed trusted: $cidr"
+            run_admin_config trust del "$@"
             reload_daemon
             ;;
         -h|--help)
@@ -1558,57 +1330,15 @@ run_acl() {
     shift || true
     case "$sub" in
         list)
-            toml_to_json | python3 -c '
-import sys, json
-cfg = json.load(sys.stdin)
-rules = cfg.get("acl", [])
-if not rules:
-    print("  (none)")
-else:
-    for r in rules:
-        ports = " ".join(str(p) for p in r.get("ports", []))
-        print(f"  {r[\"proto\"].upper():<4}  {r[\"cidr\"]:<22}  ports: {ports}")
-'
+            run_admin_config acl list
             ;;
         add)
-            local proto="${1:-}"
-            local cidr="${2:-}"
-            shift 2 || true
-            local ports=("$@")
-            [[ -n "$proto" && -n "$cidr" && ${#ports[@]} -gt 0 ]] || {
-                echo "Usage: axdp acl add tcp|udp CIDR PORT..." >&2; exit 1
-            }
-            [[ "$proto" == "tcp" || "$proto" == "udp" ]] || {
-                echo "proto must be tcp or udp" >&2; exit 1
-            }
             [[ -f "$TOML_CONFIG" ]] || run_config init
-            local ports_json
-            ports_json=$(printf '%s\n' "${ports[@]}" | python3 -c 'import sys,json; print(json.dumps([int(l) for l in sys.stdin]))')
-            mutate_toml_json "$proto" "$cidr" "$ports_json" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-proto, cidr, ports = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
-rules = data.setdefault("acl", [])
-rules = [r for r in rules if not (r["proto"] == proto and r["cidr"] == cidr)]
-rules.append({"proto": proto, "cidr": cidr, "ports": ports})
-data["acl"] = rules
-print(json.dumps(data))
-PY
-            echo "Added ACL: $proto $cidr ports ${ports[*]}"
+            run_admin_config acl add "$@"
             reload_daemon
             ;;
         del)
-            local proto="${1:-}"
-            local cidr="${2:-}"
-            [[ -n "$proto" && -n "$cidr" ]] || { echo "Usage: axdp acl del tcp|udp CIDR" >&2; exit 1; }
-            mutate_toml_json "$proto" "$cidr" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-proto, cidr = sys.argv[1], sys.argv[2]
-data["acl"] = [r for r in data.get("acl", []) if not (r["proto"] == proto and r["cidr"] == cidr)]
-print(json.dumps(data))
-PY
-            echo "Removed ACL: $proto $cidr"
+            run_admin_config acl del "$@"
             reload_daemon
             ;;
         -h|--help)
@@ -1624,64 +1354,15 @@ run_permanent() {
     shift || true
     case "$sub" in
         list)
-            toml_to_json | python3 -c '
-import sys, json
-cfg = json.load(sys.stdin)
-perm = cfg.get("permanent_ports", {})
-tcp = perm.get("tcp", [])
-udp = perm.get("udp", [])
-sctp = perm.get("sctp", [])
-if not tcp and not udp and not sctp:
-    print("  (none)")
-else:
-    for p in sorted(tcp): print(f"  TCP  {p}")
-    for p in sorted(udp): print(f"  UDP  {p}")
-    for p in sorted(sctp): print(f"  SCTP {p}")
-'
+            run_admin_config permanent list
             ;;
         add)
-            local proto="${1:-}"
-            local port="${2:-}"
-            local label="${3:-config}"
-            [[ -n "$proto" && -n "$port" ]] || {
-                echo "Usage: axdp permanent add tcp|udp|sctp PORT [LABEL]" >&2; exit 1
-            }
-            [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "sctp" ]] || {
-                echo "proto must be tcp, udp, or sctp" >&2; exit 1
-            }
             [[ -f "$TOML_CONFIG" ]] || run_config init
-            mutate_toml_json "$proto" "$port" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-proto, port = sys.argv[1], int(sys.argv[2])
-perm = data.setdefault("permanent_ports", {"tcp": [], "udp": [], "sctp": []})
-lst = perm.setdefault(proto, [])
-if port not in lst:
-    lst.append(port)
-    lst.sort()
-print(json.dumps(data))
-PY
-            echo "Added permanent: $proto/$port"
+            run_admin_config permanent add "$@"
             reload_daemon
             ;;
         del)
-            local proto="${1:-}"
-            local port="${2:-}"
-            [[ -n "$proto" && -n "$port" ]] || {
-                echo "Usage: axdp permanent del tcp|udp|sctp PORT" >&2; exit 1
-            }
-            [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "sctp" ]] || {
-                echo "proto must be tcp, udp, or sctp" >&2; exit 1
-            }
-            mutate_toml_json "$proto" "$port" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-proto, port = sys.argv[1], int(sys.argv[2])
-perm = data.setdefault("permanent_ports", {"tcp": [], "udp": [], "sctp": []})
-perm[proto] = [p for p in perm.get(proto, []) if p != port]
-print(json.dumps(data))
-PY
-            echo "Removed permanent: $proto/$port"
+            run_admin_config permanent del "$@"
             reload_daemon
             ;;
         -h|--help)
@@ -1693,216 +1374,13 @@ PY
 }
 
 run_slot() {
-    local sub="${1:-list}"; shift || true
-    local HANDLERS_DIR="${INSTALL_DIR}/handlers"
-    local SLOT_PIN_DIR="${BPF_PIN_DIR}/handlers"
+    local sub="${1:-list}"
+    shift || true
 
     case "$sub" in
-        list)
-            if [[ ! -e "${BPF_PIN_DIR}/proto_handlers" ]]; then
-                echo "XDP not loaded (proto_handlers map not found)."
-                exit 1
-            fi
-
-            echo "Loaded handlers:"
-            local found=0
-            for pin in "${SLOT_PIN_DIR}"/proto_*; do
-                [[ -e "$pin" ]] || continue
-                local proto="${pin##*/proto_}"
-                local name
-                name=$(bpftool prog show pinned "$pin" 2>/dev/null \
-                    | grep -oP 'name \K\S+' || echo "custom")
-                printf "  proto %-5s %s\n" "$proto" "$name"
-                found=1
-            done
-            [[ $found -eq 1 ]] || echo "  (none)"
-
-            echo ""
-            echo "Available handlers:"
-            local -A BUILTIN=([gre]="47  ${HANDLERS_DIR}/gre_handler.o"
-                              [esp]="50  ${HANDLERS_DIR}/esp_handler.o"
-                              [sctp]="132 ${HANDLERS_DIR}/sctp_handler.o")
-            for name in gre esp sctp; do
-                local info="${BUILTIN[$name]}"
-                local proto="${info%% *}"
-                local obj="${info#* }"
-                obj="${obj# }"
-                if [[ -f "$obj" ]]; then
-                    local pin="${SLOT_PIN_DIR}/proto_${proto}"
-                    if [[ -e "$pin" ]]; then
-                        printf "  %-6s (proto %s)  [loaded]\n" "$name" "$proto"
-                    else
-                        printf "  %-6s (proto %s)\n" "$name" "$proto"
-                    fi
-                else
-                    printf "  %-6s (proto %s)  [.o not found: %s]\n" "$name" "$proto" "$obj"
-                fi
-            done
-            for obj in "${HANDLERS_DIR}"/*.o; do
-                [[ -f "$obj" ]] || continue
-                local base="${obj##*/}"
-                case "$base" in gre_handler.o|esp_handler.o|sctp_handler.o) continue ;; esac
-                printf "  custom  %s\n" "$obj"
-            done
+        list|load|unload)
+            run_admin_config slot "$sub" "$@"
             ;;
-
-        load)
-            local name_or_proto="${1:-}"
-            local custom_path="${2:-}"
-            [[ -n "$name_or_proto" ]] || {
-                echo "Usage: axdp slot load NAME|PROTO [PATH]" >&2; exit 1
-            }
-
-            local proto obj_path builtin_name=""
-            case "$name_or_proto" in
-                gre)  proto=47;  obj_path="${HANDLERS_DIR}/gre_handler.o";  builtin_name="gre"  ;;
-                esp)  proto=50;  obj_path="${HANDLERS_DIR}/esp_handler.o";  builtin_name="esp"  ;;
-                sctp) proto=132; obj_path="${HANDLERS_DIR}/sctp_handler.o"; builtin_name="sctp" ;;
-                *[0-9]*)
-                    proto="$name_or_proto"
-                    obj_path="$custom_path"
-                    [[ -n "$obj_path" ]] || {
-                        echo "Custom handler requires a .o path: axdp slot load PROTO /path/to/handler.o" >&2
-                        exit 1
-                    }
-                    ;;
-                *)
-                    echo "Unknown handler: $name_or_proto (built-in: gre, esp, sctp)" >&2
-                    exit 1
-                    ;;
-            esac
-
-            [[ -f "$obj_path" ]] || {
-                echo "Handler object not found: $obj_path" >&2; exit 1
-            }
-            [[ -e "${BPF_PIN_DIR}/slot_ctx_map" ]] || {
-                echo "XDP not loaded (slot_ctx_map not found). Run setup first." >&2; exit 1
-            }
-
-            mkdir -p "$SLOT_PIN_DIR"
-            local pin_path="${SLOT_PIN_DIR}/proto_${proto}"
-            local -a load_args=(
-                map name slot_ctx_map pinned "${BPF_PIN_DIR}/slot_ctx_map"
-            )
-
-            if [[ "$proto" == "132" && "$obj_path" == "${HANDLERS_DIR}/sctp_handler.o" ]]; then
-                [[ -e "${BPF_PIN_DIR}/sctp_whitelist" ]] || {
-                    echo "XDP not loaded completely (sctp_whitelist map not found)." >&2
-                    exit 1
-                }
-                [[ -e "${BPF_PIN_DIR}/sctp_conntrack" ]] || {
-                    echo "XDP not loaded completely (sctp_conntrack map not found)." >&2
-                    exit 1
-                }
-                load_args+=(
-                    map name sctp_whitelist pinned "${BPF_PIN_DIR}/sctp_whitelist"
-                    map name sctp_conntrack pinned "${BPF_PIN_DIR}/sctp_conntrack"
-                )
-            fi
-
-            # Reuse the pinned maps so the handler shares runtime state with the main program.
-            bpftool prog load "$obj_path" "$pin_path" type xdp \
-                "${load_args[@]}" || {
-                echo "Failed to load $obj_path" >&2; exit 1
-            }
-
-            # Register in proto_handlers prog_array.
-            local k
-            k=$(printf '%d 0 0 0' "$proto")
-            bpftool map update pinned "${BPF_PIN_DIR}/proto_handlers" \
-                key $k value pinned "$pin_path" || {
-                echo "Failed to register handler for proto $proto" >&2
-                rm -f "$pin_path"
-                exit 1
-            }
-
-            echo "Loaded handler for proto $proto from $obj_path"
-
-            # Persist to TOML config.
-            [[ -f "$TOML_CONFIG" ]] || run_config init
-            if [[ -n "$builtin_name" ]]; then
-                mutate_toml_json "$builtin_name" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-name = sys.argv[1]
-slots = data.setdefault("slots", {})
-enabled = slots.setdefault("enabled", [])
-if name not in enabled:
-    enabled.append(name)
-print(json.dumps(data))
-PY
-            else
-                mutate_toml_json "$proto" "$obj_path" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-proto, path = int(sys.argv[1]), sys.argv[2]
-slots = data.setdefault("slots", {})
-enabled = slots.setdefault("enabled", [])
-enabled = [e for e in enabled if not (isinstance(e, dict) and e.get("proto") == proto)]
-enabled.append({"proto": proto, "path": path})
-slots["enabled"] = enabled
-print(json.dumps(data))
-PY
-            fi
-            echo "  config: $TOML_CONFIG"
-            ;;
-
-        unload)
-            local name_or_proto="${1:-}"
-            [[ -n "$name_or_proto" ]] || {
-                echo "Usage: axdp slot unload NAME|PROTO" >&2; exit 1
-            }
-
-            local proto
-            if [[ "$name_or_proto" =~ ^[0-9]+$ ]]; then
-                proto="$name_or_proto"
-            else
-                proto=""
-                for pin in "${SLOT_PIN_DIR}"/proto_*; do
-                    [[ -e "$pin" ]] || continue
-                    local pname
-                    pname=$(bpftool prog show pinned "$pin" 2>/dev/null \
-                        | grep -oP 'name \K\S+' || true)
-                    if [[ "$pname" == "$name_or_proto" || "$pname" == *"_${name_or_proto}_"* || "$pname" == *"_${name_or_proto}" ]]; then
-                        proto="${pin##*/proto_}"
-                        break
-                    fi
-                done
-                [[ -n "$proto" ]] || {
-                    echo "No loaded handler matches: $name_or_proto" >&2; exit 1
-                }
-            fi
-
-            local k
-            k=$(printf '%d 0 0 0' "$proto")
-            bpftool map delete pinned "${BPF_PIN_DIR}/proto_handlers" \
-                key $k 2>/dev/null || true
-
-            rm -f "${SLOT_PIN_DIR}/proto_${proto}"
-            echo "Unloaded handler for proto $proto"
-
-            # Remove from TOML config if it exists.
-            if [[ -f "$TOML_CONFIG" ]]; then
-                mutate_toml_json "$proto" <<'PY' | json_to_toml
-import sys, json
-data = json.load(sys.stdin)
-proto = int(sys.argv[1])
-BUILTIN = {47: "gre", 50: "esp", 132: "sctp"}
-builtin_name = BUILTIN.get(proto)
-slots = data.setdefault("slots", {})
-enabled = slots.get("enabled", [])
-new_enabled = [
-    e for e in enabled
-    if not (isinstance(e, str) and e == builtin_name)
-    and not (isinstance(e, dict) and e.get("proto") == proto)
-]
-slots["enabled"] = new_enabled
-print(json.dumps(data))
-PY
-                echo "  config: $TOML_CONFIG"
-            fi
-            ;;
-
         *)
             echo "Usage: axdp slot list|load NAME|PROTO [PATH]|unload NAME|PROTO" >&2
             exit 1

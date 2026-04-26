@@ -287,6 +287,69 @@ EOF_BPF
     assert_contains "$output" "Conntrack : tcp=2 udp=1"
 )
 
+test_run_backend_json_reports_runtime_state_and_conntrack_counts() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    BPF_PIN_DIR="$tmpdir/bpf"
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
+    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
+    printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
+    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_conntrack" "$BPF_PIN_DIR/udp_conntrack"
+    cat >"$CONFIG_FILE" <<'EOF_CFG'
+IFACES="eth9"
+PREFERRED_BACKEND="auto"
+EOF_CFG
+
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+printf '%s\n' '2: eth9: <BROADCAST> mtu 1500 xdp'
+EOF_IP
+    cat >"$tmpdir/bin/tc" <<'EOF_TC'
+#!/bin/sh
+if [ "$1" = "filter" ]; then
+  printf '%s\n' 'filter protocol all pref 49152 bpf chain 0'
+fi
+EOF_TC
+    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
+#!/bin/sh
+case "\$*" in
+  *"tcp_conntrack"*)
+    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
+    ;;
+  *"udp_conntrack"*)
+    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
+    ;;
+  *)
+    printf '%s\n' '[]'
+    ;;
+esac
+EOF_BPF
+    chmod +x "$tmpdir/bin/ip" "$tmpdir/bin/tc" "$tmpdir/bin/bpftool"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+
+    local output
+    output=$(run_backend --json) || return 1
+    python3 - "$output" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+assert data["backend"] == "xdp"
+assert data["preferred_backend"] == "auto"
+assert data["interfaces"] == ["eth9"]
+assert data["xdp_mode"] == "native"
+assert data["xdp_attach"] == {"eth9": "native"}
+assert data["tc_egress"] == {"eth9": "attached"}
+assert data["conntrack"] == {"tcp": 2, "udp": 1}
+PY
+)
+
 test_run_conntrack_summarizes_destination_ports() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -378,6 +441,7 @@ run_test "axdp detects active xdp backend from runtime state" test_detect_backen
 run_test "axdp detects nftables fallback backend" test_detect_backend_falls_back_to_nftables
 run_test "axdp reports when no backend is active" test_detect_backend_reports_missing_state
 run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
+run_test "axdp backend json reports runtime attach state and conntrack counts" test_run_backend_json_reports_runtime_state_and_conntrack_counts
 run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
 run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
 run_test "axdp slot load sctp reuses shared SCTP maps" test_slot_load_sctp_reuses_shared_maps
