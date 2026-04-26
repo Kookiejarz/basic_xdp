@@ -36,6 +36,8 @@ Commands:
   stats [args...]        Show Auto XDP statistics
   watch [args...]        Shorthand for: stats --watch
   ports [args...]        Show currently allowed TCP/UDP ports
+  backend                Show active backend and runtime attachment state
+  conntrack [args...]    Show TCP/UDP conntrack visibility
   sync [args...]         Run one sync pass with automatic backend selection
   check-update [args...] Compare installed files against GitHub and update
   log-level [LVL]        Show or change daemon log level
@@ -69,6 +71,10 @@ Stats options:
 Ports options:
   --watch              Refresh continuously and detect changes
   --interval SEC       Refresh interval in seconds (default: 2)
+
+Conntrack options:
+  tcp|udp|all         Select conntrack map view (default: all)
+  --limit N           Show top N destination ports per map (default: 10)
 
 Check-update options:
   --force              Apply all updates without prompting
@@ -279,6 +285,224 @@ detect_backend() {
 
     echo "No active Auto XDP backend detected." >&2
     exit 1
+}
+
+configured_ifaces() {
+    if [[ -n "${IFACES:-}" ]]; then
+        printf '%s\n' "$IFACES"
+        return 0
+    fi
+    if [[ -n "${IFACE:-}" ]]; then
+        printf '%s\n' "$IFACE"
+        return 0
+    fi
+    return 1
+}
+
+iface_xdp_state() {
+    local iface="$1"
+    local info=""
+    info=$(ip -d link show dev "$iface" 2>/dev/null || true)
+    [[ -n "$info" ]] || {
+        printf 'missing'
+        return 0
+    }
+    if grep -q 'xdpgeneric' <<<"$info"; then
+        printf 'generic'
+        return 0
+    fi
+    if grep -Eq 'xdp|xdpoffload' <<<"$info"; then
+        printf 'native'
+        return 0
+    fi
+    printf 'off'
+}
+
+iface_tc_egress_state() {
+    local iface="$1"
+    command -v tc >/dev/null 2>&1 || {
+        printf 'unavailable'
+        return 0
+    }
+    if tc filter show dev "$iface" egress pref 49152 2>/dev/null | grep -q .; then
+        printf 'attached'
+        return 0
+    fi
+    printf 'off'
+}
+
+conntrack_entry_count() {
+    local map_path="$1"
+    if [[ ! -e "$map_path" ]] || ! command -v bpftool >/dev/null 2>&1; then
+        printf '0'
+        return 0
+    fi
+    { bpftool -j map dump pinned "$map_path" 2>/dev/null || printf '[]\n'; } | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+print(len(rows) if isinstance(rows, list) else 0)
+'
+}
+
+summarize_conntrack_map() {
+    local map_path="$1"
+    local limit="${2:-10}"
+    local script
+    if [[ ! -e "$map_path" ]] || ! command -v bpftool >/dev/null 2>&1; then
+        echo "TOTAL|0"
+        return 0
+    fi
+    script=$(cat <<'PY'
+import json
+import sys
+
+limit = int(sys.argv[1])
+
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+
+if not isinstance(rows, list):
+    rows = []
+
+stats = {}
+
+for row in rows:
+    key = row.get("key", [])
+    if not isinstance(key, list) or len(key) < 8:
+        continue
+    try:
+        family = int(key[0], 0) if isinstance(key[0], str) else int(key[0])
+        dport = ((int(key[6], 0) if isinstance(key[6], str) else int(key[6])) << 8) | (
+            int(key[7], 0) if isinstance(key[7], str) else int(key[7])
+        )
+    except Exception:
+        continue
+    entry = stats.setdefault(dport, {"total": 0, "v4": 0, "v6": 0})
+    entry["total"] += 1
+    if family == 2:
+        entry["v4"] += 1
+    elif family == 10:
+        entry["v6"] += 1
+
+print(f"TOTAL|{len(rows)}")
+for dport, entry in sorted(stats.items(), key=lambda item: (-item[1]["total"], item[0]))[:limit]:
+    print(f"PORT|{dport}|{entry['total']}|{entry['v4']}|{entry['v6']}")
+PY
+)
+    { bpftool -j map dump pinned "$map_path" 2>/dev/null || printf '[]\n'; } | python3 -c "$script" "$limit"
+}
+
+render_conntrack_summary() {
+    local label="$1"
+    local map_path="$2"
+    local limit="${3:-10}"
+    local line total=0 dport count v4 v6
+
+    printf '%s conntrack:\n' "$label"
+    while IFS='|' read -r kind a b c d; do
+        case "$kind" in
+            TOTAL)
+                total="$a"
+                ;;
+            PORT)
+                dport="$a"
+                count="$b"
+                v4="$c"
+                v6="$d"
+                printf '  dport %-5s total=%-4s ipv4=%-4s ipv6=%s\n' "$dport" "$count" "$v4" "$v6"
+                ;;
+        esac
+    done < <(summarize_conntrack_map "$map_path" "$limit")
+
+    if [[ "$total" == "0" ]]; then
+        printf '  (none)\n'
+    fi
+    printf '  total=%s\n' "$total"
+}
+
+run_backend() {
+    local iface_list xdp_mode tcp_ct udp_ct first_iface xdp_states=() tc_states=() iface state
+
+    load_config
+    iface_list=$(configured_ifaces || true)
+    if [[ -z "$iface_list" ]]; then
+        autodetect_iface
+        iface_list="$IFACE"
+    else
+        first_iface="${iface_list%% *}"
+        IFACE="${IFACE:-$first_iface}"
+    fi
+
+    detect_backend
+
+    xdp_mode="-"
+    [[ -f "${RUN_STATE_DIR}/xdp_mode" ]] && xdp_mode=$(<"${RUN_STATE_DIR}/xdp_mode")
+    tcp_ct=$(conntrack_entry_count "${BPF_PIN_DIR}/tcp_conntrack")
+    udp_ct=$(conntrack_entry_count "${BPF_PIN_DIR}/udp_conntrack")
+
+    for iface in $iface_list; do
+        state=$(iface_xdp_state "$iface")
+        xdp_states+=("${iface}=${state}")
+        state=$(iface_tc_egress_state "$iface")
+        tc_states+=("${iface}=${state}")
+    done
+
+    printf 'Backend   : %s\n' "$BACKEND"
+    printf 'Preferred : %s\n' "${PREFERRED_BACKEND:-auto}"
+    printf 'Interfaces: %s\n' "$iface_list"
+    printf 'XDP mode  : %s\n' "$xdp_mode"
+    printf 'XDP attach: %s\n' "${xdp_states[*]:--}"
+    printf 'tc egress : %s\n' "${tc_states[*]:--}"
+    printf 'Conntrack : tcp=%s udp=%s\n' "$tcp_ct" "$udp_ct"
+}
+
+run_conntrack() {
+    local target="all"
+    local limit=10
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            tcp|udp|all)
+                target="$1"
+                shift
+                ;;
+            --limit)
+                [[ $# -ge 2 ]] || {
+                    echo "Missing value for --limit" >&2
+                    exit 1
+                }
+                limit="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown conntrack option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$target" in
+        tcp)
+            render_conntrack_summary "TCP" "${BPF_PIN_DIR}/tcp_conntrack" "$limit"
+            ;;
+        udp)
+            render_conntrack_summary "UDP" "${BPF_PIN_DIR}/udp_conntrack" "$limit"
+            ;;
+        all)
+            render_conntrack_summary "TCP" "${BPF_PIN_DIR}/tcp_conntrack" "$limit"
+            echo ""
+            render_conntrack_summary "UDP" "${BPF_PIN_DIR}/udp_conntrack" "$limit"
+            ;;
+    esac
 }
 
 human_bytes() {
@@ -1701,6 +1925,14 @@ main() {
         ports)
             shift || true
             run_ports "$@"
+            ;;
+        backend)
+            shift || true
+            run_backend "$@"
+            ;;
+        conntrack)
+            shift || true
+            run_conntrack "$@"
             ;;
         sync)
             shift || true

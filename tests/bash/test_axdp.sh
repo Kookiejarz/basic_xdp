@@ -222,6 +222,100 @@ test_detect_backend_reports_missing_state() (
     assert_contains "$output" "No active Auto XDP backend detected."
 )
 
+test_run_backend_reports_runtime_state_and_conntrack_counts() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    RUN_STATE_DIR="$tmpdir/run"
+    BPF_PIN_DIR="$tmpdir/bpf"
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    mkdir -p "$RUN_STATE_DIR" "$BPF_PIN_DIR" "$tmpdir/bin"
+    printf 'xdp\n' > "$RUN_STATE_DIR/backend"
+    printf 'native\n' > "$RUN_STATE_DIR/xdp_mode"
+    touch "$BPF_PIN_DIR/pkt_counters" "$BPF_PIN_DIR/tcp_conntrack" "$BPF_PIN_DIR/udp_conntrack"
+    cat >"$CONFIG_FILE" <<'EOF_CFG'
+IFACES="eth9"
+PREFERRED_BACKEND="auto"
+EOF_CFG
+
+    cat >"$tmpdir/bin/ip" <<'EOF_IP'
+#!/bin/sh
+printf '%s\n' '2: eth9: <BROADCAST> mtu 1500 xdp'
+EOF_IP
+    cat >"$tmpdir/bin/tc" <<'EOF_TC'
+#!/bin/sh
+if [ "$1" = "filter" ]; then
+  printf '%s\n' 'filter protocol all pref 49152 bpf chain 0'
+fi
+EOF_TC
+    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
+#!/bin/sh
+case "\$*" in
+  *"tcp_conntrack"*)
+    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[2,0,0,0,0,81,1,187]}]'
+    ;;
+  *"udp_conntrack"*)
+    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
+    ;;
+  *)
+    printf '%s\n' '[]'
+    ;;
+esac
+EOF_BPF
+    chmod +x "$tmpdir/bin/ip" "$tmpdir/bin/tc" "$tmpdir/bin/bpftool"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    IFACE=""
+    BACKEND=""
+
+    local output
+    output=$(run_backend) || return 1
+    assert_contains "$output" "Backend   : xdp" || return 1
+    assert_contains "$output" "XDP mode  : native" || return 1
+    assert_contains "$output" "XDP attach: eth9=native" || return 1
+    assert_contains "$output" "tc egress : eth9=attached" || return 1
+    assert_contains "$output" "Conntrack : tcp=2 udp=1"
+)
+
+test_run_conntrack_summarizes_destination_ports() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
+    touch "$BPF_PIN_DIR/tcp_conntrack" "$BPF_PIN_DIR/udp_conntrack"
+
+    cat >"$tmpdir/bin/bpftool" <<EOF_BPF
+#!/bin/sh
+case "\$*" in
+  *"tcp_conntrack"*)
+    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[10,0,0,0,0,81,0,22]},{"key":[2,0,0,0,0,82,1,187]}]'
+    ;;
+  *"udp_conntrack"*)
+    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
+    ;;
+  *)
+    printf '%s\n' '[]'
+    ;;
+esac
+EOF_BPF
+    chmod +x "$tmpdir/bin/bpftool"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+
+    local output
+    output=$(run_conntrack tcp --limit 2) || return 1
+    assert_contains "$output" "TCP conntrack:" || return 1
+    assert_contains "$output" "dport 22" || return 1
+    assert_contains "$output" "ipv4=1" || return 1
+    assert_contains "$output" "ipv6=1" || return 1
+    assert_contains "$output" "total=3"
+)
+
 test_cli_help_runs_without_runtime_state() (
     local output
     output=$(bash "$REPO_ROOT/axdp" help)
@@ -236,6 +330,7 @@ test_slot_load_sctp_reuses_shared_maps() (
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir/bpf"
     INSTALL_DIR="$tmpdir/install"
+    TOML_CONFIG="$tmpdir/config.toml"
     mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
     touch \
         "$BPF_PIN_DIR/slot_ctx_map" \
@@ -243,6 +338,10 @@ test_slot_load_sctp_reuses_shared_maps() (
         "$BPF_PIN_DIR/sctp_conntrack" \
         "$BPF_PIN_DIR/proto_handlers" \
         "$INSTALL_DIR/handlers/sctp_handler.o"
+    cat >"$TOML_CONFIG" <<'EOF_CFG'
+[slots]
+enabled = []
+EOF_CFG
 
     cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
 #!/bin/sh
@@ -270,6 +369,8 @@ run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_p
 run_test "axdp detects active xdp backend from runtime state" test_detect_backend_prefers_xdp_runtime_state
 run_test "axdp detects nftables fallback backend" test_detect_backend_falls_back_to_nftables
 run_test "axdp reports when no backend is active" test_detect_backend_reports_missing_state
+run_test "axdp backend reports runtime attach state and conntrack counts" test_run_backend_reports_runtime_state_and_conntrack_counts
+run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
 run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
 run_test "axdp slot load sctp reuses shared SCTP maps" test_slot_load_sctp_reuses_shared_maps
 

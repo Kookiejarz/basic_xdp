@@ -211,6 +211,40 @@ test_fetch_local_or_remote_uses_local_copy_without_network() (
     assert_file_contains "$dst" "local copy"
 )
 
+test_bpf_header_exists_checks_multiple_include_roots() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir/inc-a/linux" "$tmpdir/inc-b/bpf"
+    : >"$tmpdir/inc-a/linux/bpf.h"
+    : >"$tmpdir/inc-b/bpf/bpf_helpers.h"
+
+    bpf_header_exists "linux/bpf.h" "$tmpdir/inc-b" "$tmpdir/inc-a" || return 1
+    bpf_header_exists "bpf/bpf_helpers.h" "$tmpdir/inc-a" "$tmpdir/inc-b" || return 1
+
+    bpf_header_exists "linux/missing.h" "$tmpdir/inc-a" "$tmpdir/inc-b" >/dev/null 2>&1
+    local status=$?
+    assert_eq "$status" "1"
+)
+
+test_warn_from_log_file_prefixes_and_truncates_output() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir log output
+    tmpdir=$(mktemp -d)
+    log="$tmpdir/handler.log"
+    printf 'line one\nline two\nline three\n' >"$log"
+
+    output=$(warn_from_log_file "$log" "handler build: " 2)
+
+    assert_contains "$output" "handler build: line one" || return 1
+    assert_contains "$output" "handler build: line two" || return 1
+    assert_contains "$output" "handler build: (additional output truncated)"
+)
+
 test_xdp_maps_ready_requires_all_expected_pins() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -285,6 +319,8 @@ run_test "setup_xdp package lists cover supported managers" test_package_lists_c
 run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci_fields
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
+run_test "setup_xdp detects required BPF headers across include roots" test_bpf_header_exists_checks_multiple_include_roots
+run_test "setup_xdp surfaces truncated handler build logs" test_warn_from_log_file_prefixes_and_truncates_output
 run_test "setup_xdp validates pinned map set completeness" test_xdp_maps_ready_requires_all_expected_pins
 run_test "setup_xdp reuses SCTP conntrack map for tc egress" test_load_tc_egress_program_reuses_sctp_conntrack_map
 

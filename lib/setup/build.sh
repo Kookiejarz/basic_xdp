@@ -107,6 +107,38 @@ resolve_bpf_build_env() {
     resolve_bpf_asm_include
 }
 
+bpf_header_exists() {
+    local header="$1"
+    shift || true
+
+    local include_root
+    for include_root in "$@"; do
+        [[ -n "$include_root" ]] || continue
+        [[ -f "${include_root}/${header}" ]] && return 0
+    done
+
+    return 1
+}
+
+warn_from_log_file() {
+    local log_path="$1"
+    local prefix="${2:-}"
+    local max_lines="${3:-8}"
+    local count=0
+    local line
+
+    [[ -s "$log_path" ]] || return 0
+
+    while IFS= read -r line; do
+        warn "${prefix}${line}"
+        count=$((count + 1))
+        if [[ $count -ge $max_lines ]]; then
+            warn "${prefix}(additional output truncated)"
+            break
+        fi
+    done <"$log_path"
+}
+
 compile_xdp_program() {
     if ! command -v clang &>/dev/null || ! command -v bpftool &>/dev/null; then
         warn "clang or bpftool missing; XDP backend will be skipped."
@@ -153,17 +185,27 @@ compile_xdp_program() {
     ok "Compiled -> $TC_OBJ"
 
     if [[ -d "handlers" ]] && command -v make &>/dev/null; then
-        info "Compiling slot handlers..."
-        if make -C handlers --no-print-directory \
-                CLANG="clang" \
-                ASM_INC="$ASM_INC" \
-                ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}" \
-                2>/dev/null; then
-            mkdir -p "${INSTALL_DIR}/handlers"
-            cp handlers/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
-            ok "Slot handlers compiled and installed"
+        if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
+            warn "Slot handlers skipped: missing linux/bpf.h in /usr/include or ${ASM_INC}"
+        elif ! bpf_header_exists "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
+            warn "Slot handlers skipped: missing bpf/bpf_helpers.h in /usr/include or /usr/local/include"
         else
-            warn "Slot handler compilation failed; handlers will be unavailable"
+            local handler_log
+            handler_log=$(mktemp)
+            info "Compiling slot handlers..."
+            if make -C handlers --no-print-directory \
+                    CLANG="clang" \
+                    ASM_INC="$ASM_INC" \
+                    ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}" \
+                    >"$handler_log" 2>&1; then
+                mkdir -p "${INSTALL_DIR}/handlers"
+                cp handlers/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
+                ok "Slot handlers compiled and installed"
+            else
+                warn "Slot handler compilation failed; handlers will be unavailable"
+                warn_from_log_file "$handler_log" "handler build: "
+            fi
+            rm -f "$handler_log"
         fi
     fi
     return 0
