@@ -108,17 +108,20 @@ ensure_xdp_loaded() {
     load_tc_egress_program || true
     load_slot_handlers || true
 
-    local _iface _attached=0 _xdp_mode="native"
+    local _iface _attached=0 _xdp_mode="native" _native_err _generic_err
     for _iface in "${_IFACES[@]}"; do
-        if ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+        ethtool -K "$_iface" lro off 2>/dev/null || true
+        if _native_err=$(ip link set dev "$_iface" xdp pinned "$BPF_PIN_DIR/prog" 2>&1); then
             echo "[auto_xdp] attached XDP (native) on $_iface" >&2
             _attached=$((_attached + 1))
-        elif ip link set dev "$_iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>/dev/null; then
+        elif _generic_err=$(ip link set dev "$_iface" xdp generic pinned "$BPF_PIN_DIR/prog" 2>&1); then
             echo "[auto_xdp] attached XDP (generic) on $_iface" >&2
             _xdp_mode="generic"
             _attached=$((_attached + 1))
         else
             echo "[auto_xdp] warning: could not attach XDP to $_iface; skipping" >&2
+            [[ -n "$_native_err" ]] && echo "[auto_xdp]   ↳ native:  $_native_err" >&2
+            [[ -n "$_generic_err" ]] && echo "[auto_xdp]   ↳ generic: $_generic_err" >&2
         fi
     done
 
