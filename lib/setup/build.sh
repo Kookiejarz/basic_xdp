@@ -30,6 +30,7 @@ bootstrap_bpf_helper_step() {
 compile_bpf_object() {
     local src_path="$1"
     local obj_path="$2"
+    local include_root="${3:-.}"
 
     if ! clang -O3 -g \
         -target bpf \
@@ -41,8 +42,8 @@ compile_bpf_object() {
         -I/usr/include \
         -I"$ASM_INC" \
         -I/usr/include/bpf \
-        -Ibpf/include \
-        -I. \
+        -I"${include_root}/bpf/include" \
+        -I"$include_root" \
         -c "$src_path" -o "$obj_path"; then
         return 1
     fi
@@ -152,6 +153,27 @@ warn_from_log_file() {
     done <"$log_path"
 }
 
+ensure_build_staging_dir() {
+    if [[ -n "${BUILD_STAGING_DIR:-}" && -d "$BUILD_STAGING_DIR" ]]; then
+        return 0
+    fi
+
+    BUILD_STAGING_DIR=$(mktemp -d)
+    return 0
+}
+
+stage_build_source() {
+    local local_path="$1"
+    local remote_name="$2"
+    local relative_target="$3"
+    local target_path=""
+
+    ensure_build_staging_dir || return 1
+    target_path="${BUILD_STAGING_DIR}/${relative_target}"
+    mkdir -p "$(dirname "$target_path")"
+    fetch_local_or_remote "$local_path" "$remote_name" "$target_path"
+}
+
 prepare_slot_handler_sources() {
     local _handler_artifacts=(
         "handlers/Makefile"
@@ -163,9 +185,8 @@ prepare_slot_handler_sources() {
     local _handler_file=""
     local _missing=()
 
-    mkdir -p handlers
     for _handler_file in "${_handler_artifacts[@]}"; do
-        if ! fetch_local_or_remote "${_handler_file}" "${_handler_file}" "${_handler_file}"; then
+        if ! stage_build_source "${_handler_file}" "${_handler_file}" "${_handler_file}"; then
             _missing+=("${_handler_file}")
         fi
     done
@@ -175,7 +196,7 @@ prepare_slot_handler_sources() {
         return 1
     fi
 
-    if [[ ! -f "handlers/Makefile" ]]; then
+    if [[ ! -f "${BUILD_STAGING_DIR}/handlers/Makefile" ]]; then
         warn "Slot handlers skipped: handlers/Makefile not found"
         return 1
     fi
@@ -184,20 +205,25 @@ prepare_slot_handler_sources() {
 }
 
 compile_xdp_program() {
+    local _source_root=""
+    local _handlers_dir=""
+
     if ! command -v clang &>/dev/null || ! command -v bpftool &>/dev/null; then
         warn "clang or bpftool missing; XDP backend will be skipped."
         return 1
     fi
 
-    if ! fetch_local_or_remote "$XDP_SRC" "$XDP_SRC" "$XDP_SRC"; then
+    if ! stage_build_source "$XDP_SRC" "$XDP_SRC" "$XDP_SRC"; then
         warn "Unable to fetch ${XDP_SRC}; XDP backend will be skipped."
         return 1
     fi
+    _source_root="$BUILD_STAGING_DIR"
+    _handlers_dir="${_source_root}/handlers"
 
     local _bpf_headers=(common.h keys.h maps.h trust_acl.h rate_limit.h conntrack.h parse.h slots.h)
     local _hdr
     for _hdr in "${_bpf_headers[@]}"; do
-        fetch_local_or_remote "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
+        stage_build_source "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
     done
     local _handlers_ready=0
     if prepare_slot_handler_sources; then
@@ -209,7 +235,7 @@ compile_xdp_program() {
         return 1
     fi
 
-    if ! compile_bpf_object "$XDP_SRC" "$XDP_OBJ"; then
+    if ! compile_bpf_object "${_source_root}/${XDP_SRC}" "$XDP_OBJ" "$_source_root"; then
         warn "Failed to compile ${XDP_SRC}; XDP backend will be skipped."
         return 1
     fi
@@ -217,17 +243,17 @@ compile_xdp_program() {
     mkdir -p "$INSTALL_DIR"
     cp "$XDP_OBJ" "$XDP_OBJ_INSTALLED"
 
-    if ! fetch_local_or_remote "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
+    if ! stage_build_source "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
         warn "Unable to fetch ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
         return 0
     fi
-    if ! compile_bpf_object "$TC_SRC" "$TC_OBJ"; then
+    if ! compile_bpf_object "${_source_root}/${TC_SRC}" "$TC_OBJ" "$_source_root"; then
         warn "Failed to compile ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
         return 0
     fi
     cp "$TC_OBJ" "$TC_OBJ_INSTALLED"
 
-    if [[ $_handlers_ready -eq 1 && -d "handlers" ]] && command -v make &>/dev/null; then
+    if [[ $_handlers_ready -eq 1 && -d "$_handlers_dir" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
             warn "Slot handlers skipped: missing linux/bpf.h in /usr/include or ${ASM_INC}"
         elif ! bpf_header_exists "bpf/bpf_helpers.h" "/usr/include" "/usr/local/include"; then
@@ -235,13 +261,13 @@ compile_xdp_program() {
         else
             local handler_log
             handler_log=$(mktemp)
-            if make -C handlers -f Makefile --no-print-directory \
+            if make -C "$_handlers_dir" -f Makefile --no-print-directory \
                     CLANG="clang" \
                     ASM_INC="$ASM_INC" \
                     ARCH_FLAGS="-D__TARGET_ARCH_${TARGET_ARCH} ${HOST_ARCH_FLAG}" \
                     >"$handler_log" 2>&1; then
                 mkdir -p "${INSTALL_DIR}/handlers"
-                cp handlers/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
+                cp "${_handlers_dir}"/*.o "${INSTALL_DIR}/handlers/" 2>/dev/null || true
             else
                 warn "Slot handler compilation failed; handlers will be unavailable"
                 warn_from_log_file "$handler_log" "handler build: "
@@ -282,6 +308,11 @@ cleanup_build_artifacts_step() {
 
     if [[ -n "$BPF_HELPER_BOOTSTRAP" && "$BPF_HELPER_BOOTSTRAP" != "$BPF_HELPER_SRC" && -f "$BPF_HELPER_BOOTSTRAP" ]]; then
         rm -f "$BPF_HELPER_BOOTSTRAP" && _cleaned+=("$BPF_HELPER_BOOTSTRAP")
+    fi
+
+    if [[ -n "${BUILD_STAGING_DIR:-}" && -d "$BUILD_STAGING_DIR" ]]; then
+        rm -rf "$BUILD_STAGING_DIR" && _cleaned+=("$BUILD_STAGING_DIR")
+        BUILD_STAGING_DIR=""
     fi
 
     if [[ ${#_cleaned[@]} -gt 0 ]]; then

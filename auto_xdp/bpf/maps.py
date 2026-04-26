@@ -581,21 +581,16 @@ class BpfSynRatePortsMap:
     def __init__(self, path: str) -> None:
         self.path = path
         self.fd = obj_get(path)
+        self._max_entries: int = map_max_entries(self.fd)
         self._cache: dict[int, int] = {}
         self._key = ctypes.create_string_buffer(4)
-        self._next_key = ctypes.create_string_buffer(4)
         self._val = ctypes.create_string_buffer(8)
         self._update_attr = ctypes.create_string_buffer(128)
-        self._lookup_attr = ctypes.create_string_buffer(128)
         self._delete_attr = ctypes.create_string_buffer(128)
-        self._next_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-        next_k_ptr = ctypes.cast(self._next_key, ctypes.c_void_p).value or 0
         v_ptr = ctypes.cast(self._val, ctypes.c_void_p).value or 0
         struct.pack_into("=I4xQQQ", self._update_attr, 0, self.fd, k_ptr, v_ptr, 0)
-        struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
         struct.pack_into("=I4xQ", self._delete_attr, 0, self.fd, k_ptr)
-        struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, 0, next_k_ptr)
         self._load_cache()
 
     def close(self) -> None:
@@ -609,34 +604,30 @@ class BpfSynRatePortsMap:
         except Exception:
             pass
 
-    def _iter_raw_keys(self):
-        current_ptr = 0
-        while True:
-            struct.pack_into("=I4xQQ", self._next_attr, 0, self.fd, current_ptr, ctypes.cast(self._next_key, ctypes.c_void_p).value or 0)
-            try:
-                bpf(BPF_MAP_GET_NEXT_KEY, self._next_attr)
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    break
-                raise
-            key_raw = bytes(self._next_key.raw[:4])
-            yield key_raw
-            ctypes.memmove(self._key, key_raw, 4)
-            current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
-
     def _load_cache(self) -> None:
+        n = self._max_entries
+        keys_buf = ctypes.create_string_buffer(4 * n)
+        vals_buf = ctypes.create_string_buffer(8 * n)
+        out_batch = ctypes.create_string_buffer(4)
+        attr = ctypes.create_string_buffer(56)
+        struct.pack_into(
+            "=QQQQIIQQ", attr, 0,
+            0,
+            ctypes.cast(out_batch, ctypes.c_void_p).value or 0,
+            ctypes.cast(keys_buf, ctypes.c_void_p).value or 0,
+            ctypes.cast(vals_buf, ctypes.c_void_p).value or 0,
+            n, self.fd, 0, 0,
+        )
         try:
-            for key_raw in self._iter_raw_keys():
-                port = struct.unpack_from("=I", key_raw)[0]
-                ctypes.memmove(self._key, key_raw, 4)
-                try:
-                    bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                    rate_max = struct.unpack_from("=I", self._val)[0]
-                    self._cache[port] = rate_max
-                except OSError:
-                    continue
-        except OSError:
-            return
+            bpf(BPF_MAP_LOOKUP_BATCH, attr)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                return
+        fetched = struct.unpack_from("=I", attr, 32)[0]
+        for i in range(fetched):
+            port = struct.unpack_from("=I", keys_buf, i * 4)[0]
+            rate_max = struct.unpack_from("=I", vals_buf, i * 8)[0]
+            self._cache[port] = rate_max
 
     def active(self) -> dict[int, int]:
         return dict(self._cache)

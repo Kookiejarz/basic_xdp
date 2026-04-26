@@ -17,6 +17,52 @@ stop_existing_service() {
     pkill -f "xdp_port_sync.py" 2>/dev/null || true
 }
 
+existing_install_detected() {
+    local runtime_paths=(
+        "$CONFIG_FILE"
+        "$SYNC_SCRIPT"
+        "$AXDP_CMD"
+        "$RUNNER_SCRIPT"
+        "$BPF_RUNTIME_COMMON_INSTALLED"
+        "$BPF_HELPER_INSTALLED"
+        "$XDP_OBJ_INSTALLED"
+        "$TC_OBJ_INSTALLED"
+        "${INSTALL_DIR}/handlers"
+        "${CONFIG_DIR}/config.toml"
+    )
+    local path=""
+
+    for path in "${runtime_paths[@]}"; do
+        [[ -e "$path" ]] && return 0
+    done
+
+    case "$INIT_SYSTEM" in
+        systemd)
+            [[ -e "/etc/systemd/system/${SERVICE_NAME}.service" ]] && return 0
+            ;;
+        openrc)
+            [[ -e "/etc/init.d/${SERVICE_NAME}" ]] && return 0
+            ;;
+    esac
+
+    return 1
+}
+
+confirm_existing_install_step() {
+    if ! existing_install_detected; then
+        return 0
+    fi
+
+    step_begin "Checking existing installation"
+    if confirm_yes_no "Existing Auto XDP installation detected. Replace installed runtime files and restart the service? [y/N] " "abort"; then
+        step_ok "confirmed"
+        return 0
+    fi
+
+    step_warn "aborted"
+    die "Installation aborted; existing deployment left untouched."
+}
+
 stop_existing_service_step() {
     step_begin "Stopping existing service"
     stop_existing_service
@@ -115,6 +161,14 @@ install_axdp_command() {
     chmod +x "$AXDP_CMD"
 }
 
+install_slot_handler_sdk() {
+    local handlers_root="${INSTALL_DIR}/handlers"
+    mkdir -p "$handlers_root"
+    if ! fetch_local_or_remote "handlers/xdp_slot_ctx.h" "handlers/xdp_slot_ctx.h" "${handlers_root}/xdp_slot_ctx.h"; then
+        die "Failed to install handlers/xdp_slot_ctx.h"
+    fi
+}
+
 install_toml_config() {
     local toml_target="${CONFIG_DIR}/config.toml"
     mkdir -p "$CONFIG_DIR"
@@ -143,6 +197,7 @@ install_runtime_files() {
     substep_run "Installing relay helper" install_relay_script
     substep_run "Installing BPF helper script" install_bpf_helper
     substep_run "Installing axdp command" install_axdp_command
+    substep_run "Installing slot handler SDK" install_slot_handler_sdk
     substep_run "Installing shared runtime library" _install_runtime_common_assets
     substep_run "Installing default TOML config" install_toml_config
     substep_run "Installing launcher script" install_runner_script

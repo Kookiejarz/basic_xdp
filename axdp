@@ -58,7 +58,7 @@ Commands:
   permanent del PROTO PORT          Remove a permanent port
   slot list              List loaded and available protocol slot handlers
   slot load NAME         Load built-in handler: gre, esp, sctp
-  slot load PROTO PATH   Load custom handler .o for IP proto number
+  slot load PROTO PATH   Load custom handler .o or compile/load .c for IP proto number
   slot unload PROTO      Remove handler from slot
   help                   Show this help
 

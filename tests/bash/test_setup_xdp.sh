@@ -193,6 +193,32 @@ test_confirm_yes_no_force_and_no_tty_abort_modes() (
     }
 )
 
+test_confirm_existing_install_step_aborts_without_confirmation() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir log status output
+    tmpdir=$(mktemp -d)
+    CONFIG_FILE="$tmpdir/auto_xdp.env"
+    : >"$CONFIG_FILE"
+
+    confirm_yes_no() { return 1; }
+
+    log="$tmpdir/output.log"
+    set +e
+    ( confirm_existing_install_step ) >"$log" 2>&1
+    status=$?
+    set -e
+    output=$(<"$log")
+
+    [[ $status -ne 0 ]] || {
+        printf 'expected confirm_existing_install_step to abort when confirmation is denied\n'
+        return 1
+    }
+    assert_contains "$output" "Checking existing installation" || return 1
+    assert_contains "$output" "Installation aborted; existing deployment left untouched."
+)
+
 test_fetch_local_or_remote_uses_local_copy_without_network() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -243,6 +269,30 @@ test_warn_from_log_file_prefixes_and_truncates_output() (
     assert_contains "$output" "handler build: line one" || return 1
     assert_contains "$output" "handler build: line two" || return 1
     assert_contains "$output" "handler build: (additional output truncated)"
+)
+
+test_prepare_slot_handler_sources_uses_staging_dir() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir fetched
+    tmpdir=$(mktemp -d)
+    fetched="$tmpdir/fetched.log"
+    BUILD_STAGING_DIR="$tmpdir/stage"
+
+    fetch_local_or_remote() {
+        printf '%s -> %s\n' "$1" "$3" >>"$fetched"
+        mkdir -p "$(dirname "$3")"
+        : >"$3"
+    }
+
+    cd "$tmpdir" || return 1
+    prepare_slot_handler_sources || return 1
+    assert_file_contains "$fetched" "handlers/Makefile -> $BUILD_STAGING_DIR/handlers/Makefile" || return 1
+    [[ ! -e "$tmpdir/handlers/Makefile" ]] || {
+        printf 'expected handlers/Makefile to stay out of the current working directory\n'
+        return 1
+    }
 )
 
 test_info_prints_within_active_step() (
@@ -521,9 +571,11 @@ run_test "setup_xdp detects systemd and openrc" test_detect_init_system_supports
 run_test "setup_xdp package lists cover supported managers" test_package_lists_cover_all_supported_managers
 run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci_fields
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
+run_test "setup_xdp aborts when existing install is not confirmed" test_confirm_existing_install_step_aborts_without_confirmation
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
 run_test "setup_xdp detects required BPF headers across include roots" test_bpf_header_exists_checks_multiple_include_roots
 run_test "setup_xdp surfaces truncated handler build logs" test_warn_from_log_file_prefixes_and_truncates_output
+run_test "setup_xdp stages handler sources outside the current directory" test_prepare_slot_handler_sources_uses_staging_dir
 run_test "setup_xdp prints info lines within active step output" test_info_prints_within_active_step
 run_test "setup_xdp prints substep success and failure markers" test_substep_run_prints_success_and_failure_markers
 run_test "setup_xdp validates pinned map set completeness" test_xdp_maps_ready_requires_all_expected_pins

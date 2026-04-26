@@ -77,6 +77,7 @@ BPF_RUNTIME_COMMON_INSTALLED="${INSTALL_DIR}/auto_xdp_runtime_common.sh"
 BPF_HELPER_SRC="auto_xdp_bpf_helpers.py"
 BPF_HELPER_INSTALLED="${INSTALL_DIR}/auto_xdp_bpf_helpers.py"
 BPF_HELPER_BOOTSTRAP=""
+BUILD_STAGING_DIR=""
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
 SERVICE_NAME="xdp-port-sync"
@@ -186,6 +187,7 @@ main() {
     detect_environment_step
     check_required_tools_step
     bootstrap_bpf_helper_step
+    confirm_existing_install_step
     stop_existing_service_step
     compile_bpf_objects_step
     deploy_backend_step

@@ -429,6 +429,60 @@ EOF_BPFSH
     assert_file_contains "$tmpdir/bpftool.log" "map name sctp_conntrack pinned $BPF_PIN_DIR/sctp_conntrack"
 )
 
+test_slot_load_custom_c_compiles_and_persists_object_path() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BPF_PIN_DIR="$tmpdir/bpf"
+    INSTALL_DIR="$tmpdir/install"
+    TOML_CONFIG="$tmpdir/config.toml"
+    mkdir -p "$BPF_PIN_DIR/handlers" "$INSTALL_DIR/handlers" "$tmpdir/bin"
+    touch \
+        "$BPF_PIN_DIR/slot_ctx_map" \
+        "$BPF_PIN_DIR/proto_handlers" \
+        "$INSTALL_DIR/handlers/xdp_slot_ctx.h"
+    cat >"$TOML_CONFIG" <<'EOF_CFG'
+[slots]
+enabled = []
+EOF_CFG
+    cat >"$tmpdir/custom_handler.c" <<'EOF_SRC'
+// test source
+EOF_SRC
+
+    cat >"$tmpdir/bin/clang" <<EOF_CLANG
+#!/bin/sh
+out=""
+prev=""
+for arg in "\$@"; do
+  if [ "\$prev" = "-o" ]; then
+    out="\$arg"
+    break
+  fi
+  prev="\$arg"
+done
+printf '%s\n' "\$*" >> "$tmpdir/clang.log"
+: > "\$out"
+exit 0
+EOF_CLANG
+    cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$tmpdir/bpftool.log"
+exit 0
+EOF_BPFSH
+    chmod +x "$tmpdir/bin/clang" "$tmpdir/bin/bpftool"
+
+    PATH="$tmpdir/bin:$BASE_PATH"
+    run_slot load 99 "$tmpdir/custom_handler.c" >/dev/null || return 1
+
+    assert_file_contains "$tmpdir/clang.log" "$tmpdir/custom_handler.c" || return 1
+    assert_file_contains "$tmpdir/bpftool.log" "$INSTALL_DIR/handlers/custom_99_custom_handler.o" || return 1
+    assert_file_contains "$TOML_CONFIG" "[[slots.enabled]]" || return 1
+    assert_file_contains "$TOML_CONFIG" 'proto = 99' || return 1
+    assert_file_contains "$TOML_CONFIG" 'path = "'"$INSTALL_DIR"'/handlers/custom_99_custom_handler.o"'
+)
+
 run_test "axdp formats human-readable counters and rates" test_format_helpers_render_human_output
 run_test "axdp parses stats flags" test_parse_stats_args_sets_expected_flags
 run_test "axdp parses ports flags" test_parse_ports_args_sets_expected_flags
@@ -445,5 +499,6 @@ run_test "axdp backend json reports runtime attach state and conntrack counts" t
 run_test "axdp conntrack summarizes destination ports" test_run_conntrack_summarizes_destination_ports
 run_test "axdp help works without installation" test_cli_help_runs_without_runtime_state
 run_test "axdp slot load sctp reuses shared SCTP maps" test_slot_load_sctp_reuses_shared_maps
+run_test "axdp slot load custom c compiles and persists object path" test_slot_load_custom_c_compiles_and_persists_object_path
 
 finish_tests

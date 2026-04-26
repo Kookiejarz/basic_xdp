@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +37,8 @@ _DEFAULT_CONFIG_TEMPLATE = """\
 # To apply changes immediately: axdp restart
 
 [firewall]
+# Drop packets with obviously invalid or reserved source addresses.
+# Set to false only on environments where private/internal source ranges are expected.
 # Set to false on private/internal networks where RFC1918 source addresses are legitimate.
 bogon_filter = false
 
@@ -44,21 +47,28 @@ bogon_filter = false
 log_level = "warning"
 
 # Event debounce window before reconciling after proc connector activity.
+# Larger values reduce churn during bursty process/socket changes.
 debounce_seconds = 0.4
 
 # Preferred runtime backend: auto, xdp, nftables.
+# auto = choose the best available backend at runtime.
+# xdp  = require XDP mode when possible.
+# nftables = force nftables fallback mode.
 preferred_backend = "auto"
 
 [discovery]
 # Exclude loopback-only listeners from exposure discovery.
+# When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
 exclude_loopback = true
 
 # Exclude listeners bound to these addresses/CIDRs from automatic exposure.
+# Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
 exclude_bind_cidrs = []
 
 [permanent_ports]
 # Ports always kept open regardless of which services are running.
 # SCTP is config-managed only; it is not auto-discovered from listening sockets.
+# Use these when a port must stay allowed even if the owning process is temporarily absent.
 tcp = []
 udp = []
 sctp = []
@@ -67,12 +77,16 @@ sctp = []
 # Source IPs/CIDRs that bypass all firewall checks (rate limits, whitelist).
 # Format:  "CIDR" = "label"
 # "10.0.0.0/8" = "internal network"
+# Trusted sources are allowed before whitelist and rate-limit checks.
 
 # SYN rate limits (new connections per second per source IP).
 # Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
 # Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
+# These limits apply only to new inbound TCP SYN traffic.
 
 [rate_limits.syn_by_proc]
+# Key: process name as seen on the local host.
+# Value: allowed new SYN packets per second per source IP for ports owned by that process.
 sshd           = 2
 vsftpd         = 10
 proftpd        = 10
@@ -89,6 +103,8 @@ xrdp           = 2
 telnetd        = 2
 
 [rate_limits.syn_by_service]
+# Key: service name from /etc/services when no per-process override exists.
+# Value: allowed new SYN packets per second per source IP.
 ssh             = 2
 ftp             = 10
 "ftp-data"      = 10
@@ -108,35 +124,47 @@ vnc             = 2
 telnet          = 2
 
 [rate_limits.syn_agg_by_proc]
+# Optional per-process aggregate SYN rate limits.
+# These apply across source prefixes, not just a single IP.
 
 [rate_limits.syn_agg_by_service]
+# Optional service-name fallback for aggregate SYN rate limits.
 
 [rate_limits.tcp_conn_by_proc]
+# Optional per-process cap on concurrent tracked TCP connections per source.
 
 [rate_limits.tcp_conn_by_service]
+# Optional service-name fallback for TCP concurrent connection caps.
 
 
 # UDP rate limits (packets per second per source IP).
+# UDP is stateless at the protocol level, so these controls help bound abuse.
 
 [rate_limits.udp_by_proc]
+# Key: process name.
+# Value: allowed UDP packets per second per source IP for ports owned by that process.
 named   = 5000
 unbound = 5000
 dnsmasq = 5000
 openvpn = 200
 
 [rate_limits.udp_by_service]
+# Service-name fallback for UDP per-source packet rate limits.
 domain  = 5000
 ntp     = 500
 isakmp  = 100
 openvpn = 200
 
 [rate_limits.udp_agg_bytes_by_proc]
+# Optional per-process aggregate UDP byte-rate caps across source prefixes.
 
 [rate_limits.udp_agg_bytes_by_service]
+# Service-name fallback for aggregate UDP byte-rate caps.
 
 # Per-CIDR port ACL rules.
 # These bypass rate limiting and take priority over the port whitelist.
 # Ports do NOT need to be in the whitelist — ACL is a zero-trust path.
+# Use ACL when a service should be reachable only from specific source ranges.
 
 # [[acl]]
 # proto = "tcp"
@@ -149,15 +177,18 @@ openvpn = 200
 [slots]
 # Action for protocols with no handler loaded.
 # "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
+# This affects non-TCP/UDP/ICMP traffic dispatched through the slot table.
 default_action = "drop"
 
 # Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
 # "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
+# Use built-ins by name, or point custom entries at compiled BPF object files.
 # enabled = ["sctp", "gre", "esp"]
 enabled = []
 
 [xdp]
 # Remove stale conntrack entries after N consecutive reconcile rounds miss them.
+# Only affects userspace-managed TCP conntrack seeding/cleanup logic.
 conntrack_stale_reconciles = 2
 """
 
@@ -387,6 +418,16 @@ def _run_bpftool(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[s
     return result
 
 
+def _run_checked(cmd: list[str], fail_msg: str) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        if detail:
+            print(detail, file=sys.stderr)
+        raise RuntimeError(fail_msg)
+    return result
+
+
 def _slot_prog_name(pin_path: Path) -> str:
     result = subprocess.run(
         ["bpftool", "prog", "show", "pinned", str(pin_path)],
@@ -404,6 +445,87 @@ def _ensure_config_exists(path: Path) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_DEFAULT_CONFIG_TEMPLATE)
+
+
+def _resolve_target_arch() -> tuple[str, str]:
+    machine = os.uname().machine
+    if machine == "x86_64":
+        return "x86", "-D__x86_64__"
+    if machine in {"aarch64", "arm64"}:
+        return "arm64", "-D__aarch64__"
+    if machine.startswith("armv7") or machine.startswith("armv6") or machine == "arm":
+        return "arm", "-D__arm__"
+    return machine, ""
+
+
+def _resolve_asm_include(target_arch: str) -> str | None:
+    candidates: list[str] = []
+    result = subprocess.run(["gcc", "-print-multiarch"], capture_output=True, text=True)
+    multiarch = result.stdout.strip() if result.returncode == 0 else ""
+    if multiarch:
+        candidates.append(f"/usr/include/{multiarch}")
+
+    if target_arch == "x86":
+        candidates.append("/usr/include/x86_64-linux-gnu")
+    elif target_arch == "arm64":
+        candidates.append("/usr/include/aarch64-linux-gnu")
+    elif target_arch == "arm":
+        candidates.append("/usr/include/arm-linux-gnueabihf")
+
+    candidates.extend(
+        [
+            f"/usr/src/linux-headers-{os.uname().release}/arch/{target_arch}/include/generated",
+            "/usr/include",
+        ]
+    )
+    for candidate in candidates:
+        if os.path.isdir(candidate) and (os.path.isdir(os.path.join(candidate, "asm")) or candidate == "/usr/include"):
+            return candidate
+    return "/usr/include"
+
+
+def _compile_custom_slot_source(source_path: Path, proto: int, handlers_dir: Path) -> Path:
+    if not source_path.is_file():
+        raise RuntimeError(f"Handler source not found: {source_path}")
+    if source_path.suffix != ".c":
+        raise RuntimeError(f"Unsupported handler source type: {source_path}")
+
+    handlers_dir.mkdir(parents=True, exist_ok=True)
+    output_path = handlers_dir / f"custom_{proto}_{source_path.stem}.o"
+    target_arch, host_arch_flag = _resolve_target_arch()
+    asm_inc = _resolve_asm_include(target_arch)
+    if asm_inc is None:
+        raise RuntimeError("ASM headers not found; cannot compile slot handler source.")
+
+    cmd = [
+        "clang",
+        "-O3",
+        "-g",
+        "-target",
+        "bpf",
+        "-mcpu=v3",
+        f"-D__TARGET_ARCH_{target_arch}",
+    ]
+    if host_arch_flag:
+        cmd.append(host_arch_flag)
+    cmd.extend(
+        [
+            "-fno-stack-protector",
+            "-Wall",
+            "-Wno-unused-value",
+            "-I/usr/include",
+            f"-I{asm_inc}",
+            "-I/usr/include/bpf",
+            f"-I{handlers_dir}",
+            f"-I{source_path.parent}",
+            "-c",
+            str(source_path),
+            "-o",
+            str(output_path),
+        ]
+    )
+    _run_checked(cmd, f"Failed to compile {source_path}")
+    return output_path
 
 
 def _cmd_config_show(args: argparse.Namespace) -> int:
@@ -662,9 +784,17 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
     elif args.name_or_proto.isdigit():
         proto = int(args.name_or_proto)
         if not args.path:
-            print("Custom handler requires a .o path: axdp slot load PROTO /path/to/handler.o", file=sys.stderr)
+            print("Custom handler requires a .o or .c path: axdp slot load PROTO /path/to/handler.o", file=sys.stderr)
             return 1
-        obj_path = Path(args.path)
+        custom_path = Path(args.path)
+        if custom_path.suffix == ".c":
+            try:
+                obj_path = _compile_custom_slot_source(custom_path, proto, handlers_dir)
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        else:
+            obj_path = custom_path
     else:
         print(f"Unknown handler: {args.name_or_proto} (built-in: gre, esp, sctp)", file=sys.stderr)
         return 1

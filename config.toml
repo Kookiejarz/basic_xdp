@@ -4,6 +4,8 @@
 # To apply changes immediately: axdp restart
 
 [firewall]
+# Drop packets with obviously invalid or reserved source addresses.
+# Set to false only on environments where private/internal source ranges are expected.
 # Set to false on private/internal networks where RFC1918 source addresses are legitimate.
 bogon_filter = false
 
@@ -12,21 +14,28 @@ bogon_filter = false
 log_level = "warning"
 
 # Event debounce window before reconciling after proc connector activity.
+# Larger values reduce churn during bursty process/socket changes.
 debounce_seconds = 0.4
 
 # Preferred runtime backend: auto, xdp, nftables.
+# auto = choose the best available backend at runtime.
+# xdp  = require XDP mode when possible.
+# nftables = force nftables fallback mode.
 preferred_backend = "auto"
 
 [discovery]
 # Exclude loopback-only listeners from exposure discovery.
+# When true, listeners bound only to 127.0.0.0/8 or ::1 are ignored.
 exclude_loopback = true
 
 # Exclude listeners bound to these addresses/CIDRs from automatic exposure.
+# Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
 exclude_bind_cidrs = []
 
 [permanent_ports]
 # Ports always kept open regardless of which services are running.
 # SCTP is config-managed only; it is not auto-discovered from listening sockets.
+# Use these when a port must stay allowed even if the owning process is temporarily absent.
 tcp = []
 udp = []
 sctp = []
@@ -35,12 +44,16 @@ sctp = []
 # Source IPs/CIDRs that bypass all firewall checks (rate limits, whitelist).
 # Format:  "CIDR" = "label"
 # "10.0.0.0/8" = "internal network"
+# Trusted sources are allowed before whitelist and rate-limit checks.
 
 # SYN rate limits (new connections per second per source IP).
 # Lookup order: syn_by_proc (process name) → syn_by_service (IANA name).
 # Ports absent from both tables are not rate-limited (e.g. HTTP/HTTPS).
+# These limits apply only to new inbound TCP SYN traffic.
 
 [rate_limits.syn_by_proc]
+# Key: process name as seen on the local host.
+# Value: allowed new SYN packets per second per source IP for ports owned by that process.
 sshd           = 2
 vsftpd         = 10
 proftpd        = 10
@@ -57,6 +70,8 @@ xrdp           = 2
 telnetd        = 2
 
 [rate_limits.syn_by_service]
+# Key: service name from /etc/services when no per-process override exists.
+# Value: allowed new SYN packets per second per source IP.
 ssh             = 2
 ftp             = 10
 "ftp-data"      = 10
@@ -76,35 +91,47 @@ vnc             = 2
 telnet          = 2
 
 [rate_limits.syn_agg_by_proc]
+# Optional per-process aggregate SYN rate limits.
+# These apply across source prefixes, not just a single IP.
 
 [rate_limits.syn_agg_by_service]
+# Optional service-name fallback for aggregate SYN rate limits.
 
 [rate_limits.tcp_conn_by_proc]
+# Optional per-process cap on concurrent tracked TCP connections per source.
 
 [rate_limits.tcp_conn_by_service]
+# Optional service-name fallback for TCP concurrent connection caps.
 
 
 # UDP rate limits (packets per second per source IP).
+# UDP is stateless at the protocol level, so these controls help bound abuse.
 
 [rate_limits.udp_by_proc]
+# Key: process name.
+# Value: allowed UDP packets per second per source IP for ports owned by that process.
 named   = 5000
 unbound = 5000
 dnsmasq = 5000
 openvpn = 200
 
 [rate_limits.udp_by_service]
+# Service-name fallback for UDP per-source packet rate limits.
 domain  = 5000
 ntp     = 500
 isakmp  = 100
 openvpn = 200
 
 [rate_limits.udp_agg_bytes_by_proc]
+# Optional per-process aggregate UDP byte-rate caps across source prefixes.
 
 [rate_limits.udp_agg_bytes_by_service]
+# Service-name fallback for aggregate UDP byte-rate caps.
 
 # Per-CIDR port ACL rules.
 # These bypass rate limiting and take priority over the port whitelist.
 # Ports do NOT need to be in the whitelist — ACL is a zero-trust path.
+# Use ACL when a service should be reachable only from specific source ranges.
 
 # [[acl]]
 # proto = "tcp"
@@ -117,13 +144,16 @@ openvpn = 200
 [slots]
 # Action for protocols with no handler loaded.
 # "pass" preserves existing behaviour; "drop" enforces an explicit allow-list.
+# This affects non-TCP/UDP/ICMP traffic dispatched through the slot table.
 default_action = "drop"
 
 # Built-in handlers to load at startup: "gre" (proto 47), "esp" (proto 50),
 # "sctp" (proto 132).  Custom handlers: { proto = N, path = "/path/to.o" }
+# Use built-ins by name, or point custom entries at compiled BPF object files.
 # enabled = ["sctp", "gre", "esp"]
 enabled = []
 
 [xdp]
 # Remove stale conntrack entries after N consecutive reconcile rounds miss them.
+# Only affects userspace-managed TCP conntrack seeding/cleanup logic.
 conntrack_stale_reconciles = 2

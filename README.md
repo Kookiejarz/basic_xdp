@@ -233,7 +233,7 @@ Pinned directory: `/sys/fs/bpf/xdp_fw/`
 | `syn_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
 | `udp_rate_ports` | HASH | 1024 | `__u32` dest port | `struct syn_rate_port_cfg { rate_max }` |
 | `udp_rate_map` | LRU_HASH | 65536 | `struct syn_rate_key { dest_port, saddr[4] }` | `struct syn_rate_val { window_start_ns, count }` |
-| `udp_global_rl` | ARRAY | 1 | `__u32` (0) | `struct udp_global_tb { lock, rate_max, window_start_ns, prev_count, curr_count }` |
+| `udp_global_rl` | PERCPU_ARRAY | 1 | `__u32` (0) | `struct udp_global_tb { rate_max, window_start_ns, prev_bytes, curr_bytes }` |
 
 ### Manually Add / Remove a Port
 
