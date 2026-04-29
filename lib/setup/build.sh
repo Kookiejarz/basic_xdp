@@ -220,7 +220,7 @@ compile_xdp_program() {
     _source_root="$BUILD_STAGING_DIR"
     _handlers_dir="${_source_root}/handlers"
 
-    local _bpf_headers=(common.h keys.h maps.h trust_acl.h rate_limit.h conntrack.h parse.h slots.h)
+    local _bpf_headers=(common.h keys.h maps.h trust_acl.h rate_limit.h port_dispatch.h conntrack.h parse.h slots.h)
     local _hdr
     for _hdr in "${_bpf_headers[@]}"; do
         stage_build_source "bpf/include/${_hdr}" "bpf/include/${_hdr}" "bpf/include/${_hdr}" || true
@@ -284,6 +284,30 @@ compile_bpf_objects_step() {
         step_ok
     else
         step_warn "compile failed — nftables fallback will be used"
+    fi
+}
+
+restore_compiled_slot_handlers() {
+    local staged_handlers=""
+
+    [[ -n "${BUILD_STAGING_DIR:-}" && -d "$BUILD_STAGING_DIR" ]] || return 0
+    staged_handlers="${BUILD_STAGING_DIR}/handlers"
+    [[ -d "$staged_handlers" ]] || return 0
+
+    if ! find "$staged_handlers" -maxdepth 1 -type f -name '*.o' | grep -q .; then
+        return 0
+    fi
+
+    mkdir -p "${INSTALL_DIR}/handlers"
+    cp "$staged_handlers"/*.o "${INSTALL_DIR}/handlers/"
+}
+
+restore_compiled_slot_handlers_step() {
+    step_begin "Restoring compiled slot handlers"
+    if restore_compiled_slot_handlers; then
+        step_ok
+    else
+        step_warn "restore failed"
     fi
 }
 

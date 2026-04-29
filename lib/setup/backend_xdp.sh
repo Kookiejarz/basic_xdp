@@ -90,6 +90,7 @@ deploy_xdp_backend() {
     done
 
     if [[ $attached -gt 0 ]]; then
+        auto_tune_interface_parallelism || true
         ACTIVE_BACKEND="xdp"
         return 0
     fi
