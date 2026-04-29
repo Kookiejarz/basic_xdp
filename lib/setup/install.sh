@@ -24,6 +24,7 @@ existing_install_detected() {
         "$AXDP_CMD"
         "$RUNNER_SCRIPT"
         "$BPF_RUNTIME_COMMON_INSTALLED"
+        "${INSTALL_DIR}/xdp_required_maps.txt"
         "$BPF_HELPER_INSTALLED"
         "$XDP_OBJ_INSTALLED"
         "$TC_OBJ_INSTALLED"
@@ -80,17 +81,122 @@ BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${XDP_OBJ_INSTALLED}"
 TC_OBJ_PATH="${TC_OBJ_INSTALLED}"
 PREFERRED_BACKEND="auto"
+AUTO_TUNE_QUEUES="1"
 BPF_HELPER_SCRIPT="${BPF_HELPER_INSTALLED}"
 TOML_CONFIG="${CONFIG_DIR}/config.toml"
+INSTALL_DIR="${INSTALL_DIR}"
 HANDLERS_DIR="${INSTALL_DIR}/handlers"
+PYTHON_LIB_DIR="${PYTHON_LIB_DIR}"
 PYTHONPATH="${PYTHON_LIB_DIR}"
 export BPF_PIN_DIR
 EOF_CFG
 }
 
+cleanup_installed_python_support_package() {
+    local pkg_root="${AUTO_XDP_PACKAGE_DIR}"
+
+    [[ -n "$pkg_root" ]] || return 0
+    if [[ -d "$pkg_root" ]]; then
+        rm -rf "$pkg_root"
+    fi
+    mkdir -p "$pkg_root"
+}
+
+cleanup_installed_handler_sdk() {
+    local handlers_root="${INSTALL_DIR}/handlers"
+    local config_path="${CONFIG_DIR}/config.toml"
+    local installed_file=""
+    local base_name=""
+    local resolved_file=""
+    local keep_file=0
+    local preserved_path=""
+    local -a preserve_paths=()
+
+    mkdir -p "$handlers_root"
+
+    if command -v "${PYTHON3_BIN:-python3}" >/dev/null 2>&1 && [[ -f "$config_path" ]]; then
+        mapfile -t preserve_paths < <("${PYTHON3_BIN:-python3}" - "$config_path" "$handlers_root" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+handlers_root = Path(sys.argv[2]).resolve()
+preserved = set()
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        raise SystemExit(0)
+
+try:
+    with config_path.open("rb") as fh:
+        cfg = tomllib.load(fh)
+except Exception:
+    raise SystemExit(0)
+
+for entry in cfg.get("slots", {}).get("enabled", []):
+    if isinstance(entry, dict):
+        raw_path = entry.get("path")
+        if raw_path:
+            try:
+                path = Path(str(raw_path)).resolve()
+            except OSError:
+                continue
+            if path.parent == handlers_root:
+                preserved.add(str(path))
+
+for proto in ("tcp", "udp"):
+    table = cfg.get("port_handlers", {}).get(proto, {})
+    if not isinstance(table, dict):
+        continue
+    for raw_path in table.values():
+        if not raw_path:
+            continue
+        try:
+            path = Path(str(raw_path)).resolve()
+        except OSError:
+            continue
+        if path.parent == handlers_root:
+            preserved.add(str(path))
+
+for path in sorted(preserved):
+    print(path)
+PY
+)
+    fi
+
+    while IFS= read -r installed_file; do
+        base_name="$(basename "$installed_file")"
+        resolved_file="$(cd "$(dirname "$installed_file")" && pwd -P)/${base_name}"
+        keep_file=0
+
+        case "$base_name" in
+            custom_*)
+                continue
+                ;;
+        esac
+
+        for preserved_path in "${preserve_paths[@]}"; do
+            if [[ "$resolved_file" == "$preserved_path" ]]; then
+                keep_file=1
+                break
+            fi
+        done
+        [[ $keep_file -eq 1 ]] && continue
+
+        rm -f "$installed_file"
+    done < <(find "$handlers_root" -maxdepth 1 -type f)
+}
+
 install_python_support_package() {
     local pkg_root="${AUTO_XDP_PACKAGE_DIR}"
     local files rel target
+
+    cleanup_installed_python_support_package
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
         local api_url
@@ -117,6 +223,11 @@ for e in json.load(sys.stdin).get('tree', []):
         mkdir -p "$(dirname "$target")"
         fetch_local_or_remote "$rel" "$rel" "$target" || return 1
     done
+
+    fetch_local_or_remote \
+        "auto_xdp/xdp_required_maps.txt" \
+        "auto_xdp/xdp_required_maps.txt" \
+        "${pkg_root}/xdp_required_maps.txt" || return 1
 }
 
 install_runner_script() {
@@ -131,6 +242,10 @@ install_runtime_common_script() {
         die "Failed to install ${RUNTIME_COMMON_SRC}"
     fi
     chmod +x "$BPF_RUNTIME_COMMON_INSTALLED"
+
+    if ! fetch_local_or_remote "auto_xdp/xdp_required_maps.txt" "auto_xdp/xdp_required_maps.txt" "${INSTALL_DIR}/xdp_required_maps.txt"; then
+        die "Failed to install auto_xdp/xdp_required_maps.txt"
+    fi
 }
 
 install_sync_script() {
@@ -163,10 +278,45 @@ install_axdp_command() {
 
 install_slot_handler_sdk() {
     local handlers_root="${INSTALL_DIR}/handlers"
-    mkdir -p "$handlers_root"
-    if ! fetch_local_or_remote "handlers/xdp_slot_ctx.h" "handlers/xdp_slot_ctx.h" "${handlers_root}/xdp_slot_ctx.h"; then
-        die "Failed to install handlers/xdp_slot_ctx.h"
+    local -a handler_files=()
+    local rel=""
+
+    cleanup_installed_handler_sdk
+
+    if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
+        local api_url
+        api_url="$(sed \
+            -e 's|https://raw\.githubusercontent\.com/|https://api.github.com/repos/|' \
+            -e 's|/\([^/]*\)$|/git/trees/\1?recursive=1|' \
+            <<< "$RAW_URL")"
+        mapfile -t handler_files < <(
+            curl -fsSL "$api_url" \
+            | python3 -c "
+import json, sys
+for e in json.load(sys.stdin).get('tree', []):
+    p = e['path']
+    if not p.startswith('handlers/'):
+        continue
+    tail = p.split('/')[-1]
+    if tail == 'Makefile' or p.endswith('.c') or p.endswith('.h'):
+        print(p)
+" | sort
+        )
+    else
+        mapfile -t handler_files < <(
+            find handlers -maxdepth 1 -type f \
+                \( -name 'Makefile' -o -name '*.c' -o -name '*.h' \) \
+                | sort
+        )
     fi
+
+    [[ ${#handler_files[@]} -gt 0 ]] || die "Failed to discover handler SDK files"
+
+    for rel in "${handler_files[@]}"; do
+        if ! fetch_local_or_remote "$rel" "$rel" "${handlers_root}/${rel#handlers/}"; then
+            die "Failed to install ${rel}"
+        fi
+    done
 }
 
 install_toml_config() {
@@ -219,6 +369,17 @@ load_configured_slot_handlers_step() {
         step_ok
     else
         step_warn "slot handlers unavailable"
+    fi
+}
+
+load_configured_port_handlers_step() {
+    [[ "${ACTIVE_BACKEND:-nftables}" == "xdp" ]] || return 0
+
+    step_begin "Loading configured per-port handlers"
+    if load_port_handlers; then
+        step_ok
+    else
+        step_warn "per-port handlers unavailable"
     fi
 }
 
