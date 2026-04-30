@@ -27,12 +27,11 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
 
         packed = helpers.pack_ct_key(conn)
         expected = struct.pack(
-            "!B3xHH16s16s",
-            socket.AF_INET,
+            "!HH4s4s",
             50000,
             443,
-            socket.inet_aton("198.51.100.20") + (b"\x00" * 12),
-            socket.inet_aton("192.0.2.10") + (b"\x00" * 12),
+            socket.inet_aton("198.51.100.20"),
+            socket.inet_aton("192.0.2.10"),
         )
         self.assertEqual(packed, expected)
 
@@ -45,8 +44,7 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
 
         packed = helpers.pack_ct_key(conn)
         expected = struct.pack(
-            "!B3xHH16s16s",
-            socket.AF_INET6,
+            "!HH16s16s",
             50000,
             443,
             socket.inet_pton(socket.AF_INET6, "2001:db8::20"),
@@ -137,7 +135,7 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
     def test_cmd_seed_tcp_conntrack_prints_zero_without_psutil(self):
         stdout = io.StringIO()
         with redirect_stdout(stdout), mock.patch.object(helpers, "psutil", None):
-            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_conntrack")
+            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_ct4", "/pins/tcp_ct6")
 
         self.assertEqual(rc, 0)
         self.assertEqual(stdout.getvalue().strip(), "0")
@@ -146,8 +144,9 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stderr(stderr), \
              mock.patch.object(helpers, "psutil", object()), \
+             mock.patch.object(helpers.os.path, "exists", return_value=True), \
              mock.patch.object(helpers, "obj_get", side_effect=OSError(2, "missing")):
-            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_conntrack")
+            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_ct4", "/pins/tcp_ct6")
 
         self.assertEqual(rc, 1)
         self.assertIn("failed to open map", stderr.getvalue())
@@ -169,29 +168,32 @@ class AutoXdpBpfHelpersTests(unittest.TestCase):
         stdout = io.StringIO()
         with redirect_stdout(stdout), \
              mock.patch.object(helpers, "psutil", object()), \
-             mock.patch.object(helpers, "obj_get", return_value=123), \
+             mock.patch.object(helpers.os.path, "exists", return_value=True), \
+             mock.patch.object(helpers, "obj_get", side_effect=[123, 124]), \
              mock.patch.object(helpers, "iter_established_tcp", return_value=connections), \
              mock.patch.object(helpers, "bpf") as bpf_call, \
              mock.patch.object(helpers.os, "close") as close_call, \
              mock.patch.object(helpers.time, "monotonic_ns", return_value=99):
-            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_conntrack")
+            rc = helpers.cmd_seed_tcp_conntrack("/pins/tcp_ct4", "/pins/tcp_ct6")
 
         self.assertEqual(rc, 0)
         self.assertEqual(stdout.getvalue().strip(), "2")
         self.assertEqual(bpf_call.call_count, 2)
-        close_call.assert_called_once_with(123)
+        close_call.assert_has_calls([mock.call(123), mock.call(124)])
 
     def test_main_dispatches_seed_subcommand(self):
         with mock.patch.object(sys, "argv", [
             "auto_xdp_bpf_helpers.py",
             "seed-tcp-conntrack",
-            "--map-path",
-            "/pins/tcp_conntrack",
+            "--map-path-v4",
+            "/pins/tcp_ct4",
+            "--map-path-v6",
+            "/pins/tcp_ct6",
         ]), mock.patch.object(helpers, "cmd_seed_tcp_conntrack", return_value=0) as seed_cmd:
             rc = helpers.main()
 
         self.assertEqual(rc, 0)
-        seed_cmd.assert_called_once_with("/pins/tcp_conntrack")
+        seed_cmd.assert_called_once_with("/pins/tcp_ct4", "/pins/tcp_ct6")
 
     def test_main_dispatches_pin_maps_subcommand(self):
         with mock.patch.object(sys, "argv", [

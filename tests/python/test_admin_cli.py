@@ -1,6 +1,7 @@
 import subprocess
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -91,6 +92,79 @@ class AdminCliTests(unittest.TestCase):
             self.assertIn('[slots]', text)
             self.assertIn('enabled = ["sctp"]', text)
 
+    def test_slot_list_excludes_port_handler_candidates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            bpf_pin_dir = root / "bpf"
+            handlers_dir = root / "handlers"
+            handlers_dir.mkdir()
+            bpf_pin_dir.mkdir()
+            (bpf_pin_dir / "proto_handlers").touch()
+            (handlers_dir / "minecraft_handler.c").write_text(
+                'struct { int x; } tcp_ct4 SEC(".maps");\nSEC("xdp/minecraft") int x(void *ctx) { return 0; }\n'
+            )
+            (handlers_dir / "minecraft_handler.o").touch()
+
+            stdout = StringIO()
+            with mock.patch("sys.stdout", stdout):
+                rc = admin_cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--bpf-pin-dir",
+                        str(bpf_pin_dir),
+                        "--handlers-dir",
+                        str(handlers_dir),
+                        "slot",
+                        "list",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            output = stdout.getvalue()
+            self.assertIn("Available handlers:", output)
+            self.assertNotIn("minecraft_handler", output)
+            self.assertNotIn("minecraft", output)
+
+    def test_port_handler_list_shows_available_local_handler_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            bpf_pin_dir = root / "bpf"
+            handlers_dir = root / "handlers"
+            handlers_dir.mkdir()
+            bpf_pin_dir.mkdir()
+            (handlers_dir / "gre_handler.o").touch()
+            (handlers_dir / "custom_47_demo.o").touch()
+            (handlers_dir / "minecraft_handler.c").write_text(
+                'struct { int x; } tcp_ct4 SEC(".maps");\nSEC("xdp/minecraft") int x(void *ctx) { return 0; }\n'
+            )
+            (handlers_dir / "minecraft_handler.o").touch()
+
+            stdout = StringIO()
+            with mock.patch("sys.stdout", stdout):
+                rc = admin_cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--bpf-pin-dir",
+                        str(bpf_pin_dir),
+                        "--handlers-dir",
+                        str(handlers_dir),
+                        "port-handler",
+                        "list",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            output = stdout.getvalue()
+            self.assertIn("Available local port handler files:", output)
+            self.assertIn("minecraft_handler", output)
+            self.assertIn(str(handlers_dir / "minecraft_handler.o"), output)
+            self.assertNotIn("custom_47_demo", output)
+            self.assertNotIn(str(handlers_dir / "gre_handler.o"), output)
+
     def test_admin_main_backend_json_matches_backend_snapshot(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -107,8 +181,10 @@ class AdminCliTests(unittest.TestCase):
             (run_state_dir / "xdp_mode").write_text("native\n")
             for path in (
                 bpf_pin_dir / "pkt_counters",
-                bpf_pin_dir / "tcp_conntrack",
-                bpf_pin_dir / "udp_conntrack",
+                bpf_pin_dir / "tcp_ct4",
+                bpf_pin_dir / "tcp_ct6",
+                bpf_pin_dir / "udp_ct4",
+                bpf_pin_dir / "udp_ct6",
             ):
                 path.touch()
 
@@ -125,8 +201,10 @@ class AdminCliTests(unittest.TestCase):
             (bin_dir / "bpftool").write_text(
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
-                "  *\"tcp_conntrack\"*) printf '%s\\n' '[{\"key\":[1]},{\"key\":[2]}]' ;;\n"
-                "  *\"udp_conntrack\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
+                "  *\"tcp_ct4\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
+                "  *\"tcp_ct6\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
+                "  *\"udp_ct4\"*) printf '%s\\n' '[{\"key\":[1]}]' ;;\n"
+                "  *\"udp_ct6\"*) printf '%s\\n' '[]' ;;\n"
                 "  *) printf '%s\\n' '[]' ;;\n"
                 "esac\n"
             )

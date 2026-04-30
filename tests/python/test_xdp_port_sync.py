@@ -453,7 +453,6 @@ class XdpPortSyncTests(unittest.TestCase):
         state = state_mod.ObservedState(tcp={80}, udp={53}, sctp=set(), established={b"flow"})
 
         with mock.patch.object(syncer_mod, "get_listening_ports", return_value=state), \
-             mock.patch.object(syncer_mod, "_net_connections", return_value=[]), \
              mock.patch.object(policy_mod.cfg, "TCP_PERMANENT", {22: "ssh"}), \
              mock.patch.object(policy_mod.cfg, "UDP_PERMANENT", {123: "ntp"}), \
              mock.patch.object(policy_mod.cfg, "SCTP_PERMANENT", {3868: "diameter"}), \
@@ -507,7 +506,8 @@ class XdpPortSyncTests(unittest.TestCase):
              mock.patch.object(policy_mod.cfg, "XDP_ICMP_BURST_PACKETS", 200), \
              mock.patch.object(policy_mod.cfg, "XDP_ICMP_RATE_PPS", 50.0), \
              mock.patch.object(policy_mod.cfg, "XDP_UDP_GLOBAL_WINDOW_SECONDS", 2.0), \
-             mock.patch.object(policy_mod.cfg, "XDP_RATE_WINDOW_SECONDS", 0.5):
+             mock.patch.object(policy_mod.cfg, "XDP_RATE_WINDOW_SECONDS", 0.5), \
+             mock.patch.object(policy_mod.cfg, "XDP_SYN_TIMEOUT_SECONDS", 10.0):
             desired = policy_mod.resolve_desired_state(observed)
 
         self.assertEqual(desired.tcp_ports, {22, 80, 2222})
@@ -530,6 +530,7 @@ class XdpPortSyncTests(unittest.TestCase):
                 20_000_000,
                 2_000_000_000,
                 500_000_000,
+                10_000_000_000,
             ),
         )
 
@@ -550,6 +551,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap({0})
+        backend.sit4_map = None
         backend._conntrack_stale_rounds = {}
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -617,6 +619,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.acl_maps = None
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
+        backend.sit4_map = None
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -648,6 +651,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.acl_maps = None
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
+        backend.sit4_map = None
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -825,6 +829,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.acl_maps = None
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
+        backend.sit4_map = None
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend._tcp_policy_map = None
         backend._udp_policy_map = None
@@ -939,6 +944,7 @@ class XdpPortSyncTests(unittest.TestCase):
         backend.runtime_config_map = FakeRuntimeConfigMap()
         backend.bogon_cfg_map = None
         backend.observability_cfg_map = FakeArrayCfgMap()
+        backend.sit4_map = None
 
         backend.close()
 

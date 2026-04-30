@@ -87,6 +87,44 @@ EOF_CFG
     assert_file_contains "$TOML_CONFIG" 'log_level = "debug"'
 )
 
+test_run_under_attack_reads_and_updates_config() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TOML_CONFIG="$tmpdir/config.toml"
+    cat >"$TOML_CONFIG" <<'EOF_CFG'
+[under_attack]
+enabled = false
+EOF_CFG
+
+    PATH="$tmpdir/empty-bin:$BASE_PATH"
+    mkdir -p "$tmpdir/empty-bin"
+    reload_daemon() { :; }
+
+    assert_eq "$(run_under_attack)" "off" || return 1
+
+    local output
+    output=$(run_under_attack on 2>&1) || return 1
+    assert_contains "$output" "under_attack.enabled=true" || return 1
+    assert_file_contains "$TOML_CONFIG" "[under_attack]"
+    assert_file_contains "$TOML_CONFIG" "enabled = true"
+)
+
+test_main_dispatches_under_attack_command() (
+    source "$REPO_ROOT/axdp"
+    set +e
+
+    local called=""
+    run_under_attack() {
+        called="yes:$*"
+    }
+
+    main under-attack on || return 1
+    assert_eq "$called" "yes:on"
+)
+
 test_config_updates_preserve_unrelated_sections() (
     source "$REPO_ROOT/axdp"
     set +e
@@ -337,17 +375,28 @@ test_run_conntrack_summarizes_destination_ports() (
     local tmpdir
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir/bpf"
-    mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
-    touch "$BPF_PIN_DIR/tcp_conntrack" "$BPF_PIN_DIR/udp_conntrack"
+    INSTALL_DIR="$tmpdir/install"
+    PYTHON_LIB_DIR="$REPO_ROOT"
+    TOML_CONFIG="$tmpdir/config.toml"
+    mkdir -p "$BPF_PIN_DIR" "$INSTALL_DIR" "$tmpdir/bin"
+    touch "$TOML_CONFIG"
+    # New split maps: ct_key_v4 (12 bytes), ct_key_v6 (36 bytes)
+    # ct_key_v4 layout: sport[2] dport[2] saddr[4] daddr[4]
+    # ct_key_v6 layout: sport[2] dport[2] saddr[16] daddr[16]
+    touch "$BPF_PIN_DIR/tcp_ct4" "$BPF_PIN_DIR/tcp_ct6" \
+          "$BPF_PIN_DIR/udp_ct4" "$BPF_PIN_DIR/udp_ct6"
 
     cat >"$tmpdir/bin/bpftool" <<EOF_BPF
 #!/bin/sh
 case "\$*" in
-  *"tcp_conntrack"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,80,0,22]},{"key":[10,0,0,0,0,81,0,22]},{"key":[2,0,0,0,0,82,1,187]}]'
+  *"tcp_ct4"*)
+    printf '%s\n' '[{"key":[0,80,0,22,1,2,3,4,5,6,7,8]},{"key":[0,82,1,187,1,2,3,4,5,6,7,8]}]'
     ;;
-  *"udp_conntrack"*)
-    printf '%s\n' '[{"key":[2,0,0,0,0,53,0,53]}]'
+  *"tcp_ct6"*)
+    printf '%s\n' '[{"key":[0,80,0,22,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]}]'
+    ;;
+  *"udp_ct4"*)
+    printf '%s\n' '[{"key":[0,53,0,53,1,2,3,4,5,6,7,8]}]'
     ;;
   *)
     printf '%s\n' '[]'
@@ -468,6 +517,8 @@ run_test "axdp parses stats flags" test_parse_stats_args_sets_expected_flags
 run_test "axdp parses ports flags" test_parse_ports_args_sets_expected_flags
 run_test "axdp sorts and diffs csv port lists" test_csv_helpers_sort_and_diff_ports
 run_test "axdp reads and updates runtime log level" test_run_log_level_reads_and_updates_config
+run_test "axdp reads and updates under-attack mode" test_run_under_attack_reads_and_updates_config
+run_test "axdp dispatches under-attack command correctly" test_main_dispatches_under_attack_command
 run_test "axdp preserves unrelated TOML sections on config update" test_config_updates_preserve_unrelated_sections
 run_test "axdp permanent supports SCTP ports" test_run_permanent_supports_sctp_ports
 run_test "axdp detects active xdp backend from runtime state" test_detect_backend_prefers_xdp_runtime_state

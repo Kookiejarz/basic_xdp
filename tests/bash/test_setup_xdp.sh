@@ -237,6 +237,116 @@ test_fetch_local_or_remote_uses_local_copy_without_network() (
     assert_file_contains "$dst" "local copy"
 )
 
+test_write_config_enables_queue_auto_tuning() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    CONFIG_DIR="$tmpdir/etc"
+    CONFIG_FILE="$CONFIG_DIR/auto_xdp.env"
+    IFACES=(eth0 eth1)
+    SYNC_SCRIPT="/tmp/xdp_port_sync.py"
+    PYTHON3_BIN="/usr/bin/python3"
+    BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
+    XDP_OBJ_INSTALLED="/tmp/xdp_firewall.o"
+    TC_OBJ_INSTALLED="/tmp/tc_flow_track.o"
+    BPF_HELPER_INSTALLED="/tmp/auto_xdp_bpf_helpers.py"
+    INSTALL_DIR="/tmp/auto_xdp"
+    PYTHON_LIB_DIR="/tmp/auto_xdp/python"
+
+    write_config || return 1
+
+    assert_file_contains "$CONFIG_FILE" 'AUTO_TUNE_QUEUES="1"'
+    assert_file_contains "$CONFIG_FILE" 'PYTHON_LIB_DIR="/tmp/auto_xdp/python"'
+)
+
+test_auto_tune_interface_parallelism_sets_combined_channels() (
+    set +e
+
+    local tmpdir log
+    tmpdir=$(mktemp -d)
+    log="$tmpdir/ethtool.log"
+
+    export AUTO_XDP_CPU_ONLINE_FILE="$tmpdir/cpu_online"
+    printf '0-5\n' > "$AUTO_XDP_CPU_ONLINE_FILE"
+
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+
+    IFACES=(eth0)
+    AUTO_TUNE_QUEUES=1
+
+    ethtool() {
+        if [[ "$1" == "-l" ]]; then
+            cat <<'EOF_ETHTOOL'
+Channel parameters for eth0:
+Pre-set maximums:
+RX:             0
+TX:             0
+Other:          1
+Combined:       4
+Current hardware settings:
+RX:             0
+TX:             0
+Other:          1
+Combined:       1
+EOF_ETHTOOL
+            return 0
+        fi
+        if [[ "$1" == "-L" ]]; then
+            printf '%s\n' "$*" > "$log"
+            return 0
+        fi
+        return 1
+    }
+
+    auto_tune_interface_parallelism || return 1
+    assert_file_contains "$log" "-L eth0 combined 4"
+)
+
+test_auto_tune_interface_parallelism_balances_irqs() (
+    set +e
+
+    local tmpdir irq
+    tmpdir=$(mktemp -d)
+
+    export AUTO_XDP_SYS_CLASS_NET_DIR="$tmpdir/sys/class/net"
+    export AUTO_XDP_PROC_IRQ_DIR="$tmpdir/proc/irq"
+    export AUTO_XDP_PROC_INTERRUPTS="$tmpdir/proc/interrupts"
+    export AUTO_XDP_CPU_ONLINE_FILE="$tmpdir/sys/devices/system/cpu/online"
+
+    mkdir -p "$AUTO_XDP_SYS_CLASS_NET_DIR/eth0/device/msi_irqs"
+    mkdir -p "$AUTO_XDP_PROC_IRQ_DIR"
+    mkdir -p "$(dirname "$AUTO_XDP_CPU_ONLINE_FILE")"
+
+    printf '0-2\n' > "$AUTO_XDP_CPU_ONLINE_FILE"
+    cat > "$AUTO_XDP_PROC_INTERRUPTS" <<'EOF_IRQS'
+ 32: 10 0 0 0 PCI-MSI  eth0-TxRx-0
+ 33: 0 10 0 0 PCI-MSI  eth0-TxRx-1
+ 34: 0 0 10 0 PCI-MSI  eth0-TxRx-2
+EOF_IRQS
+
+    for irq in 32 33 34; do
+        : > "$AUTO_XDP_SYS_CLASS_NET_DIR/eth0/device/msi_irqs/$irq"
+        mkdir -p "$AUTO_XDP_PROC_IRQ_DIR/$irq"
+        : > "$AUTO_XDP_PROC_IRQ_DIR/$irq/smp_affinity_list"
+    done
+
+    # shellcheck disable=SC1090
+    source "$REPO_ROOT/runtime/auto_xdp_runtime_common.sh"
+
+    IFACES=(eth0)
+    AUTO_TUNE_QUEUES=1
+    ethtool() { return 1; }
+
+    auto_tune_interface_parallelism || return 1
+
+    assert_file_contains "$AUTO_XDP_PROC_IRQ_DIR/32/smp_affinity_list" "0" || return 1
+    assert_file_contains "$AUTO_XDP_PROC_IRQ_DIR/33/smp_affinity_list" "1" || return 1
+    assert_file_contains "$AUTO_XDP_PROC_IRQ_DIR/34/smp_affinity_list" "2"
+)
+
 test_bpf_header_exists_checks_multiple_include_roots() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -343,36 +453,27 @@ test_xdp_maps_ready_requires_all_expected_pins() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
 
-    local tmpdir
+    local tmpdir map_name
     tmpdir=$(mktemp -d)
     BPF_PIN_DIR="$tmpdir"
 
-    touch \
-        "$tmpdir/prog" \
-        "$tmpdir/tcp_whitelist" \
-        "$tmpdir/udp_whitelist" \
-        "$tmpdir/sctp_whitelist" \
-        "$tmpdir/tcp_conntrack" \
-        "$tmpdir/udp_conntrack" \
-        "$tmpdir/sctp_conntrack"
+    map_name=$(xdp_required_map_names | head -n 1)
+    [[ -n "$map_name" ]] || {
+        printf 'expected shared XDP map manifest to be readable\n'
+        return 1
+    }
+
+    touch "$tmpdir/$map_name"
 
     xdp_maps_ready >/dev/null 2>&1
     local status=$?
     assert_eq "$status" "1" || return 1
 
-    touch \
-        "$tmpdir/trusted_ipv4" \
-        "$tmpdir/trusted_ipv6" \
-        "$tmpdir/syn_rate_ports" \
-        "$tmpdir/udp_rate_ports" \
-        "$tmpdir/syn_agg_rate_ports" \
-        "$tmpdir/tcp_conn_limit_ports" \
-        "$tmpdir/udp_agg_rate_ports" \
-        "$tmpdir/udp_global_rl" \
-        "$tmpdir/bogon_cfg" \
-        "$tmpdir/proto_handlers" \
-        "$tmpdir/slot_ctx_map" \
-        "$tmpdir/slot_def_action"
+    while IFS= read -r map_name; do
+        [[ -n "$map_name" ]] || continue
+        touch "$tmpdir/$map_name"
+    done < <(xdp_required_map_names)
+
     xdp_maps_ready >/dev/null 2>&1
     status=$?
     assert_eq "$status" "0"
@@ -390,8 +491,10 @@ test_load_tc_egress_program_reuses_sctp_conntrack_map() (
     IFACES=("eth9")
     mkdir -p "$BPF_PIN_DIR" "$tmpdir/bin"
     touch "$TC_OBJ_INSTALLED" \
-        "$BPF_PIN_DIR/tcp_conntrack" \
-        "$BPF_PIN_DIR/udp_conntrack" \
+        "$BPF_PIN_DIR/tcp_ct4" \
+        "$BPF_PIN_DIR/tcp_ct6" \
+        "$BPF_PIN_DIR/udp_ct4" \
+        "$BPF_PIN_DIR/udp_ct6" \
         "$BPF_PIN_DIR/sctp_conntrack"
 
     cat >"$tmpdir/bin/bpftool" <<EOF_BPFSH
@@ -545,6 +648,31 @@ test_cleanup_build_artifacts_step_preserves_local_sources() (
     }
 )
 
+test_restore_compiled_slot_handlers_step_reinstalls_builtin_objects() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    BUILD_STAGING_DIR="$tmpdir/stage"
+    INSTALL_DIR="$tmpdir/install"
+
+    mkdir -p "$BUILD_STAGING_DIR/handlers" "$INSTALL_DIR/handlers"
+    printf 'gre' >"$BUILD_STAGING_DIR/handlers/gre_handler.o"
+    printf 'esp' >"$BUILD_STAGING_DIR/handlers/esp_handler.o"
+
+    restore_compiled_slot_handlers_step >/dev/null || return 1
+
+    [[ -s "$INSTALL_DIR/handlers/gre_handler.o" ]] || {
+        printf 'expected gre handler object to be restored after SDK install\n'
+        return 1
+    }
+    [[ -s "$INSTALL_DIR/handlers/esp_handler.o" ]] || {
+        printf 'expected esp handler object to be restored after SDK install\n'
+        return 1
+    }
+)
+
 test_install_python_support_package_includes_state_module() (
     source "$REPO_ROOT/setup_xdp.sh"
     set +e
@@ -562,6 +690,91 @@ test_install_python_support_package_includes_state_module() (
 
     install_python_support_package || return 1
     assert_file_contains "$fetched" "auto_xdp/state.py -> ${AUTO_XDP_PACKAGE_DIR}/state.py"
+    assert_file_contains "$fetched" "auto_xdp/xdp_required_maps.txt -> ${AUTO_XDP_PACKAGE_DIR}/xdp_required_maps.txt"
+)
+
+test_install_python_support_package_removes_stale_files() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir fetched
+    tmpdir=$(mktemp -d)
+    AUTO_XDP_PACKAGE_DIR="$tmpdir/auto_xdp"
+    fetched="$tmpdir/fetched.log"
+
+    mkdir -p "$AUTO_XDP_PACKAGE_DIR/obsolete"
+    : >"$AUTO_XDP_PACKAGE_DIR/stale.py"
+    : >"$AUTO_XDP_PACKAGE_DIR/obsolete/old.txt"
+
+    fetch_local_or_remote() {
+        printf '%s -> %s\n' "$1" "$3" >>"$fetched"
+        mkdir -p "$(dirname "$3")"
+        printf 'fresh\n' >"$3"
+    }
+
+    install_python_support_package || return 1
+    [[ ! -e "$AUTO_XDP_PACKAGE_DIR/stale.py" ]] || {
+        printf 'expected stale package file to be removed\n'
+        return 1
+    }
+    [[ ! -e "$AUTO_XDP_PACKAGE_DIR/obsolete/old.txt" ]] || {
+        printf 'expected stale package subdirectory to be removed\n'
+        return 1
+    }
+    assert_file_contains "$AUTO_XDP_PACKAGE_DIR/state.py" "fresh"
+)
+
+test_install_slot_handler_sdk_cleans_stale_files_and_preserves_configured_custom_handlers() (
+    source "$REPO_ROOT/setup_xdp.sh"
+    set +e
+
+    local tmpdir fetched
+    tmpdir=$(mktemp -d)
+    INSTALL_DIR="$tmpdir/install"
+    CONFIG_DIR="$tmpdir/etc"
+    PYTHON3_BIN="${PYTHON3_BIN:-python3}"
+    fetched="$tmpdir/fetched.log"
+
+    mkdir -p "$INSTALL_DIR/handlers" "$CONFIG_DIR"
+    cat >"$CONFIG_DIR/config.toml" <<EOF_CFG
+[slots]
+enabled = [{ proto = 99, path = "${INSTALL_DIR}/handlers/custom_99_keep.o" }]
+
+[port_handlers.tcp]
+"25565" = "${INSTALL_DIR}/handlers/minecraft_handler.o"
+EOF_CFG
+
+    : >"$INSTALL_DIR/handlers/gre_handler.o"
+    : >"$INSTALL_DIR/handlers/old_removed_handler.o"
+    : >"$INSTALL_DIR/handlers/custom_99_keep.o"
+    : >"$INSTALL_DIR/handlers/minecraft_handler.o"
+    : >"$INSTALL_DIR/handlers/xdp_slot_ctx.h"
+    : >"$INSTALL_DIR/handlers/Makefile"
+
+    fetch_local_or_remote() {
+        printf '%s -> %s\n' "$1" "$3" >>"$fetched"
+        mkdir -p "$(dirname "$3")"
+        printf 'sdk\n' >"$3"
+    }
+
+    install_slot_handler_sdk || return 1
+    [[ ! -e "$INSTALL_DIR/handlers/gre_handler.o" ]] || {
+        printf 'expected old built-in handler object to be removed\n'
+        return 1
+    }
+    [[ ! -e "$INSTALL_DIR/handlers/old_removed_handler.o" ]] || {
+        printf 'expected stale unconfigured handler object to be removed\n'
+        return 1
+    }
+    [[ -e "$INSTALL_DIR/handlers/custom_99_keep.o" ]] || {
+        printf 'expected configured custom slot handler to be preserved\n'
+        return 1
+    }
+    [[ -e "$INSTALL_DIR/handlers/minecraft_handler.o" ]] || {
+        printf 'expected configured custom port handler to be preserved\n'
+        return 1
+    }
+    assert_file_contains "$INSTALL_DIR/handlers/Makefile" "sdk"
 )
 
 run_test "setup_xdp detects distro families" test_detect_os_release_maps_supported_families
@@ -573,6 +786,9 @@ run_test "setup_xdp dry-run report emits CI fields" test_dry_run_report_emits_ci
 run_test "setup_xdp confirmation handles force and no-tty abort" test_confirm_yes_no_force_and_no_tty_abort_modes
 run_test "setup_xdp aborts when existing install is not confirmed" test_confirm_existing_install_step_aborts_without_confirmation
 run_test "setup_xdp prefers local files when available" test_fetch_local_or_remote_uses_local_copy_without_network
+run_test "setup_xdp writes queue auto tuning into runtime config" test_write_config_enables_queue_auto_tuning
+run_test "setup_xdp sizes combined channels to available CPUs" test_auto_tune_interface_parallelism_sets_combined_channels
+run_test "setup_xdp balances interface irqs across CPUs" test_auto_tune_interface_parallelism_balances_irqs
 run_test "setup_xdp detects required BPF headers across include roots" test_bpf_header_exists_checks_multiple_include_roots
 run_test "setup_xdp surfaces truncated handler build logs" test_warn_from_log_file_prefixes_and_truncates_output
 run_test "setup_xdp stages handler sources outside the current directory" test_prepare_slot_handler_sources_uses_staging_dir
@@ -586,6 +802,9 @@ run_test "setup_xdp backend step falls back to nftables" test_deploy_backend_ste
 run_test "setup_xdp service step warns when no init system exists" test_install_runtime_service_step_warns_without_init_system
 run_test "setup_xdp loads configured slot handlers only for xdp backend" test_load_configured_slot_handlers_step_only_runs_for_xdp
 run_test "setup_xdp cleanup step preserves local sources" test_cleanup_build_artifacts_step_preserves_local_sources
+run_test "setup_xdp restores compiled builtin slot handlers after runtime install" test_restore_compiled_slot_handlers_step_reinstalls_builtin_objects
 run_test "setup_xdp installs auto_xdp state module into runtime package" test_install_python_support_package_includes_state_module
+run_test "setup_xdp removes stale installed python package files" test_install_python_support_package_removes_stale_files
+run_test "setup_xdp cleans stale handler artifacts but preserves configured custom handlers" test_install_slot_handler_sdk_cleans_stale_files_and_preserves_configured_custom_handlers
 
 finish_tests
