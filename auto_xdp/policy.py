@@ -1,5 +1,7 @@
 """Rate-limit policy resolution helpers for port sync and firewall rules."""
 
+from dataclasses import replace
+
 from auto_xdp import config as cfg
 from auto_xdp.services import service_name
 from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
@@ -110,14 +112,9 @@ def _syn_aggregate_rate_limit(port: int, proc: str = "") -> int:
     return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE
 
 
-def rate_map_entries_v6(v4_entries: int) -> int:
-    """Derive the v6 inner-map capacity from the v4 one.
-
-    Ports carrying the global v4 default use the operator's global v6
-    value; per-port overrides derive as v4/4 with a floor of 64."""
-    if v4_entries == cfg.RATE_MAP_ENTRIES_V4:
-        return cfg.RATE_MAP_ENTRIES_V6
-    return max(v4_entries // 4, 64)
+def rate_map_entries_v6(_v4_entries: int) -> int:
+    """Return the fixed v6 capacity required by the compiled map template."""
+    return cfg.RATE_MAP_ENTRIES_V6
 
 
 def _rate_map_entries(port: int, proc: str = "") -> int:
@@ -244,26 +241,35 @@ def _grant_for(endpoint: RuntimeEndpoint, subject: dict) -> tuple[bool, str, str
 def resolve_exposure_decisions(observed: ObservedState) -> list[ExposureDecision]:
     """Compile runtime endpoints against explicit workload exposure grants."""
     decisions: list[ExposureDecision] = []
-    for endpoint in observed.endpoints:
-        resolved = _subject_for_endpoint(endpoint)
-        if resolved is None:
+    for observed_endpoint in observed.endpoints:
+        endpoints = (
+            tuple(
+                replace(observed_endpoint, ingress_zone=zone)
+                for zone in cfg.ZONES
+            )
+            if observed_endpoint.bind_scope == "wildcard" and cfg.ZONES
+            else (observed_endpoint,)
+        )
+        for endpoint in endpoints:
+            resolved = _subject_for_endpoint(endpoint)
+            if resolved is None:
+                decisions.append(
+                    ExposureDecision(
+                        endpoint, "drop", "unknown or unapproved workload ownership"
+                    )
+                )
+                continue
+            subject_name, subject = resolved
+            allowed, reason, profile = _grant_for(endpoint, subject)
             decisions.append(
                 ExposureDecision(
-                    endpoint, "drop", "unknown or unapproved workload ownership"
+                    endpoint,
+                    "allow" if allowed else "drop",
+                    reason,
+                    subject_name,
+                    profile,
                 )
             )
-            continue
-        subject_name, subject = resolved
-        allowed, reason, profile = _grant_for(endpoint, subject)
-        decisions.append(
-            ExposureDecision(
-                endpoint,
-                "allow" if allowed else "drop",
-                reason,
-                subject_name,
-                profile,
-            )
-        )
 
     # A global port map cannot safely express two incompatible owners. Keep
     # the whole port closed when the inventory proves shared/ambiguous ownership.

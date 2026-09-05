@@ -40,9 +40,11 @@ _UDP_RATE_BY_SERVICE: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_PROC: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_SERVICE: dict[str, int] = {}
 
-# Per-port rate-limit inner map capacities (ARRAY_OF_MAPS inners).
-RATE_MAP_ENTRIES_V4 = 16384
-RATE_MAP_ENTRIES_V6 = 4096
+# ARRAY_OF_MAPS requires every LRU inner to match the compiled template.
+_RATE_MAP_TEMPLATE_ENTRIES_V4 = 16384
+_RATE_MAP_TEMPLATE_ENTRIES_V6 = 4096
+RATE_MAP_ENTRIES_V4 = _RATE_MAP_TEMPLATE_ENTRIES_V4
+RATE_MAP_ENTRIES_V6 = _RATE_MAP_TEMPLATE_ENTRIES_V6
 _RATE_MAP_ENTRIES_BY_PROC: dict[str, int] = {}
 _RATE_MAP_ENTRIES_BY_SERVICE: dict[str, int] = {}
 
@@ -369,8 +371,8 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     POLICY_MODE = "audit"
     RATE_LIMIT_SOURCE_PREFIX_V4 = 32
     RATE_LIMIT_SOURCE_PREFIX_V6 = 128
-    RATE_MAP_ENTRIES_V4 = 16384
-    RATE_MAP_ENTRIES_V6 = 4096
+    RATE_MAP_ENTRIES_V4 = _RATE_MAP_TEMPLATE_ENTRIES_V4
+    RATE_MAP_ENTRIES_V6 = _RATE_MAP_TEMPLATE_ENTRIES_V6
 
     if "permanent_ports" in cfg:
         raise ValueError("unsupported exposure configuration; use subjects.*.exposure grants")
@@ -413,10 +415,17 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     _UDP_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_by_service", {}).items()})
     _UDP_AGG_BYTES_BY_PROC.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_proc", {}).items()})
     _UDP_AGG_BYTES_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_service", {}).items()})
-    RATE_MAP_ENTRIES_V4 = int(rl.get("map_entries_v4", 16384))
-    RATE_MAP_ENTRIES_V6 = int(rl.get("map_entries_v6", 4096))
-    _RATE_MAP_ENTRIES_BY_PROC.update({k: int(v) for k, v in rl.get("map_entries_by_proc", {}).items()})
-    _RATE_MAP_ENTRIES_BY_SERVICE.update({k: int(v) for k, v in rl.get("map_entries_by_service", {}).items()})
+    RATE_MAP_ENTRIES_V4 = int(rl.get("map_entries_v4", _RATE_MAP_TEMPLATE_ENTRIES_V4))
+    RATE_MAP_ENTRIES_V6 = int(rl.get("map_entries_v6", _RATE_MAP_TEMPLATE_ENTRIES_V6))
+    if (
+        RATE_MAP_ENTRIES_V4 != _RATE_MAP_TEMPLATE_ENTRIES_V4
+        or RATE_MAP_ENTRIES_V6 != _RATE_MAP_TEMPLATE_ENTRIES_V6
+        or rl.get("map_entries_by_proc")
+        or rl.get("map_entries_by_service")
+    ):
+        raise ValueError(
+            "rate-limit inner map capacities are fixed by the compiled XDP map ABI"
+        )
 
     BOGON_FILTER_ENABLED = bool(cfg.get("firewall", {}).get("bogon_filter", True))
     ISATTACK = cfg.get("under_attack", {})

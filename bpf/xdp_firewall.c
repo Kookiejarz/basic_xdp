@@ -27,6 +27,7 @@ static __always_inline int check_tcp_policy(
         bool bypass_rate = key->family == CT_FAMILY_IPV4
             ? is_trusted_v4((__be32)key->saddr[0])
             : is_trusted_v6((const struct in6_addr *)key->saddr);
+        bypass_rate = bypass_rate || tcp_acl_allowed(key, dest_port);
         if (!bypass_rate && abuseipdb_active() && key->family == CT_FAMILY_IPV4 &&
             is_abuseipdb_v4((__be32)key->saddr[0])) {
             count(CNT_ABUSEIPDB_DROP);
@@ -559,7 +560,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
         void *trans_data = (void *)(ipv6 + 1);
 
         __u8 nexthdr = skip_ipv6_exthdr(&trans_data, data_end, ipv6->nexthdr);
-        // 0xFF is our dedicated sentinel for non-initial IPv6 fragments.
+        // 0xFF is our dedicated sentinel for every IPv6 fragment.
         if (nexthdr == IPV6_FRAG_DROP_SENTINEL) {
             count(CNT_FRAG_DROP);
             { __u32 s[4], d[4];

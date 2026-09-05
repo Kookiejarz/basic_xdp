@@ -98,9 +98,8 @@ struct {
 } tcp_port_policies SEC(".maps");
 
 /* Per-port rate-limit isolation: outer array indexed directly by dport.
- * Each occupied slot holds a per-port LRU created by userspace (hash-type
- * inner maps may differ in max_entries since kernel 5.10 — no flag needed;
- * BPF_F_INNER_MAP is ARRAY-only and htab creation rejects it with EINVAL).
+ * Each occupied slot holds a per-port LRU created by userspace with metadata
+ * matching the compiled template; BPF_F_INNER_MAP is not valid for LRU_HASH.
  * NULL slot = no rate limit configured for that port. */
 #define RATE_MAP_DEFAULT_ENTRIES_V4 16384
 #define RATE_MAP_DEFAULT_ENTRIES_V6 4096

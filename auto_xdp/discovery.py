@@ -628,7 +628,7 @@ def _get_listening_ports_netlink() -> ObservedState:
             subject, attribution, source, container = _proc_attribution(inode)
             if raw_name == "systemd" and name != "systemd":
                 subject, attribution, source, container = name, "exact", "systemd-socket", None
-            if name and name != "systemd" and container is None:
+            if attribution != "exact" and name and name != "systemd" and container is None:
                 subject = name
             state.endpoints.append(
                 _endpoint("tcp", _addr_str(family, src), port, subject, attribution, source, container)
@@ -643,6 +643,7 @@ def _get_listening_ports_netlink() -> ObservedState:
             else:
                 proc_udp[_port] = {"drops": _data["drops"]}
 
+    udp_sockets: list[dict] = []
     udp_agg: dict[int, dict] = {}
     for family in (socket.AF_INET, socket.AF_INET6):
         for sport_h, dport_h, src, _dst, inode, rqueue in _nldiag_dump(
@@ -652,31 +653,29 @@ def _get_listening_ports_netlink() -> ObservedState:
             if port == 0:
                 continue
             connected = dport_h != 0
-            if port not in udp_agg:
-                udp_agg[port] = {
-                    "family": family,
-                    "src": src,
-                    "inode": inode,
-                    "rqueue": rqueue,
-                    "count": 1,
-                    "connected_only": connected,
-                }
-            else:
-                udp_agg[port]["rqueue"] += rqueue
-                udp_agg[port]["count"] += 1
-                if not connected:
-                    udp_agg[port]["connected_only"] = False
+            udp_sockets.append({
+                "port": port,
+                "family": family,
+                "src": src,
+                "inode": inode,
+                "connected": connected,
+            })
+            aggregate = udp_agg.setdefault(port, {"rqueue": 0, "count": 0})
+            aggregate["rqueue"] += rqueue
+            aggregate["count"] += 1
 
-    for port, info in udp_agg.items():
+    for info in udp_sockets:
+        port = info["port"]
         family, src = info["family"], info["src"]
         if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
             continue
         if port in cfg.DISCOVERY_EXCLUDE_PORTS:
             continue
-        if info["connected_only"]:
+        aggregate = udp_agg[port]
+        if info["connected"]:
             server_signal = (
-                info["count"] > 1               # SO_REUSEPORT proxy
-                or info["rqueue"] > 0           # receive backlog (from SOCK_DIAG)
+                aggregate["count"] > 1           # SO_REUSEPORT proxy
+                or aggregate["rqueue"] > 0       # receive backlog (from SOCK_DIAG)
                 or proc_udp.get(port, {}).get("drops", 0) > 0
             )
             if not server_signal:
@@ -684,17 +683,17 @@ def _get_listening_ports_netlink() -> ObservedState:
         state.udp.add(port)
         name = _resolve_systemd(_proc_name(info["inode"]), port)
         if name:
-            state.udp_processes[port] = name
+            state.udp_processes.setdefault(port, name)
         subject, attribution, source, container = _proc_attribution(info["inode"])
-        if name and name != "systemd" and container is None:
+        if attribution != "exact" and name and name != "systemd" and container is None:
             subject = name
         state.endpoints.append(
             _endpoint("udp", _addr_str(family, src), port, subject, attribution, source, container)
         )
         opts: set[str] = set()
-        if info["count"] > 1:
+        if aggregate["count"] > 1:
             opts.add("SO_REUSEPORT")
-        if info["rqueue"] > 0:
+        if aggregate["rqueue"] > 0:
             opts.add("rx_queue>0")
         if proc_udp.get(port, {}).get("drops", 0) > 0:
             opts.add("drops>0")
@@ -716,6 +715,59 @@ def _get_listening_ports_netlink() -> ObservedState:
     except OSError:
         pass
 
+    return _mark_shared_endpoints(state)
+
+
+def _append_published_container_endpoints(
+    state: ObservedState,
+    published: dict[tuple[str, int], list[ContainerIdentity]],
+) -> ObservedState:
+    """Add runtime endpoints implemented by container NAT rather than a host socket."""
+    exclude_nets = _discovery_exclude_networks()
+    existing = {
+        (
+            endpoint.protocol,
+            endpoint.host_port,
+            endpoint.host_address.split("%", 1)[0],
+            endpoint.container_runtime,
+            endpoint.container_id,
+        )
+        for endpoint in state.endpoints
+    }
+    for (protocol, port), identities in published.items():
+        for identity in identities:
+            host_address = identity.host_ip or "0.0.0.0"
+            key = (
+                protocol,
+                port,
+                host_address.split("%", 1)[0],
+                identity.runtime,
+                identity.container_id,
+            )
+            if key in existing or not _bind_ip_is_exposed(host_address, exclude_nets):
+                continue
+            if protocol == "tcp":
+                state.tcp.add(port)
+                state.tcp_processes.setdefault(port, identity.subject)
+            elif protocol == "udp":
+                state.udp.add(port)
+                state.udp_processes.setdefault(port, identity.subject)
+            elif protocol == "sctp":
+                state.sctp.add(port)
+            else:
+                continue
+            state.endpoints.append(
+                _endpoint(
+                    protocol,
+                    host_address,
+                    port,
+                    identity.subject,
+                    "exact",
+                    f"{identity.runtime}-inspect",
+                    identity,
+                )
+            )
+            existing.add(key)
     return _mark_shared_endpoints(state)
 
 
@@ -838,7 +890,8 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
 def get_listening_ports(cached_conns=None) -> ObservedState:
     """Read externally reachable listening TCP/UDP/SCTP ports."""
     if _IS_LINUX:
-        _container_metadata()
-    if _IS_LINUX:
-        return _get_listening_ports_netlink()
+        published, _ = _container_metadata()
+        return _append_published_container_endpoints(
+            _get_listening_ports_netlink(), published
+        )
     return _get_listening_ports_psutil(cached_conns)

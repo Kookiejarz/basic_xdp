@@ -71,15 +71,9 @@ static __always_inline __u8 skip_ipv6_exthdr(
         case IPPROTO_FRAGMENT: // 44 Fragment header (fixed 8 bytes)
         {
             __u8 *hdr = *trans_data;
-            __u16 frag_off_flags;
             if ((void *)(hdr + 8) > data_end)
                 return IPV6_EXTHDR_MALFORMED_SENTINEL;
-            frag_off_flags = ((__u16)hdr[2] << 8) | hdr[3];
-            if (frag_off_flags & 0xFFF8)
-                return IPV6_FRAG_DROP_SENTINEL;
-            nexthdr = hdr[0];
-            *trans_data += 8;
-            break;
+            return IPV6_FRAG_DROP_SENTINEL;
         }
         default:
             // TCP / UDP / ICMPv6 / other: stop traversal

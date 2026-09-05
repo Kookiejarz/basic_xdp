@@ -65,6 +65,24 @@ static __always_inline bool acl_port_match(struct acl_val *v, __u32 port)
     return false;
 }
 
+static __always_inline bool tcp_acl_allowed(const struct flow_key *key, __u32 port)
+{
+    if (key->family == CT_FAMILY_IPV4) {
+        struct trusted_v4_key tk = {
+            .prefixlen = 32,
+            .addr = (__be32)key->saddr[0],
+        };
+        struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
+        return av && acl_port_match(av, port);
+    }
+
+    struct trusted_v6_key tk;
+    tk.prefixlen = 128;
+    __builtin_memcpy(tk.addr, key->saddr, 16);
+    struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
+    return av && acl_port_match(av, port);
+}
+
 static __always_inline bool abuseipdb_active(void)
 {
     struct xdp_runtime_cfg *cfg = runtime_cfg();

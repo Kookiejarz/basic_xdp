@@ -98,9 +98,7 @@ def map_get_fd_by_id(map_id_: int) -> int:
 
 def probe_inner_map_support() -> bool:
     """True if the kernel accepts an LRU_HASH inner in an ARRAY_OF_MAPS
-    outer. No BPF_F_INNER_MAP: that flag is ARRAY-only and htab creation
-    rejects it with EINVAL; hash-type inners may differ in max_entries
-    without it (kernel 5.10+)."""
+    outer. LRU inner maps must match the outer's compiled template metadata."""
     inner_fd = -1
     outer_fd = -1
     try:

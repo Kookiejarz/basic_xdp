@@ -773,17 +773,18 @@ class BpfSynRatePortsMap(CacheVerifyMixin, BpfFdMap):
 
 class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
     """ARRAY_OF_MAPS outer keyed by dport; each occupied slot holds a
-    per-port LRU inner (no BPF_F_INNER_MAP — htab rejects that flag;
-    hash-type inners may differ in max_entries without it).
+    per-port LRU inner matching the compiled map template exactly.
 
     Cache shape: {dport: inner max_entries}.
     """
 
     def __init__(self, path: str, inner_key_size: int,
-                 inner_value_size: int, name_prefix: str) -> None:
+                 inner_value_size: int, inner_max_entries: int,
+                 name_prefix: str) -> None:
         super().__init__(path)
         self._inner_key_size = inner_key_size
         self._inner_value_size = inner_value_size
+        self._inner_max_entries = inner_max_entries
         self._name_prefix = name_prefix
         self._max_entries: int = map_max_entries(self.fd)
         self._cache: dict[int, int] = self._read_kernel()
@@ -852,6 +853,12 @@ class BpfRateOuterMap(CacheVerifyMixin, BpfFdMap):
             return False
 
     def set(self, port: int, capacity: int, dry_run: bool = False) -> bool:
+        if capacity != self._inner_max_entries:
+            log.error(
+                "rate outer %s: inner capacity %d does not match compiled template %d",
+                self.path, capacity, self._inner_max_entries,
+            )
+            return False
         if self._cache.get(port) == capacity:
             return True
         if dry_run:

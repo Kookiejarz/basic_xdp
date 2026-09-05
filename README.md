@@ -45,7 +45,7 @@ Static firewall rules drift as services come and go. Auto XDP watches runtime en
 - Native XDP can drop unwanted packets before they enter the normal Linux networking path.
 - The same listener policy can use `nftables` when native XDP is unavailable.
 
-This keeps the firewall tied to both operator intent and current runtime state. Legacy permanent-port behavior remains available when the new `[policy]` section is absent; service-aware mode uses grants, zones, and protection profiles.
+This keeps the firewall tied to both operator intent and current runtime state. Legacy `permanent_ports` configuration is rejected; exposure must use workload grants and zones.
 
 ## Auto XDP compared with other firewalls
 

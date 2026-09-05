@@ -102,16 +102,13 @@ systemd / sockets / containers
        XDP ingress -> Linux network stack
 ```
 
-XDP consumes destination IP/protocol/port policy, source ACLs, rate limits,
+XDP consumes ingress-interface/protocol/port policy, source ACLs, rate limits,
 and handler state. The resolver carries the profile name for decisions and
 explanations; profile-specific behavior is still deferred, so V1 applies the
-existing generic protection maps to every authorized endpoint. The current XDP
-implementation also has a small project-owned flow-admission cache for
-reply/handshake fast paths. It is not a general-purpose replacement for Linux
-conntrack. Egress `tc` tracking
-is optional support for locally initiated reply visibility; exposure
+existing generic protection maps to every authorized endpoint. Exposure
 authorization, asymmetric ingress-only reconciliation, and stateless
-protection do not require symmetric routing.
+protection do not require symmetric routing or project-owned connection
+tracking.
 
 If a future stateful feature needs kernel conntrack, it must capability-detect
 the kernel facility and retain a restricted stateless fallback. Auto XDP does
@@ -149,7 +146,10 @@ activation attribution, separate bind scope and ingress zone, explicit grants,
 explainable decisions, effective-port reconciliation, stale exposure removal,
 latency measurement, and fail-closed structural parsing.
 
-Deferred until separately evidenced: Docker/Podman published-port attribution,
-approval workflow, a service-specific profile implementation, optional kernel
-conntrack lookup, strict per-packet workload authentication, full L7
-inspection, custom BPF conntrack, and upstream volumetric mitigation.
+Implemented after the V1 baseline: Docker/Podman published-port attribution,
+including NAT-only publications, and the approval workflow.
+
+Deferred until separately evidenced: a service-specific profile implementation,
+optional kernel conntrack lookup, destination-address/CIDR zone keys, strict
+per-packet workload authentication, full L7 inspection, custom BPF conntrack,
+and upstream volumetric mitigation.
