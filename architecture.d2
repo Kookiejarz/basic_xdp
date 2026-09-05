@@ -1,0 +1,26 @@
+# Auto XDP workload-aware exposure architecture
+# Render with: d2 architecture.d2 architecture.svg
+
+direction: right
+
+intent: "Operator intent\n[policy] + [subjects] grants"
+runtime: "RuntimeEndpoint observer\nSOCK_DIAG + /proc + systemd"
+attribution: "Workload attribution\nexact | delegated | shared | unknown"
+zones: "Ingress zones\nbind scope != zone"
+compile: "Policy reconciler\nallow/drop + reason + profile"
+maps: "Effective policy\nXDP maps / atomic nftables"
+dataplane: "XDP ingress\nparse -> policy -> protection"
+stack: "Linux network stack"
+audit: "observe / audit\nno backend writes"
+deferred: "Deferred: containers,\noptional kernel conntrack,\nupstream DDoS"
+
+intent -> compile: "explicit grants"
+runtime -> attribution: "live evidence"
+attribution -> compile
+zones -> compile
+compile -> maps: "enforce only"
+compile -> audit: "explain inventory"
+maps -> dataplane
+dataplane -> stack: "XDP_PASS"
+dataplane -> dataplane: "XDP_DROP"
+deferred -> compile: "capability-gated follow-up"

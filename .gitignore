@@ -5,7 +5,11 @@ __pycache__/
 .superpowers/
 uv.lock
 XDP-eBPF-Anti-DDoS-Firewall/
-website/
+website/*
+!website/src/
+website/src/*
+!website/src/general-usage.mov
+!website/src/exclude-ports.mov
 docs/
 *.log
 *.o

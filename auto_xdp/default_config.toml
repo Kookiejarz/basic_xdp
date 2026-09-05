@@ -1,5 +1,5 @@
 # Auto XDP configuration — /etc/auto_xdp/config.toml
-# Manage via: axdp trust / axdp acl / axdp permanent
+# Manage via: axdp trust / axdp acl / policy subjects and exposure grants
 # The daemon reloads this file on SIGHUP (no restart needed).
 # To apply changes immediately: axdp restart
 
@@ -14,6 +14,30 @@ bogon_filter = false
 # When enabled, drop telemetry is disabled in the XDP data path to avoid
 # per-drop ringbuf writes and reduce hot-path CPU cost.
 enabled = false
+
+# Workload-aware exposure is explicit: LISTEN != AUTHORIZATION.
+# Use observe/audit before enabling enforcement on an existing host.
+[policy]
+mode = "audit" # observe | audit | enforce; switch to enforce after grants are audited
+
+[zones.public]
+# Empty means non-loopback wildcard binds are classified as public.
+interfaces = []
+
+[zones.trusted]
+interfaces = ["tailscale0", "wg0"]
+
+[unknown_subjects]
+public = "deny"
+trusted = "deny"
+
+# Example grant:
+# [subjects.website.resolve]
+# systemd_unit = "nginx.service"
+# [subjects.website.exposure.public.tcp]
+# ports = [80, 443]
+# [subjects.website.protection]
+# profile = "web"
 
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.
@@ -63,24 +87,10 @@ exclude_loopback = true
 # Useful for admin sockets, VPN-only services, or addresses handled elsewhere.
 exclude_bind_cidrs = []
 
-[permanent_ports]
-# Ports always kept open regardless of which services are running.
-# SCTP is config-managed only; it is not auto-discovered from listening sockets.
-# Use these when a port must stay allowed even if the owning process is temporarily absent.
-tcp = []
-udp = []
-sctp = []
-
 [trusted_ips]
 # Source IPs/CIDRs with elevated handling.
-# XDP TCP: trusted sources may pass pure SYN packets even when the port was not
-# auto-discovered, and they bypass SYN rate limits.
-# XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
-# port must already be whitelisted. Once whitelisted, trusted sources bypass
-# UDP rate limits and port handlers.
-# nftables fallback mirrors the XDP distinction: trusted TCP sources may open
-# a SYN to an otherwise closed port, while trusted UDP sources still require
-# the destination port to be open; both bypass fallback rate limits.
+# Trusted sources may bypass selected mitigation checks, but never authorize a
+# closed or ungranted destination port. The destination must already be allowed.
 # Format:  "CIDR" = "label"
 # "10.0.0.0/8" = "internal network"
 
@@ -142,13 +152,6 @@ telnet          = 2
 [rate_limits.syn_agg_by_service]
 # Optional service-name fallback for aggregate SYN rate limits.
 
-[rate_limits.tcp_conn_by_proc]
-# Optional per-process cap on concurrent tracked TCP connections per source.
-
-[rate_limits.tcp_conn_by_service]
-# Optional service-name fallback for TCP concurrent connection caps.
-
-
 # UDP rate limits (packets per second per source IP).
 # UDP is stateless at the protocol level, so these controls help bound abuse.
 
@@ -174,12 +177,8 @@ openvpn = 200
 # Service-name fallback for aggregate UDP byte-rate caps.
 
 # Per-CIDR port ACL rules.
-# XDP TCP ACL entries explicitly allow matching source CIDRs to reach listed
-# TCP ports even when those ports were not auto-discovered, and bypass TCP SYN
-# rate limits.
-# XDP UDP ACL entries do not open closed UDP ports; the destination UDP port
-# must already be whitelisted. Once whitelisted, matching ACL entries bypass
-# UDP rate limits and port handlers.
+# ACL entries restrict already-authorized destination ports; they never create
+# exposure. Matching traffic may bypass selected mitigation checks.
 # Use ACL when a service should be reachable only from specific source ranges.
 
 # [[acl]]
@@ -210,17 +209,9 @@ enabled = []
 [port_handlers.udp]
 # Per-port UDP handlers: "PORT" = "/path/to/handler.o" or ".c".
 
-[xdp]
-# Remove stale conntrack entries after N consecutive reconcile rounds miss them.
-# Only affects userspace-managed TCP conntrack seeding/cleanup logic.
-conntrack_stale_reconciles = 2
-
 [xdp.runtime]
 # Hot-updated XDP data-path tunables. Set a duration to 0 to let the BPF
 # program use its compiled default.
-tcp_timeout_seconds = 300
-udp_timeout_seconds = 60
-conntrack_refresh_seconds = 30
 icmp_burst_packets = 100
 icmp_rate_pps = 100
 udp_global_window_seconds = 1

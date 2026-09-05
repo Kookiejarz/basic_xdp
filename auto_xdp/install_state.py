@@ -182,7 +182,6 @@ def merge_machine_state(
             "xdp_mode": old.get("xdp_mode", default_xdp_mode),
             "requested_mode": default_xdp_mode,
             "last_program_id": old.get("last_program_id"),
-            "tc_egress": bool(old.get("tc_egress", False)),
         }
     return {
         "schema": STATE_SCHEMA,
@@ -257,7 +256,7 @@ def _cmd_select(args: argparse.Namespace) -> int:
 def _parse_interface_state(raw: str) -> tuple[str, dict[str, Any]]:
     try:
         name, payload = raw.split("=", 1)
-        mode, program_id, tc_state = payload.split(":")
+        mode, program_id = payload.split(":")
     except ValueError as exc:
         raise ValueError(f"invalid interface state: {raw}") from exc
     if mode not in {"native", "generic", "off"}:
@@ -265,8 +264,7 @@ def _parse_interface_state(raw: str) -> tuple[str, dict[str, Any]]:
     return name, {
         "xdp_mode": mode,
         "program_id": None if program_id in {"", "-"} else int(program_id),
-        "tc_egress": tc_state == "attached",
-        "verified": mode == "off" or (program_id not in {"", "-"} and tc_state == "attached"),
+        "verified": mode == "off" or program_id not in {"", "-"},
     }
 
 
@@ -285,7 +283,6 @@ def _cmd_record(args: argparse.Namespace) -> int:
             {
                 "xdp_mode": state["xdp_mode"],
                 "last_program_id": state["program_id"],
-                "tc_egress": state["tc_egress"],
             }
         )
         old_interfaces[name] = previous

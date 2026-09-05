@@ -7,11 +7,52 @@
 #include "include/trust_acl.h"
 #include "include/rate_limit.h"
 #include "include/port_dispatch.h"
-#include "include/conntrack.h"
+#include "include/exposure.h"
 #include "include/parse.h"
 #include "include/slots.h"
 
 /* --- Protocol dispatch functions --- */
+
+static __always_inline int check_tcp_policy(
+    struct xdp_md *ctx, struct flow_key *key, __u8 tcp_flags,
+    __u32 dest_port, __u16 l3_off, __u16 inner_off)
+{
+    __u64 now = bpf_ktime_get_ns();
+    struct xdp_runtime_cfg *cfg = runtime_cfg();
+
+    if (!tcp_exposure_allowed(ctx, dest_port))
+        goto drop;
+
+    if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
+        bool bypass_rate = key->family == CT_FAMILY_IPV4
+            ? is_trusted_v4((__be32)key->saddr[0])
+            : is_trusted_v6((const struct in6_addr *)key->saddr);
+        if (!bypass_rate && abuseipdb_active() && key->family == CT_FAMILY_IPV4 &&
+            is_abuseipdb_v4((__be32)key->saddr[0])) {
+            count(CNT_ABUSEIPDB_DROP);
+            goto drop;
+        }
+        if (is_handler_blocked(key))
+            goto drop;
+        if (precheck_new_tcp_syn(key, dest_port, bypass_rate, now, cfg) == XDP_DROP)
+            return XDP_DROP;
+        try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
+        count(CNT_TCP_NEW_ALLOW);
+        emit_allow(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+                   key->sport, key->dport, (__u8)CNT_TCP_NEW_ALLOW, now);
+        return XDP_PASS;
+    }
+
+    try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
+    count(CNT_TCP_PASS);
+    return XDP_PASS;
+
+drop:
+    count(CNT_TCP_DROP);
+    emit_drop(IPPROTO_TCP, key->family, key->saddr, key->daddr,
+              key->sport, key->dport, (__u8)CNT_TCP_DROP, now);
+    return XDP_DROP;
+}
 
 static __always_inline int check_tcp_ipv4(
     struct xdp_md *ctx,
@@ -42,19 +83,11 @@ static __always_inline int check_tcp_ipv4(
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
-        __u64 now = bpf_ktime_get_ns();
-        struct xdp_runtime_cfg *cfg = runtime_cfg();
-        if (is_trusted_v4(ip->saddr))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
-
-        struct trusted_v4_key tk = { .prefixlen = 32, .addr = ip->saddr };
-        struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v4, &tk);
-        if (av && acl_port_match(av, dest_port))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
-
+        // Trust and ACLs can bypass mitigation, but never create exposure.
+        // The shared TCP path below remains the authorization boundary.
     }
 
-    return check_tcp_conntrack(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
+    return check_tcp_policy(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
 }
 
 static __always_inline int check_tcp_ipv6(
@@ -87,21 +120,11 @@ static __always_inline int check_tcp_ipv6(
 
     // Malformed-packet check already ran above; fragments dropped before we arrive.
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
-        __u64 now = bpf_ktime_get_ns();
-        struct xdp_runtime_cfg *cfg = runtime_cfg();
-        if (is_trusted_v6(&ipv6->saddr))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
-
-        struct trusted_v6_key tk;
-        tk.prefixlen = 128;
-        __builtin_memcpy(tk.addr, &ipv6->saddr, 16);
-        struct acl_val *av = bpf_map_lookup_elem(&tcp_acl_v6, &tk);
-        if (av && acl_port_match(av, dest_port))
-            return allow_new_tcp_syn(&key, dest_port, true, false, now, cfg);
-
+        // Trust and ACLs can bypass mitigation, but never create exposure.
+        // The shared TCP path below remains the authorization boundary.
     }
 
-    return check_tcp_conntrack(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
+    return check_tcp_policy(ctx, &key, tcp_flags, dest_port, l3_off, inner_off);
 }
 
 static __always_inline int check_udp_ipv4(
@@ -111,10 +134,9 @@ static __always_inline int check_udp_ipv4(
 {
     struct udphdr *udp = trans_data;
     struct flow_key key;
-    struct ct_key_v4 ct_key;
+    struct udp_validation_key_v4 validation_key;
     __u64 now = bpf_ktime_get_ns();
     struct xdp_runtime_cfg *cfg = runtime_cfg();
-    __u64 *last_seen;
 
     if ((void *)(udp + 1) > data_end)
         return XDP_DROP;
@@ -135,25 +157,10 @@ static __always_inline int check_udp_ipv4(
     __u64 pkt_bytes = (__u64)bpf_ntohs(ip->tot_len);
     struct udp_port_policy_cfg *policy;
 
-    // tc egress records outbound UDP packets as the reverse tuple; XDP looks up
-    // the inbound tuple here to pass replies without a whitelist check.
     fill_flow_key_v4(&key, ip->saddr, ip->daddr, udp->source, udp->dest);
-    fill_ct_key_v4_map(&ct_key, &key);
+    fill_udp_validation_key_v4(&validation_key, &key);
 
-    last_seen = bpf_map_lookup_elem(&udp_ct4, &ct_key);
-    if (last_seen) {
-        __u64 age = now - *last_seen;
-        if (age <= cfg_udp_timeout_ns(cfg)) {
-            if (age > cfg_ct_refresh_ns(cfg))
-                bpf_map_update_elem(&udp_ct4, &ct_key, &now, BPF_EXIST);
-            count(CNT_UDP_PASS);
-            return XDP_PASS;
-        }
-        bpf_map_delete_elem(&udp_ct4, &ct_key);
-    }
-
-    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
-    if (!allow || !*allow) {
+    if (!udp_exposure_allowed(ctx, dest_port)) {
         count(CNT_UDP_DROP);
         emit_drop(IPPROTO_UDP, CT_FAMILY_IPV4, key.saddr, key.daddr,
                   key.sport, key.dport, (__u8)CNT_UDP_DROP, now);
@@ -191,7 +198,7 @@ static __always_inline int check_udp_ipv4(
     }
 
     {
-        __u64 *valid_until = bpf_map_lookup_elem(&udp_hv4, &ct_key);
+        __u64 *valid_until = bpf_map_lookup_elem(&udp_hv4, &validation_key);
         if (valid_until && now < *valid_until) {
             count(CNT_UDP_PASS);
             return XDP_PASS;
@@ -258,10 +265,9 @@ static __always_inline int check_udp_ipv6(
 {
     struct udphdr *udp = trans_data;
     struct flow_key key;
-    struct ct_key_v6 ct_key;
+    struct udp_validation_key_v6 validation_key;
     __u64 now = bpf_ktime_get_ns();
     struct xdp_runtime_cfg *cfg = runtime_cfg();
-    __u64 *last_seen;
     struct udp_port_policy_cfg *policy;
 
     if ((void *)(udp + 1) > data_end)
@@ -284,22 +290,10 @@ static __always_inline int check_udp_ipv6(
     __u64 pkt_bytes = (__u64)sizeof(*ipv6) + (__u64)bpf_ntohs(ipv6->payload_len);
 
     fill_flow_key_v6(&key, &ipv6->saddr, &ipv6->daddr, udp->source, udp->dest);
-    fill_ct_key_v6_map(&ct_key, &key);
+    fill_udp_validation_key_v6(&validation_key, &key);
 
-    last_seen = bpf_map_lookup_elem(&udp_ct6, &ct_key);
-    if (last_seen) {
-        __u64 age = now - *last_seen;
-        if (age <= cfg_udp_timeout_ns(cfg)) {
-            if (age > cfg_ct_refresh_ns(cfg))
-                bpf_map_update_elem(&udp_ct6, &ct_key, &now, BPF_EXIST);
-            count(CNT_UDP_PASS);
-            return XDP_PASS;
-        }
-        bpf_map_delete_elem(&udp_ct6, &ct_key);
-    }
 
-    __u32 *allow = bpf_map_lookup_elem(&udp_whitelist, &dest_port);
-    if (!allow || !*allow) {
+    if (!udp_exposure_allowed(ctx, dest_port)) {
         count(CNT_UDP_DROP);
         emit_drop(IPPROTO_UDP, CT_FAMILY_IPV6, key.saddr, key.daddr,
                   key.sport, key.dport, (__u8)CNT_UDP_DROP, now);
@@ -329,7 +323,7 @@ static __always_inline int check_udp_ipv6(
     }
 
     {
-        __u64 *valid_until = bpf_map_lookup_elem(&udp_hv6, &ct_key);
+        __u64 *valid_until = bpf_map_lookup_elem(&udp_hv6, &validation_key);
         if (valid_until && now < *valid_until) {
             count(CNT_UDP_PASS);
             return XDP_PASS;
@@ -445,16 +439,16 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_PASS;
+        return XDP_DROP;
 
     // Strip 802.1Q / QinQ VLAN tags so firewall rules apply to the inner
     // EtherType.  Without this, VLAN-tagged IP packets arrive with
-    // h_proto=0x8100 and bypass all port/conntrack checks via CNT_NON_IP.
+    // h_proto=0x8100 and bypass all port/policy checks via CNT_NON_IP.
     __be16 eth_proto = eth->h_proto;
     void  *l3_data   = (void *)(eth + 1);
 
     if (!strip_vlan_tags(&eth_proto, &l3_data, data_end))
-        return XDP_PASS; // truncated VLAN header: let the kernel handle it
+        return XDP_DROP; // truncated VLAN header cannot be classified safely
 
     // Drop packets with more VLAN layers than VLAN_MAX_DEPTH — no legitimate
     // traffic uses such deep nesting; deeper tags are a known bypass technique.
@@ -469,12 +463,12 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
     if (eth_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr *ip = l3_data;
         if ((void *)(ip + 1) > data_end)
-            return XDP_PASS;
+            return XDP_DROP;
 
         // Validate ihl before reading frag_off
         __u32 ip_hlen = ip->ihl * 4;
-        if (ip_hlen < sizeof(*ip))
-            return XDP_PASS;
+        if (ip_hlen < sizeof(*ip) || (void *)ip + ip_hlen > data_end)
+            return XDP_DROP;
 
         // Drop IPv4 fragmented packets (rarely needed on personal servers, and fragments can bypass port filtering)
         if (ip->frag_off & bpf_htons(IP_MF | IP_OFFSET)) {
@@ -507,7 +501,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             struct icmphdr *icmp = trans_data;
             if ((void *)(icmp + 1) > data_end) {
                 count(CNT_IPV4_OTHER);
-                return XDP_PASS;
+                return XDP_DROP;
             }
             __u8 icmp_type = icmp->type;
             // Control-plane messages required for PMTU discovery, traceroute,
@@ -560,7 +554,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
     if (eth_proto == bpf_htons(ETH_P_IPV6)) {
         struct ipv6hdr *ipv6 = l3_data;
         if ((void *)(ipv6 + 1) > data_end)
-            return XDP_PASS;
+            return XDP_DROP;
 
         void *trans_data = (void *)(ipv6 + 1);
 
@@ -574,6 +568,8 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
               emit_drop(0, CT_FAMILY_IPV6, s, d, 0, 0, (__u8)CNT_FRAG_DROP, now); }
             return XDP_DROP;
         }
+        if (nexthdr == IPV6_EXTHDR_MALFORMED_SENTINEL)
+            return XDP_DROP;
         if (nexthdr == IPPROTO_NONE)
             return XDP_PASS;
 
@@ -610,7 +606,7 @@ static __always_inline int _xdp_fw(struct xdp_md *ctx) {
             struct icmp6hdr *icmp6 = trans_data;
             if ((void *)(icmp6 + 1) > data_end) {
                 count(CNT_IPV6_OTHER);
-                return XDP_PASS;
+                return XDP_DROP;
             }
             if (icmp6->icmp6_type == ICMPV6_ECHO_REQUEST &&
                 !is_trusted_v6(&ipv6->saddr) &&

@@ -8,7 +8,7 @@
  * this via get_slot_ctx() to skip re-parsing headers already
  * validated by the main program.
  *
- *  family       : CT_FAMILY_IPV4 (2) or CT_FAMILY_IPV6 (10)
+ *  family       : FAMILY_IPV4 (2) or FAMILY_IPV6 (10)
  *  ip_proto     : final L4 protocol number — for IPv6 this is the
  *                 result of skip_ipv6_exthdr(), never an ext-hdr type
  *  l3_offset    : byte offset from ctx->data to the IP/IPv6 header

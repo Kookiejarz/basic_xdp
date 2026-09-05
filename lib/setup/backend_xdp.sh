@@ -5,7 +5,7 @@ cleanup_existing_xdp() {
     # Scan ALL system interfaces, not just IFACES: a previous install may have
     # attached XDP to different interfaces. Discovery and confirmation happen
     # before staging, but the programs remain attached until the candidate XDP
-    # and tc programs have both committed successfully.
+    # program has committed successfully.
     local iface any_xdp=0
     XDP_PREVIOUS_IFACES=()
     for iface in $(ls /sys/class/net/ 2>/dev/null); do
@@ -53,7 +53,7 @@ deploy_xdp_backend() {
     cleanup_existing_xdp
 
     if ! transactional_reload_xdp; then
-        XDP_FALLBACK_REASON="transactional XDP/tc switch failed; previous attachment was preserved or restored"
+        XDP_FALLBACK_REASON="transactional XDP switch failed; previous attachment was preserved or restored"
         warn "XDP upgrade failed transactionally; previous protection was preserved or restored."
         if _auto_xdp_any_target_has_xdp; then
             XDP_FALLBACK_BLOCKED=1
@@ -66,7 +66,7 @@ deploy_xdp_backend() {
     load_sock_state_tracker || true
 
     # Old attachments on interfaces removed from IFACES are detached only after
-    # the target interfaces and tc filters have committed successfully.
+    # the target interfaces have committed successfully.
     local old_iface target keep
     for old_iface in "${XDP_PREVIOUS_IFACES[@]}"; do
         keep=0
@@ -77,11 +77,6 @@ deploy_xdp_backend() {
             ip link set dev "$old_iface" xdp off 2>/dev/null || true
             ip link set dev "$old_iface" xdpgeneric off 2>/dev/null || true
             ip link set dev "$old_iface" xdpoffload off 2>/dev/null || true
-            if command -v tc &>/dev/null; then
-                tc filter del dev "$old_iface" egress \
-                    pref "${TC_FILTER_PREF:-49152}" \
-                    handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null || true
-            fi
         fi
     done
 

@@ -1,0 +1,67 @@
+# Listener discovery and policy reconciliation
+direction: right
+
+triggers: {
+  label: "Triggers"
+  proc: "Process connector\nEXEC / EXIT"
+  tcp: "TCP socket-state\ntracepoint event"
+  relay: "pkt-relay\nport_change"
+  timer: "30-second periodic scan"
+  reload: "SIGHUP config reload"
+  proc -> scan
+  tcp -> relay -> scan
+  timer -> scan
+  reload -> scan
+}
+
+scan: "SOCK_DIAG listener scan"
+tcp_listen: "TCP LISTEN sockets"
+udp: "UDP sockets\n/proc/net/udp* heuristics"
+sctp: "SCTP sockets\nbest effort"
+owners: "inode -> PID ->\nprocess / service"
+filters: "Filter loopback, excluded\nCIDRs/ports, multicast"
+
+scan -> tcp_listen
+scan -> udp
+scan -> sctp
+tcp_listen -> owners
+udp -> owners
+sctp -> owners
+owners -> filters
+
+observed: "ObservedState"
+config: "config.toml"
+policy: "Grant + zone policy\ncalculation"
+desired: "DesiredState"
+applied: "AppliedState"
+plan: "ReconcilePlan"
+
+filters -> observed
+config -> policy
+observed -> policy
+policy -> desired
+desired -> plan
+applied -> plan
+
+xdp: "XDP global + zone\nmap update"
+nft: "nft -f atomic ruleset"
+verify: "Verify effective policy"
+next: "AppliedState"
+
+plan -> xdp: "XDP backend"
+plan -> nft: "nft backend"
+xdp -> verify
+nft -> verify
+verify -> next
+next -> applied
+verify -> scan: "retry on failure"
+
+ordering: {
+  label: "Safety ordering"
+  prepare: "Opening: prepare policy first"
+  expose: "Opening: add whitelist entry"
+  close: "Closing: remove whitelist first"
+  cleanup: "Closing: clean supporting state"
+  prepare -> expose
+  close -> cleanup
+}

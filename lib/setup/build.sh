@@ -53,24 +53,15 @@ compile_bpf_object() {
 generate_xdp_map_abi() {
     local source_root="$1"
     local header="${source_root}/bpf/include/map_sizes.h"
-    local ct4 ct6 rate4 rate6
+    local rate4 rate6
 
     [[ -f "$header" ]] || return 1
-    ct4=$(awk '$2 == "CT_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
-    ct6=$(awk '$2 == "CT_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
     rate4=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V4" { print $3; exit }' "$header")
     rate6=$(awk '$2 == "RATE_MAP_MAX_ENTRIES_V6" { print $3; exit }' "$header")
-    [[ "$ct4" =~ ^[0-9]+$ && "$ct6" =~ ^[0-9]+$ \
-        && "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
+    [[ "$rate4" =~ ^[0-9]+$ && "$rate6" =~ ^[0-9]+$ ]] || return 1
 
     cat >"${BUILD_STAGING_DIR}/xdp_map_abi.txt" <<EOF
 # Map capacities derived from bpf/include/map_sizes.h.
-tcp_ct4 ${ct4}
-tcp_ct6 ${ct6}
-udp_ct4 ${ct4}
-udp_ct6 ${ct6}
-tcp_pd4 ${rate4}
-tcp_pd6 ${rate6}
 hblk4 ${rate4}
 hblk6 ${rate6}
 udp_hv4 ${rate4}
@@ -79,10 +70,6 @@ synag4 ${rate4}
 synag6 ${rate6}
 udpag4 ${rate4}
 udpag6 ${rate6}
-tsc4 ${rate4}
-tsc6 ${rate6}
-tsc_pfx4 ${rate4}
-tsc_pfx6 ${rate6}
 EOF
 }
 
@@ -297,14 +284,6 @@ compile_xdp_program() {
         return 1
     fi
 
-    if ! stage_build_source "$TC_SRC" "$TC_SRC" "$TC_SRC"; then
-        warn "Unable to fetch ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
-        return 0
-    fi
-    if ! compile_bpf_object "${_source_root}/${TC_SRC}" "${BUILD_STAGING_DIR}/${TC_OBJ}" "$_source_root"; then
-        warn "Failed to compile ${TC_SRC}; TCP/UDP tc egress tracker will be skipped."
-        return 0
-    fi
     if [[ $_handlers_ready -eq 1 && -d "$_handlers_dir" ]] && command -v make &>/dev/null; then
         if ! bpf_header_exists "linux/bpf.h" "/usr/include" "$ASM_INC"; then
             warn "Slot handlers skipped: missing linux/bpf.h in /usr/include or ${ASM_INC}"
@@ -359,13 +338,13 @@ compile_sock_state_program() {
 }
 
 compile_bpf_objects_step() {
-    step_begin "Compiling XDP, tc, and sock_state BPF objects" COMPILE
+    step_begin "Compiling XDP and sock_state BPF objects" COMPILE
     local ok=1
     compile_xdp_program || ok=0
     compile_sock_state_program || true
     if [[ $ok -eq 1 ]]; then
         if [[ ${HANDLER_BUILD_FAILED:-0} -eq 1 ]]; then
-            step_ok "XDP/tc compiled; slot handlers unavailable"
+            step_ok "XDP compiled; slot handlers unavailable"
         else
             step_ok
         fi
@@ -399,14 +378,14 @@ cleanup_build_artifacts_step() {
     local _cleaned=()
 
     step_begin "Cleaning up build artifacts"
-    for _f in "$XDP_OBJ" "$TC_OBJ" "$SOCK_STATE_OBJ"; do
+    for _f in "$XDP_OBJ" "$SOCK_STATE_OBJ"; do
         if [[ -f "$_f" ]]; then
             rm -f "$_f" && _cleaned+=("$_f")
         fi
     done
 
     if [[ $PREFER_REMOTE_SOURCES -eq 1 ]]; then
-        for _f in "$XDP_SRC" "$TC_SRC"; do
+        for _f in "$XDP_SRC"; do
             if [[ -f "$_f" ]]; then
                 rm -f "$_f" && _cleaned+=("$_f")
             fi

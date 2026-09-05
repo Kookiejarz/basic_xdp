@@ -3,9 +3,7 @@
 
 Deliberately self-contained: setup bootstrap (lib/setup/build.sh) may fetch
 this single file to a temp path and run it before the auto_xdp package exists
-on the host, so the bpf()/obj_get()/pack_ct_key* duplicates of
-auto_xdp/bpf/syscall.py and auto_xdp/discovery.py must stay local — do not
-replace them with package imports.
+on the host.
 """
 
 from __future__ import annotations
@@ -13,20 +11,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
-import ipaddress
 import json
 import os
 import platform
-import socket
 import struct
 import subprocess
 import sys
-import time
-
-try:
-    import psutil
-except ImportError:
-    psutil = None
 
 
 NR_BPF = {
@@ -35,7 +25,6 @@ NR_BPF = {
     "armv7l": 386,
     "armv6l": 386,
 }.get(platform.machine(), 321)
-BPF_MAP_UPDATE_ELEM = 2
 BPF_OBJ_GET = 7
 
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -83,135 +72,6 @@ def cmd_pin_maps(prog_id: int, pin_dir: str) -> int:
         return 1
 
 
-def iter_established_tcp():
-    if psutil is None:
-        return
-    getter = getattr(psutil, "connections", psutil.net_connections)
-    for conn in getter(kind="inet"):
-        if getattr(conn, "family", None) not in (socket.AF_INET, socket.AF_INET6):
-            continue
-        if getattr(conn, "type", None) != socket.SOCK_STREAM:
-            continue
-        if conn.status != psutil.CONN_ESTABLISHED:
-            continue
-        if not conn.laddr or not conn.raddr:
-            continue
-        yield conn
-
-
-def pack_ct_key_v4(conn) -> bytes:
-    remote_ip = socket.inet_aton(conn.raddr.ip)
-    local_ip = socket.inet_aton(conn.laddr.ip)
-    return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-
-
-def pack_ct_key_v6(conn) -> bytes:
-    mapped_remote = _ipv4_mapped_packed(conn.raddr.ip)
-    mapped_local = _ipv4_mapped_packed(conn.laddr.ip)
-    if mapped_remote is not None and mapped_local is not None:
-        return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, mapped_remote, mapped_local)
-    remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
-    local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
-    return struct.pack("!HH16s16s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-
-
-def _ipv4_mapped_packed(ip_str: str) -> bytes | None:
-    try:
-        addr = ipaddress.IPv6Address(ip_str.split("%", 1)[0])
-    except ValueError:
-        return None
-    if addr.ipv4_mapped is None:
-        return None
-    return addr.ipv4_mapped.packed
-
-
-def pack_ct_key(conn) -> bytes:
-    if conn.family == socket.AF_INET:
-        return pack_ct_key_v4(conn)
-    return pack_ct_key_v6(conn)
-
-
-def _open_optional_map(path: str) -> tuple[int, ctypes.Array, ctypes.Array] | None:
-    if not path or not os.path.exists(path):
-        return None
-    fd = obj_get(path)
-    return fd, ctypes.create_string_buffer(8), ctypes.create_string_buffer(128)
-
-
-def cmd_seed_tcp_conntrack(map_path_v4: str, map_path_v6: str) -> int:
-    if psutil is None:
-        print(0)
-        return 0
-
-    try:
-        map_v4 = _open_optional_map(map_path_v4)
-        map_v6 = _open_optional_map(map_path_v6)
-    except OSError as exc:
-        print(f"seed-tcp-conntrack failed to open map: {exc}", file=sys.stderr)
-        return 1
-
-    if map_v4 is None and map_v6 is None:
-        print(0)
-        return 0
-
-    key_v4 = ctypes.create_string_buffer(12)
-    key_v6 = ctypes.create_string_buffer(36)
-    attr_v4 = ctypes.create_string_buffer(128)
-    attr_v6 = ctypes.create_string_buffer(128)
-    value_v4 = map_v4[1] if map_v4 is not None else None
-    value_v6 = map_v6[1] if map_v6 is not None else None
-    if map_v4 is not None:
-        assert value_v4 is not None  # value_v4 is set whenever map_v4 is
-        struct.pack_into(
-            "=I4xQQQ",
-            attr_v4,
-            0,
-            map_v4[0],
-            ctypes.cast(key_v4, ctypes.c_void_p).value or 0,
-            ctypes.cast(value_v4, ctypes.c_void_p).value or 0,
-            0,
-        )
-    if map_v6 is not None:
-        assert value_v6 is not None  # value_v6 is set whenever map_v6 is
-        struct.pack_into(
-            "=I4xQQQ",
-            attr_v6,
-            0,
-            map_v6[0],
-            ctypes.cast(key_v6, ctypes.c_void_p).value or 0,
-            ctypes.cast(value_v6, ctypes.c_void_p).value or 0,
-            0,
-        )
-
-    seeded = 0
-    stamp = time.monotonic_ns()
-    for conn in iter_established_tcp():
-        try:
-            packed = pack_ct_key(conn)
-            if len(packed) == 12 and map_v4 is not None:
-                assert value_v4 is not None
-                ctypes.memmove(key_v4, packed, len(packed))
-                struct.pack_into("=Q", value_v4, 0, stamp)
-                bpf(BPF_MAP_UPDATE_ELEM, attr_v4)
-            elif len(packed) == 36 and map_v6 is not None:
-                assert value_v6 is not None
-                ctypes.memmove(key_v6, packed, len(packed))
-                struct.pack_into("=Q", value_v6, 0, stamp)
-                bpf(BPF_MAP_UPDATE_ELEM, attr_v6)
-            else:
-                continue
-            seeded += 1
-        except OSError:
-            continue
-
-    if map_v4 is not None:
-        os.close(map_v4[0])
-    if map_v6 is not None:
-        os.close(map_v6[0])
-    print(seeded)
-    return 0
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Auto XDP BPF helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -220,15 +80,9 @@ def main() -> int:
     pin.add_argument("--prog-id", type=int, required=True)
     pin.add_argument("--pin-dir", required=True)
 
-    seed = sub.add_parser("seed-tcp-conntrack", help="Seed established TCP flows into conntrack map")
-    seed.add_argument("--map-path-v4", default="")
-    seed.add_argument("--map-path-v6", default="")
-
     args = parser.parse_args()
     if args.cmd == "pin-maps":
         return cmd_pin_maps(args.prog_id, args.pin_dir)
-    if args.cmd == "seed-tcp-conntrack":
-        return cmd_seed_tcp_conntrack(args.map_path_v4, args.map_path_v6)
     return 1
 
 

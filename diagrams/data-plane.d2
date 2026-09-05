@@ -1,0 +1,84 @@
+# XDP/eBPF and nftables data plane
+direction: right
+
+ingress: "NIC ingress"
+parse: "Parse L2/L3/L4\nbounds + malformed checks"
+dispatch: "Protocol dispatch"
+
+tcp: {
+  label: "TCP path"
+  syn: "Inbound SYN"
+  exposure: "Explicit endpoint grant\n+ ingress interface/zone?"
+  abuse: "AbuseIPDB / handler block"
+  limits: "SYN + source/prefix/port\nconnection limits"
+  handler: "Per-port handler"
+  pending: "Create SYN_PENDING CT"
+  pass: "XDP_PASS"
+  drop: "XDP_DROP"
+  established: "ACK: pending -> established"
+  syn -> trust
+  exposure -> abuse: "yes"
+  exposure -> drop: "no / unknown"
+  abuse -> limits: "allowed"
+  abuse -> drop: "blocked"
+  limits -> handler: "allowed"
+  limits -> drop: "over limit"
+  handler -> pending
+  pending -> pass
+  established -> pass
+}
+
+udp: {
+  label: "UDP path"
+  hit: "Existing CT hit?"
+  exposure: "Explicit endpoint grant\n+ ingress interface/zone?"
+  abuse: "AbuseIPDB + handler block"
+  limits: "Source packet + prefix byte\nglobal byte limits"
+  handler: "Validated handler"
+  pass: "XDP_PASS"
+  drop: "XDP_DROP"
+  hit -> pass: "yes"
+  hit -> exposure: "no"
+  exposure -> abuse: "yes"
+  exposure -> drop: "no / unknown"
+  abuse -> limits: "allowed"
+  abuse -> drop: "blocked"
+  limits -> handler: "allowed"
+  limits -> drop: "over limit"
+  handler -> pass
+}
+
+icmp: "ICMP / ICMPv6\ncontrol + echo limits"
+tunnel: "Configured protocol slots\nSIT, SCTP, handlers"
+
+ingress -> parse -> dispatch
+dispatch -> tcp.syn: "TCP SYN"
+dispatch -> tcp.established: "TCP ACK / FIN / RST"
+dispatch -> udp.hit: "UDP"
+dispatch -> icmp: "ICMP"
+dispatch -> tunnel: "other protocols"
+
+ct: "Shared CT maps"
+tc: "tc_flow_track.c\negress observer"
+app: "Local application"
+stack: "Linux network stack"
+
+tcp.pending -> ct
+udp.hit -> ct
+tc -> ct: "reverse tuple + refresh"
+app -> tc
+tcp.pass -> stack
+udp.pass -> stack
+icmp -> stack
+tunnel -> stack
+
+nft: {
+  label: "Alternative nftables backend"
+  table: "Managed nftables table"
+  rules: "loopback -> invalid -> established\n-> zone grant/ACL -> meters -> public grant\n-> ICMP/SIT -> default"
+  verdict: "accept / drop"
+  table -> rules -> verdict
+}
+
+ingress -> nft.table: "when nft backend is committed"
+nft.verdict -> stack

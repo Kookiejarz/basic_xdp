@@ -529,9 +529,8 @@ EOF
     fi
     if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
         echo "  Backend        : XDP ($ACTIVE_XDP_MODE mode)"
-        echo "  Verification   : every interface program ID + tc egress"
+        echo "  Verification   : every interface program ID"
         echo "  BPF maps       : $BPF_PIN_DIR/"
-        echo "  TC egress obj  : $TC_OBJ_INSTALLED"
     else
         echo "  Backend        : nftables fallback"
         echo "  Fallback reason: ${XDP_FALLBACK_REASON:-XDP unavailable}"
@@ -593,7 +592,7 @@ dry_run_report() {
     echo "package_manager=$PKG_MANAGER"
     echo "init_system=$INIT_SYSTEM"
     echo "interfaces=${detected_ifaces:-undetected}"
-    echo "missing_commands=$(for cmd in clang bpftool python3 curl tar ip tc nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
+    echo "missing_commands=$(for cmd in clang bpftool python3 curl tar ip nft; do command -v "$cmd" >/dev/null 2>&1 || printf '%s ' "$cmd"; done | sed 's/[[:space:]]*$//')"
     echo "planned_packages=$(package_list_for_manager; optional_package_list_for_manager; printf ' python3-psutil python3-tomli-if-python310')"
     echo "planned_actions=check-dependencies,compile-xdp,deploy-backend,install-runtime,initial-sync,install-service"
     echo "note=dry-run performs no installs, no downloads, and no system changes"

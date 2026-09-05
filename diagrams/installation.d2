@@ -1,0 +1,33 @@
+# Installation and upgrade transaction
+direction: right
+
+operator: "Operator"
+setup: "setup_xdp.sh\nlock + recovery"
+detect: "Detect distro, init, tools,\ninterfaces, kernel capabilities"
+source: "Resolve immutable source revision"
+build: "Build BPF artifacts\nxdp_firewall.o\ntc_flow_track.o\nsock_state_track.o"
+stage: "Stage immutable release"
+validate: "Validate release and\nmap ABI metadata"
+quiesce: "Stop or quiesce old services"
+record: "Record transaction\nand rollback state"
+switch: "Atomically switch\ncurrent symlink"
+candidate: "Prepare candidate backend\nXDP generation or nft table"
+verify: "Verify attachment, maps,\nlinks, and ruleset"
+sync: "Initial endpoint inventory\nand policy synchronization"
+services: "Install and start\nsystemd / OpenRC services"
+commit: "Commit transaction"
+rollback: "Reject candidate and\nrestore prior verified state"
+
+operator -> setup -> detect -> source -> build -> stage -> validate -> quiesce -> record -> switch -> candidate -> verify -> sync -> services -> commit
+verify -> rollback: "failure"
+rollback -> commit: "prior state remains active"
+
+install_boundary: {
+  label: "Userspace release boundary"
+  stage -> validate -> switch
+}
+
+kernel_boundary: {
+  label: "Kernel backend boundary"
+  candidate -> verify -> sync
+}

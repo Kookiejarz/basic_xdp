@@ -28,8 +28,6 @@ class BackendReport:
     interfaces: list[str]
     xdp_mode: str
     xdp_attach: dict[str, str]
-    tc_egress: dict[str, str]
-    conntrack: dict[str, int]
     generation: str
     healthy: bool
     fallback_reason: str | None
@@ -101,13 +99,6 @@ def _ip_default_iface() -> str:
     return ""
 
 
-def _iface_tc_egress_state(iface: str) -> str:
-    if not _command_exists("tc"):
-        return "unavailable"
-    result = _run_text(["tc", "filter", "show", "dev", iface, "egress", "pref", "49152"])
-    return "attached" if result.returncode == 0 and result.stdout.strip() else "off"
-
-
 def _iface_xdp_program_id(iface: str) -> int | None:
     result = _run_text(["ip", "-j", "-d", "link", "show", "dev", iface])
     if result.returncode != 0:
@@ -151,23 +142,6 @@ def _iface_xdp_program_id(iface: str) -> int | None:
         return None
 
     return find_xdp(value)
-
-
-def _count_conntrack_entries(map_path: Path) -> int:
-    if not map_path.exists() or not _command_exists("bpftool"):
-        return 0
-    result = _run_text(["bpftool", "-j", "map", "dump", "pinned", str(map_path)])
-    if result.returncode != 0:
-        return 0
-    try:
-        rows = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return 0
-    return len(rows) if isinstance(rows, list) else 0
-
-
-def _count_conntrack_entries_many(*map_paths: Path) -> int:
-    return sum(_count_conntrack_entries(path) for path in map_paths)
 
 
 def _configured_ifaces(env: dict[str, str]) -> list[str]:
@@ -217,7 +191,6 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
     xdp_mode = xdp_mode_path.read_text().strip() if xdp_mode_path.exists() else "-"
 
     xdp_attach = {name: _iface_xdp_state(name) for name in interfaces}
-    tc_egress = {name: _iface_tc_egress_state(name) for name in interfaces}
     runtime_path = Path(env.get("RUNTIME_STATE", "/etc/auto_xdp/runtime-state.json"))
     machine_path = Path(env.get("MACHINE_STATE", "/etc/auto_xdp/machine-state.json"))
     persistent = _load_json_file(runtime_path)
@@ -246,7 +219,6 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
     )
     if backend == "xdp":
         attachments_ok = all(value in {"native", "generic"} for value in xdp_attach.values())
-        tc_ok = all(value == "attached" for value in tc_egress.values())
         saved_interfaces = persistent.get("interfaces", {})
         ids_ok = True
         if isinstance(saved_interfaces, dict) and saved_interfaces:
@@ -257,7 +229,7 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
                     ids_ok = False
                     break
         policy = "BPF maps pinned"
-        healthy = attachments_ok and tc_ok and ids_ok and clean_generation
+        healthy = attachments_ok and ids_ok and clean_generation
     else:
         schema = _nft_policy_schema(ctx.nft_family, ctx.nft_table)
         policy = f"{ctx.nft_family} {ctx.nft_table} / {schema}"
@@ -277,17 +249,6 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
         interfaces=interfaces,
         xdp_mode=xdp_mode,
         xdp_attach=xdp_attach,
-        tc_egress=tc_egress,
-        conntrack={
-            "tcp": _count_conntrack_entries_many(
-                ctx.bpf_pin_dir / "tcp_ct4",
-                ctx.bpf_pin_dir / "tcp_ct6",
-            ),
-            "udp": _count_conntrack_entries_many(
-                ctx.bpf_pin_dir / "udp_ct4",
-                ctx.bpf_pin_dir / "udp_ct6",
-            ),
-        },
         generation=generation if clean_generation else "recovery-required",
         healthy=healthy,
         fallback_reason=(
@@ -305,7 +266,6 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
 def render_backend_text(report: BackendReport) -> str:
     interfaces = " ".join(report.interfaces)
     xdp_attach = " ".join(f"{iface}={state}" for iface, state in report.xdp_attach.items()) or "-"
-    tc_egress = " ".join(f"{iface}={state}" for iface, state in report.tc_egress.items()) or "-"
     lines = [
             f"Backend   : {report.backend}",
             f"Preferred : {report.preferred_backend}",
@@ -316,8 +276,6 @@ def render_backend_text(report: BackendReport) -> str:
             f"Interfaces: {interfaces}",
             f"XDP mode  : {report.xdp_mode}",
             f"XDP attach: {xdp_attach}",
-            f"tc egress : {tc_egress}",
-            f"Conntrack : tcp={report.conntrack['tcp']} udp={report.conntrack['udp']}",
         ]
     if report.fallback_reason:
         lines.append(f"Fallback  : {report.fallback_reason}")
@@ -340,8 +298,6 @@ def render_backend_json(report: BackendReport) -> str:
             "interfaces": report.interfaces,
             "xdp_mode": report.xdp_mode,
             "xdp_attach": report.xdp_attach,
-            "tc_egress": report.tc_egress,
-            "conntrack": report.conntrack,
             "generation": report.generation,
             "healthy": report.healthy,
             "fallback_reason": report.fallback_reason,

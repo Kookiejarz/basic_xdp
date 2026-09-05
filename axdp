@@ -42,8 +42,9 @@ Commands:
   tui [args...]          Open htop-like live TUI
   watch [args...]        Shorthand for: stats --watch
   ports [args...]        Show currently allowed TCP/UDP ports
+  exposure               Show live service-aware exposure decisions
+  explain PROTO/PORT     Explain one runtime endpoint authorization decision
   backend                Show active backend and runtime attachment state
-  conntrack [args...]    Show TCP/UDP conntrack visibility
   sync [args...]         Run one sync pass with automatic backend selection
   check-update [args...] Compare installed files against GitHub and update
   log-level [LVL]        Show or change daemon log level
@@ -61,9 +62,14 @@ Commands:
   acl list               List per-CIDR port ACL rules
   acl add PROTO CIDR PORT...  Add an ACL rule (proto: tcp|udp)
   acl del PROTO CIDR     Remove an ACL rule
-  permanent list         List permanently whitelisted ports
-  permanent add PROTO PORT [LABEL]  Add a permanent port (tcp|udp|sctp)
-  permanent del PROTO PORT          Remove a permanent port
+  policy grants          List approved service exposure grants
+  approval list          List exposure approval requests
+  approval history       Show immutable approval audit history
+  approval request ...   Create an exposure approval request
+  approval approve ID    Approve a request and apply its grant
+  approval reject ID     Reject a request
+  approval revoke ID     Revoke a request's applied grant
+  approval-api           Run the root-only Unix-socket management API
   slot list              List loaded and available protocol slot handlers
   slot load NAME         Load built-in handler: gre, esp, sctp
   slot load PROTO PATH   Load custom handler .o or compile/load .c for IP proto number
@@ -92,10 +98,6 @@ TUI options:
 Ports options:
   --watch              Refresh continuously and detect changes
   --interval SEC       Refresh interval in seconds (default: 2)
-
-Conntrack options:
-  tcp|udp|all         Select conntrack map view (default: all)
-  --limit N           Show top N destination ports per map (default: 10)
 
 Check-update options:
   --force              Apply all updates without prompting
@@ -301,17 +303,6 @@ run_uninstall() {
             failures=1
         fi
 
-        if command -v tc >/dev/null 2>&1; then
-            tc filter del dev "$iface" egress \
-                protocol all pref 49152 handle 1 bpf >/dev/null 2>&1 || true
-            if tc filter show dev "$iface" egress pref 49152 handle 1 2>/dev/null | grep -q .; then
-                printf 'Failed to remove Auto XDP tc filter from %s.\n' "$iface" >&2
-                failures=1
-            fi
-        else
-            printf 'tc command is required to remove the egress tracker from %s.\n' "$iface" >&2
-            failures=1
-        fi
     done
 
     if command -v nft >/dev/null 2>&1; then
@@ -436,6 +427,7 @@ run_admin_config() {
         --bpf-pin-dir "$BPF_PIN_DIR" \
         --install-dir "$INSTALL_DIR" \
         --handlers-dir "$HANDLERS_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
         "$@"
 }
 
@@ -483,12 +475,6 @@ run_backend() {
     run_admin_runtime backend "$@"
 }
 
-run_conntrack() {
-    run_admin_config conntrack "$@"
-}
-
-
-
 run_ports() {
     require_admin_cli_runtime ports
 
@@ -505,6 +491,16 @@ run_ports() {
         --nft-family "$NFT_FAMILY" \
         --nft-table "$NFT_TABLE" \
         ports "${args[@]}"
+}
+
+run_exposure() {
+    require_admin_cli_runtime exposure
+    run_admin_config exposure "$@"
+}
+
+run_explain() {
+    require_admin_cli_runtime explain
+    run_admin_config explain "$@"
 }
 
 run_stats() {
@@ -666,29 +662,49 @@ run_acl() {
     esac
 }
 
-run_permanent() {
-    local sub="${1:-list}"
+run_policy() {
+    local sub="${1:-grants}"
     shift || true
-    case "$sub" in add|del) require_root "permanent $sub" ;; esac
     case "$sub" in
-        list)
-            run_admin_config permanent list
-            ;;
-        add)
-            [[ -f "$TOML_CONFIG" ]] || run_config init
-            run_admin_config permanent add "$@"
-            reload_daemon
-            ;;
-        del)
-            run_admin_config permanent del "$@"
-            reload_daemon
+        grants)
+            require_admin_cli_runtime policy
+            run_admin_config policy grants "$@"
             ;;
         -h|--help)
-            echo "Usage: axdp permanent list|add tcp|udp|sctp PORT [LABEL]|del tcp|udp|sctp PORT"
+            echo "Usage: axdp policy grants [--json]"
             ;;
         *)
-            echo "Unknown permanent subcommand: $sub" >&2; exit 1 ;;
+            echo "Unknown policy subcommand: $sub" >&2; exit 1 ;;
     esac
+}
+
+run_approval() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list|history)
+            require_admin_cli_runtime approval
+            require_root "approval $sub"
+            run_admin_config approval "$sub" "$@"
+            ;;
+        request|approve|reject|revoke)
+            require_admin_cli_runtime approval
+            require_root "approval $sub"
+            [[ -f "$TOML_CONFIG" ]] || run_config init
+            run_admin_config approval "$sub" "$@"
+            ;;
+        -h|--help)
+            echo "Usage: axdp approval list|history|request SUBJECT ZONE PROTO PORT...|approve ID|reject ID|revoke ID"
+            ;;
+        *)
+            echo "Unknown approval subcommand: $sub" >&2; exit 1 ;;
+    esac
+}
+
+run_approval_api() {
+    require_admin_cli_runtime approval-api
+    require_root "approval-api"
+    run_admin_config approval-api "$@"
 }
 
 run_slot() {
@@ -792,13 +808,17 @@ main() {
             shift || true
             run_ports "$@"
             ;;
+        exposure)
+            shift || true
+            run_exposure "$@"
+            ;;
+        explain)
+            shift || true
+            run_explain "$@"
+            ;;
         backend)
             shift || true
             run_backend "$@"
-            ;;
-        conntrack)
-            shift || true
-            run_conntrack "$@"
             ;;
         sync)
             shift || true
@@ -830,9 +850,17 @@ main() {
             shift || true
             run_acl "$@"
             ;;
-        permanent)
+        policy)
             shift || true
-            run_permanent "$@"
+            run_policy "$@"
+            ;;
+        approval)
+            shift || true
+            run_approval "$@"
+            ;;
+        approval-api)
+            shift || true
+            run_approval_api "$@"
             ;;
         slot)
             shift || true

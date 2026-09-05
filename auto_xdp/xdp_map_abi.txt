@@ -1,10 +1,4 @@
 # Map capacities derived from bpf/include/map_sizes.h.
-tcp_ct4 196608
-tcp_ct6 196608
-udp_ct4 196608
-udp_ct6 196608
-tcp_pd4 49152
-tcp_pd6 16384
 hblk4 49152
 hblk6 16384
 udp_hv4 49152
@@ -13,7 +7,3 @@ synag4 49152
 synag6 16384
 udpag4 49152
 udpag6 16384
-tsc4 49152
-tsc6 16384
-tsc_pfx4 49152
-tsc_pfx6 16384

@@ -68,8 +68,7 @@ package_list_for_manager() {
             echo "clang llvm libbpf-dev build-essential iproute2 curl tar findutils python3 python3-pip nftables${multilib}"
             ;;
         dnf|yum)
-            # tc lives in iproute-tc on Fedora/RHEL, not in iproute.
-            echo "clang llvm libbpf-devel bpftool iproute iproute-tc curl tar findutils python3 python3-pip gcc make nftables"
+            echo "clang llvm libbpf-devel bpftool iproute curl tar findutils python3 python3-pip gcc make nftables"
             ;;
         zypper)
             echo "clang llvm libbpf-devel bpftool iproute2 curl tar findutils python3 python3-pip gcc make nftables"
@@ -244,7 +243,7 @@ check_required_tools_step() {
     local cmd
 
     step_begin "Checking required tools"
-    for cmd in clang bpftool python3 curl tar find ip tc nft; do
+    for cmd in clang bpftool python3 curl tar find ip nft; do
         substep_run "$cmd" _tool_present "$cmd" || missing+=("$cmd")
     done
 
@@ -273,9 +272,6 @@ check_required_tools_step() {
                         ;;
                     tar)
                         warn "$cmd still missing — remote source staging will be unavailable"
-                        ;;
-                    tc)
-                        warn "tc still missing — TCP/UDP/SCTP egress reply tracking will be skipped"
                         ;;
                     nft)
                         warn "nft still missing — nftables fallback backend will be unavailable"

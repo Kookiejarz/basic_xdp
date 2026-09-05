@@ -244,7 +244,7 @@ begin_install_transaction_step() {
 _remove_obsolete_install_layout() {
     local path bin_dir
     local -a obsolete_root=(
-        python handlers xdp_required_maps.txt xdp_map_abi.txt xdp_firewall.o tc_flow_track.o
+        python handlers xdp_required_maps.txt xdp_map_abi.txt xdp_firewall.o
         sock_state_track.o auto_xdp_runtime_common.sh auto_xdp_bpf_helpers.py
         xdp_port_sync.py pkt_relay.py axdp auto_xdp_start.sh release.json
     )

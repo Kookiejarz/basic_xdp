@@ -2,7 +2,7 @@
 
 from auto_xdp import config as cfg
 from auto_xdp.services import service_name
-from auto_xdp.state import DesiredState, ObservedState
+from auto_xdp.state import DesiredState, ExposureDecision, ObservedState, RuntimeEndpoint
 
 _NS_PER_SECOND = 1_000_000_000
 
@@ -16,14 +16,14 @@ def _xdp_runtime_config() -> tuple[int, int, int, int, int, int, int, int]:
     if cfg.XDP_ICMP_RATE_PPS > 0:
         icmp_ns_per_token = max(1, int(_NS_PER_SECOND / cfg.XDP_ICMP_RATE_PPS))
     return (
-        _seconds_to_ns(cfg.XDP_TCP_TIMEOUT_SECONDS),
-        _seconds_to_ns(cfg.XDP_UDP_TIMEOUT_SECONDS),
-        _seconds_to_ns(cfg.XDP_CONNTRACK_REFRESH_SECONDS),
+        0,
+        0,
+        0,
         cfg.XDP_ICMP_BURST_PACKETS,
         icmp_ns_per_token,
         _seconds_to_ns(cfg.XDP_UDP_GLOBAL_WINDOW_SECONDS),
         _seconds_to_ns(cfg.XDP_RATE_WINDOW_SECONDS),
-        _seconds_to_ns(cfg.XDP_SYN_TIMEOUT_SECONDS),
+        0,
     )
 
 
@@ -110,39 +110,6 @@ def _syn_aggregate_rate_limit(port: int, proc: str = "") -> int:
     return cfg.XDP_DEFAULT_TCP_SYN_AGG_RATE
 
 
-def _tcp_conn_limit(port: int, proc: str = "") -> int:
-    explicit = _explicit_lookup(
-        port, proc, cfg._TCP_CONN_BY_PROC, cfg._TCP_CONN_BY_SERVICE,
-    )
-    if explicit is not None:
-        return explicit
-    if _is_sensitive(port, proc):
-        return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT
-    return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC
-
-
-def _tcp_conn_prefix_limit(port: int, proc: str = "") -> int:
-    explicit = _explicit_lookup(
-        port, proc, cfg._TCP_CONN_PREFIX_BY_PROC, cfg._TCP_CONN_PREFIX_BY_SERVICE,
-    )
-    if explicit is not None:
-        return explicit
-    if _is_sensitive(port, proc):
-        return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT
-    return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX
-
-
-def _tcp_conn_port_limit(port: int, proc: str = "") -> int:
-    explicit = _explicit_lookup(
-        port, proc, cfg._TCP_CONN_PORT_BY_PROC, cfg._TCP_CONN_PORT_BY_SERVICE,
-    )
-    if explicit is not None:
-        return explicit
-    if _is_sensitive(port, proc):
-        return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT
-    return cfg.XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT
-
-
 def rate_map_entries_v6(v4_entries: int) -> int:
     """Derive the v6 inner-map capacity from the v4 one.
 
@@ -203,11 +170,183 @@ def _desired_acl_rules() -> dict[tuple[str, str], frozenset[int]]:
     return desired
 
 
-def resolve_desired_state(observed: ObservedState) -> DesiredState:
-    tcp_ports = set(observed.tcp) | set(cfg.TCP_PERMANENT)
-    udp_ports = set(observed.udp) | set(cfg.UDP_PERMANENT)
-    sctp_ports = set(observed.sctp) | set(cfg.SCTP_PERMANENT)
+def _unit_name(value: object) -> str:
+    return str(value).strip().removesuffix(".service")
 
+
+def _container_label_match(value: object, labels: dict[str, str]) -> bool:
+    if isinstance(value, dict):
+        return all(labels.get(str(key)) == str(label) for key, label in value.items())
+    if isinstance(value, str) and "=" in value:
+        key, label = value.split("=", 1)
+        return labels.get(key.strip()) == label.strip()
+    return False
+
+
+def _container_resolver_matches(endpoint: RuntimeEndpoint, resolve: dict) -> bool:
+    identity_keys = {"container_id", "container_name", "container_label"}
+    if not identity_keys.intersection(resolve):
+        return False
+    if endpoint.attribution_state != "exact" or not endpoint.container_runtime:
+        return False
+    runtime = str(resolve.get("container_runtime", "")).strip().lower()
+    if runtime and runtime != endpoint.container_runtime:
+        return False
+    container_id = str(resolve.get("container_id", "")).strip().lower()
+    if container_id and not endpoint.container_id.startswith(container_id):
+        return False
+    container_name = str(resolve.get("container_name", "")).strip()
+    if container_name and container_name != endpoint.container_name:
+        return False
+    label = resolve.get("container_label")
+    return not label or _container_label_match(label, endpoint.container_labels)
+
+
+def _subject_for_endpoint(endpoint: RuntimeEndpoint) -> tuple[str, dict] | None:
+    """Resolve runtime evidence to an explicitly configured policy subject."""
+    if endpoint.attribution_state in {"unknown", "ambiguous"} or not endpoint.subject:
+        return None
+    for name, spec in cfg.SUBJECTS.items():
+        resolve = spec.get("resolve", {}) if isinstance(spec, dict) else {}
+        if not isinstance(resolve, dict):
+            continue
+        if _container_resolver_matches(endpoint, resolve):
+            return name, spec
+        unit = resolve.get("systemd_unit")
+        process = resolve.get("process_name")
+        if unit and _unit_name(unit) == _unit_name(endpoint.subject):
+            return name, spec
+        if process and str(process) == endpoint.subject:
+            return name, spec
+        if not unit and not process and str(name) == endpoint.subject:
+            return name, spec
+    return None
+
+
+def _grant_for(endpoint: RuntimeEndpoint, subject: dict) -> tuple[bool, str, str]:
+    exposure = subject.get("exposure", {})
+    zone = exposure.get(endpoint.ingress_zone, {}) if isinstance(exposure, dict) else {}
+    if not isinstance(zone, dict):
+        return False, "no exposure grant for ingress zone", ""
+    if bool(zone.get("deny", False)):
+        return False, "subject explicitly denies this ingress zone", ""
+    protocol = zone.get(endpoint.protocol, {})
+    if not isinstance(protocol, dict):
+        return False, "no exposure grant for protocol", ""
+    ports = protocol.get("ports", [])
+    if endpoint.host_port not in {int(port) for port in ports}:
+        return False, "port is not listed in the exposure grant", ""
+    protection = subject.get("protection", {})
+    profile = str(protection.get("profile", "")) if isinstance(protection, dict) else ""
+    return True, "matched explicit exposure grant", profile
+
+
+def resolve_exposure_decisions(observed: ObservedState) -> list[ExposureDecision]:
+    """Compile runtime endpoints against explicit workload exposure grants."""
+    decisions: list[ExposureDecision] = []
+    for endpoint in observed.endpoints:
+        resolved = _subject_for_endpoint(endpoint)
+        if resolved is None:
+            decisions.append(
+                ExposureDecision(
+                    endpoint, "drop", "unknown or unapproved workload ownership"
+                )
+            )
+            continue
+        subject_name, subject = resolved
+        allowed, reason, profile = _grant_for(endpoint, subject)
+        decisions.append(
+            ExposureDecision(
+                endpoint,
+                "allow" if allowed else "drop",
+                reason,
+                subject_name,
+                profile,
+            )
+        )
+
+    # A global port map cannot safely express two incompatible owners. Keep
+    # the whole port closed when the inventory proves shared/ambiguous ownership.
+    grouped: dict[tuple[str, int], list[ExposureDecision]] = {}
+    for decision in decisions:
+        grouped.setdefault(
+            (decision.endpoint.protocol, decision.endpoint.host_port), []
+        ).append(decision)
+    for group in grouped.values():
+        if len(group) < 2:
+            continue
+        if any(item.endpoint.attribution_state in {"unknown", "ambiguous"} for item in group):
+            for item in group:
+                item.action = "drop"
+                item.reason = "shared port has unknown or ambiguous ownership"
+        elif len({(item.subject, item.protection_profile) for item in group}) > 1:
+            for item in group:
+                item.action = "drop"
+                item.reason = "shared port has incompatible subject protection"
+    return decisions
+
+
+def _service_aware_desired_state(observed: ObservedState) -> DesiredState:
+    decisions = resolve_exposure_decisions(observed)
+    zone_tcp_ports: dict[str, set[int]] = {}
+    zone_udp_ports: dict[str, set[int]] = {}
+    for item in decisions:
+        if item.action != "allow":
+            continue
+        target = zone_tcp_ports if item.endpoint.protocol == "tcp" else zone_udp_ports
+        if item.endpoint.protocol in {"tcp", "udp"}:
+            target.setdefault(item.endpoint.ingress_zone, set()).add(item.endpoint.host_port)
+    allowed = {
+        (item.endpoint.protocol, item.endpoint.host_port)
+        for item in decisions
+        if item.action == "allow"
+    }
+    # The current global maps represent public exposure. Private/trusted grants
+    # are carried separately and enforced by the zone-aware backend path.
+    public_is_global = not cfg.ZONES.get("public", {}).get("interfaces", [])
+    public_tcp_ports = {
+        item.endpoint.host_port for item in decisions
+        if item.action == "allow" and item.endpoint.protocol == "tcp"
+        and item.endpoint.ingress_zone == "public" and public_is_global
+    }
+    public_udp_ports = {
+        item.endpoint.host_port for item in decisions
+        if item.action == "allow" and item.endpoint.protocol == "udp"
+        and item.endpoint.ingress_zone == "public" and public_is_global
+    }
+    # SCTP remains global-map only until its slot handlers accept an interface
+    # key; never widen it when a public zone is interface-scoped.
+    sctp_ports = {
+        item.endpoint.host_port for item in decisions
+        if item.action == "allow" and item.endpoint.protocol == "sctp"
+        and item.endpoint.ingress_zone == "public" and public_is_global
+    }
+    # Resolve protection for every allowed endpoint, while only the public
+    # subset enters the global XDP maps. Zone-only ports are admitted by the
+    # interface/port maps installed by the zone-aware backend.
+    allowed_tcp_ports = {port for proto, port in allowed if proto == "tcp"}
+    allowed_udp_ports = {port for proto, port in allowed if proto == "udp"}
+    desired = _desired_state_for_ports(
+        ObservedState(
+            tcp=allowed_tcp_ports,
+            udp=allowed_udp_ports,
+            sctp=sctp_ports,
+            tcp_processes={port: observed.tcp_processes.get(port, "") for port in allowed_tcp_ports},
+            udp_processes={port: observed.udp_processes.get(port, "") for port in allowed_udp_ports},
+        ),
+    )
+    desired.tcp_ports = public_tcp_ports
+    desired.udp_ports = public_udp_ports
+    desired.exposure_decisions = decisions
+    desired.zone_tcp_ports = zone_tcp_ports
+    desired.zone_udp_ports = zone_udp_ports
+    return desired
+
+
+def _desired_state_for_ports(observed: ObservedState) -> DesiredState:
+    tcp_ports = set(observed.tcp)
+    udp_ports = set(observed.udp)
+    sctp_ports = set(observed.sctp)
     tcp_syn_rate_limits = _resolve_port_limits(
         tcp_ports, observed.tcp_processes, _port_rate_limit
     )
@@ -228,17 +367,9 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
         udp_ports=udp_ports,
         sctp_ports=sctp_ports,
         trusted_cidrs=set(cfg.TRUSTED_SRC_IPS),
-        conntrack_entries=set(observed.established),
         tcp_syn_rate_limits=tcp_syn_rate_limits,
         tcp_syn_agg_rate_limits=_resolve_port_limits(
             tcp_ports, observed.tcp_processes, _syn_aggregate_rate_limit
-        ),
-        tcp_conn_limits=_resolve_port_limits(tcp_ports, observed.tcp_processes, _tcp_conn_limit),
-        tcp_conn_prefix_limits=_resolve_port_limits(
-            tcp_ports, observed.tcp_processes, _tcp_conn_prefix_limit
-        ),
-        tcp_conn_port_limits=_resolve_port_limits(
-            tcp_ports, observed.tcp_processes, _tcp_conn_port_limit
         ),
         udp_rate_limits=udp_rate_limits,
         tcp_rate_map_entries=tcp_rate_map_entries,
@@ -254,3 +385,7 @@ def resolve_desired_state(observed: ObservedState) -> DesiredState:
         udp_global_byte_rate=cfg.XDP_UDP_GLOBAL_BYTE_RATE,
         xdp_runtime_config=_xdp_runtime_config(),
     )
+
+
+def resolve_desired_state(observed: ObservedState) -> DesiredState:
+    return _service_aware_desired_state(observed)

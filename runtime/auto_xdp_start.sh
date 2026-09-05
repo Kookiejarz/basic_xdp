@@ -190,12 +190,6 @@ ensure_xdp_loaded() {
             fi
         done
         [[ -f "$BPF_PIN_DIR/sock_state_link" ]] || load_sock_state_tracker || true
-        if ! _auto_xdp_restore_tc_egress; then
-            echo "[auto_xdp] warning: could not restore tc egress tracker after XDP re-attach" >&2
-            # XDP is still attached; do not let select_backend tear it down
-            # and replace it with nftables without a verified tc rollback.
-            return 2
-        fi
         load_port_handlers || true
         auto_tune_interface_parallelism || true
         [[ $_any_missing -eq 1 ]] && echo "[auto_xdp] re-attached XDP to missing interfaces" >&2
@@ -209,11 +203,11 @@ ensure_xdp_loaded() {
 
     [[ -f "$BPF_PIN_DIR/prog" ]] && echo "[auto_xdp] existing XDP maps incomplete; reloading runtime objects" >&2
 
-    # Build and seed a candidate map generation while the current XDP/tc
-    # programs remain attached. The shared switch helper restores every
-    # interface and filter if any replace operation fails.
+    # Build a candidate map generation while the current XDP program remains
+    # attached. The shared switch helper restores every interface if any
+    # replace operation fails.
     if ! transactional_reload_xdp; then
-        echo "[auto_xdp] transactional XDP/tc reload failed; previous protection preserved or restored" >&2
+        echo "[auto_xdp] transactional XDP reload failed; previous protection preserved or restored" >&2
         if _auto_xdp_any_target_has_xdp; then
             echo "[auto_xdp] refusing nftables fallback while XDP remains attached" >&2
             return 2
@@ -284,7 +278,6 @@ activate_nftables_backend() {
             fi
             detached=$((detached + 1))
         done
-        cleanup_tc_egress_filter
     fi
 
     echo "nftables" > "${RUN_STATE_DIR}/backend"

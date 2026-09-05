@@ -63,9 +63,6 @@ class PortBackend:
         plan = self.build_reconcile_plan(desired_state, applied_state)
         self.apply_reconcile_plan(plan, dry_run, desired_state, observed_state)
 
-    def run_ct_gc(self) -> None:
-        return None
-
     def close(self) -> None:
         return None
 

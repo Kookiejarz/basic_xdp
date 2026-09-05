@@ -83,11 +83,10 @@ def _policy_signature(desired: DesiredState) -> tuple[object, ...]:
         frozenset(desired.udp_ports),
         frozenset(desired.sctp_ports),
         frozenset(desired.trusted_cidrs),
+        tuple(sorted((zone, tuple(sorted(ports))) for zone, ports in desired.zone_tcp_ports.items())),
+        tuple(sorted((zone, tuple(sorted(ports))) for zone, ports in desired.zone_udp_ports.items())),
         tuple(sorted(desired.tcp_syn_rate_limits.items())),
         tuple(sorted(desired.tcp_syn_agg_rate_limits.items())),
-        tuple(sorted(desired.tcp_conn_limits.items())),
-        tuple(sorted(desired.tcp_conn_prefix_limits.items())),
-        tuple(sorted(desired.tcp_conn_port_limits.items())),
         tuple(sorted(desired.udp_rate_limits.items())),
         tuple(sorted(desired.udp_agg_rate_limits.items())),
         tuple(sorted((proto, cidr, tuple(sorted(ports))) for (proto, cidr), ports in desired.acl_rules.items())),
@@ -126,6 +125,8 @@ class NftablesBackend(PortBackend):
         self._tcp_cache: set[int] = set()
         self._udp_cache: set[int] = set()
         self._sctp_cache: set[int] = set()
+        self._zone_tcp_cache: dict[str, set[int]] = {}
+        self._zone_udp_cache: dict[str, set[int]] = {}
         self._trusted_cache: set[str] = set()
         self._reset_policy_cache()
         self._ensure_ruleset()
@@ -134,9 +135,6 @@ class NftablesBackend(PortBackend):
     def _reset_policy_cache(self) -> None:
         self._tcp_syn_rate_cache: dict[int, int] = {}
         self._tcp_syn_agg_rate_cache: dict[int, int] = {}
-        self._tcp_conn_limit_cache: dict[int, int] = {}
-        self._tcp_conn_prefix_limit_cache: dict[int, int] = {}
-        self._tcp_conn_port_limit_cache: dict[int, int] = {}
         self._udp_rate_cache: dict[int, int] = {}
         self._udp_agg_rate_cache: dict[int, int] = {}
         self._acl_cache: dict[tuple[str, str], frozenset[int]] = {}
@@ -183,12 +181,11 @@ class NftablesBackend(PortBackend):
             tcp_ports=set(self._tcp_cache),
             udp_ports=set(self._udp_cache),
             sctp_ports=set(self._sctp_cache),
+            zone_tcp_ports={zone: set(ports) for zone, ports in self._zone_tcp_cache.items()},
+            zone_udp_ports={zone: set(ports) for zone, ports in self._zone_udp_cache.items()},
             trusted_cidrs=set(self._trusted_cache),
             tcp_syn_rate_limits=dict(self._tcp_syn_rate_cache),
             tcp_syn_agg_rate_limits=dict(self._tcp_syn_agg_rate_cache),
-            tcp_conn_limits=dict(self._tcp_conn_limit_cache),
-            tcp_conn_prefix_limits=dict(self._tcp_conn_prefix_limit_cache),
-            tcp_conn_port_limits=dict(self._tcp_conn_port_limit_cache),
             udp_rate_limits=dict(self._udp_rate_cache),
             udp_agg_rate_limits=dict(self._udp_agg_rate_cache),
             acl_rules=dict(self._acl_cache),
@@ -199,6 +196,26 @@ class NftablesBackend(PortBackend):
 
     def _family_flags(self) -> tuple[bool, bool]:
         return cfg.NFT_FAMILY in {"inet", "ip"}, cfg.NFT_FAMILY in {"inet", "ip6"}
+
+    @staticmethod
+    def _zone_ports(desired: DesiredState, proto: str) -> set[int]:
+        by_zone = desired.zone_tcp_ports if proto == "tcp" else desired.zone_udp_ports
+        return set().union(*(ports for ports in by_zone.values())) if by_zone else set()
+
+    def _zone_rules(self, desired: DesiredState, proto: str) -> list[str]:
+        by_zone = desired.zone_tcp_ports if proto == "tcp" else desired.zone_udp_ports
+        rules: list[str] = []
+        for zone, ports in sorted(by_zone.items()):
+            interfaces = [name for name in cfg.ZONES.get(zone, {}).get("interfaces", []) if name != "*"]
+            if not interfaces or not ports:
+                continue
+            names = ", ".join(f'"{name}"' for name in sorted(set(interfaces)))
+            rendered_ports = ", ".join(str(port) for port in sorted(ports))
+            match = f'iifname {{ {names} }} {proto} dport {{ {rendered_ports} }}'
+            if proto == "tcp":
+                match += " tcp flags & (syn | ack) == syn"
+            rules.append(f"        {match} counter accept")
+        return rules
 
     def _acl_rules(self, desired: DesiredState, proto: str, family: int) -> list[str]:
         result: list[str] = []
@@ -211,7 +228,7 @@ class NftablesBackend(PortBackend):
             if proto == "tcp":
                 result.append(
                     f"        {addr_expr} {cidr} tcp flags & (syn | ack) == syn "
-                    f"tcp dport {{ {rendered_ports} }} counter accept"
+                    f"tcp dport @{port_set} tcp dport {{ {rendered_ports} }} counter accept"
                 )
             else:
                 result.append(
@@ -219,18 +236,6 @@ class NftablesBackend(PortBackend):
                     f"udp dport {{ {rendered_ports} }} counter accept"
                 )
         return result
-
-    def _tcp_policy_objects(self, desired: DesiredState, family: int) -> list[str]:
-        value_type = "ipv4_addr" if family == 4 else "ipv6_addr"
-        blocks: list[str] = []
-        for port in sorted(desired.tcp_ports):
-            if desired.tcp_conn_limits.get(port, 0) > 0:
-                blocks.append(_set_block(f"tc{family}s_{port}", value_type, []))
-                blocks[-1] = blocks[-1].replace("    }", "        flags dynamic\n    }")
-            if desired.tcp_conn_prefix_limits.get(port, 0) > 0:
-                blocks.append(_set_block(f"tc{family}p_{port}", value_type, []))
-                blocks[-1] = blocks[-1].replace("    }", "        flags dynamic\n    }")
-        return blocks
 
     def _tcp_policy_rules(self, desired: DesiredState, family: int) -> list[str]:
         addr_expr = "ip saddr" if family == 4 else "ip6 saddr"
@@ -241,7 +246,7 @@ class NftablesBackend(PortBackend):
         )
         mask = _prefix_mask(family, prefix)
         rules: list[str] = []
-        for port in sorted(desired.tcp_ports):
+        for port in sorted(set(desired.tcp_ports) | self._zone_ports(desired, "tcp")):
             per_src = desired.tcp_syn_rate_limits.get(port, 0)
             if per_src > 0:
                 rate = _rate(per_src)
@@ -258,24 +263,6 @@ class NftablesBackend(PortBackend):
                     f"meter tp{family}_{port} {{ {addr_expr} & {mask} limit rate over {rate}/second "
                     f"burst {rate} packets }} counter drop"
                 )
-            conn_src = desired.tcp_conn_limits.get(port, 0)
-            if conn_src > 0:
-                rules.append(
-                    f"        tcp dport {port} ct state new add @tc{family}s_{port} "
-                    f"{{ {addr_expr} ct count over {conn_src} }} counter drop"
-                )
-            conn_prefix = desired.tcp_conn_prefix_limits.get(port, 0)
-            if conn_prefix > 0:
-                rules.append(
-                    f"        tcp dport {port} ct state new add @tc{family}p_{port} "
-                    f"{{ {addr_expr} & {mask} ct count over {conn_prefix} }} counter drop"
-                )
-            conn_port = desired.tcp_conn_port_limits.get(port, 0)
-            if conn_port > 0:
-                rules.append(
-                    f"        tcp dport {port} ct state new add @tcp_conn_ports "
-                    f"{{ tcp dport ct count over {conn_port} }} counter drop"
-                )
         return rules
 
     def _udp_policy_rules(self, desired: DesiredState, family: int) -> list[str]:
@@ -287,7 +274,7 @@ class NftablesBackend(PortBackend):
         )
         mask = _prefix_mask(family, prefix)
         rules: list[str] = []
-        for port in sorted(desired.udp_ports):
+        for port in sorted(set(desired.udp_ports) | self._zone_ports(desired, "udp")):
             per_src = desired.udp_rate_limits.get(port, 0)
             if per_src > 0:
                 rate = _rate(per_src)
@@ -321,14 +308,6 @@ class NftablesBackend(PortBackend):
             blocks.append(_set_block("bogon_v4", "ipv4_addr", list(_BOGON_V4), interval=True))
         if has_v6 and desired.bogon_filter_enabled:
             blocks.append(_set_block("bogon_v6", "ipv6_addr", list(_BOGON_V6), interval=True))
-        if has_v4:
-            blocks.extend(self._tcp_policy_objects(desired, 4))
-        if has_v6:
-            blocks.extend(self._tcp_policy_objects(desired, 6))
-        if any(desired.tcp_conn_port_limits.get(port, 0) > 0 for port in desired.tcp_ports):
-            blocks.append(_set_block("tcp_conn_ports", "inet_service", []))
-            blocks[-1] = blocks[-1].replace("    }", "        flags dynamic\n    }")
-
         rules = [
             "        iifname \"lo\" counter accept",
         ]
@@ -360,18 +339,21 @@ class NftablesBackend(PortBackend):
 
         if has_v4:
             rules.append(
-                f"        ip saddr @{cfg.NFT_TRUSTED_SET4} tcp flags & (syn | ack) == syn counter accept"
+                f"        ip saddr @{cfg.NFT_TRUSTED_SET4} tcp dport @{cfg.NFT_TCP_SET} "
+                "tcp flags & (syn | ack) == syn counter accept"
             )
             rules.extend(self._acl_rules(desired, "tcp", 4))
         if has_v6:
             rules.append(
-                f"        ip6 saddr @{cfg.NFT_TRUSTED_SET6} tcp flags & (syn | ack) == syn counter accept"
+                f"        ip6 saddr @{cfg.NFT_TRUSTED_SET6} tcp dport @{cfg.NFT_TCP_SET} "
+                "tcp flags & (syn | ack) == syn counter accept"
             )
             rules.extend(self._acl_rules(desired, "tcp", 6))
         if has_v4:
             rules.extend(self._tcp_policy_rules(desired, 4))
         if has_v6:
             rules.extend(self._tcp_policy_rules(desired, 6))
+        rules.extend(self._zone_rules(desired, "tcp"))
         rules.extend(
             [
                 f"        tcp flags & (syn | ack) == syn tcp dport @{cfg.NFT_TCP_SET} counter accept",
@@ -395,6 +377,7 @@ class NftablesBackend(PortBackend):
             rules.extend(self._udp_policy_rules(desired, 4))
         if has_v6:
             rules.extend(self._udp_policy_rules(desired, 6))
+        rules.extend(self._zone_rules(desired, "udp"))
         rules.extend(
             [
                 f"        udp dport @{cfg.NFT_UDP_SET} counter accept",
@@ -507,12 +490,11 @@ class NftablesBackend(PortBackend):
         self._tcp_cache = set(desired.tcp_ports)
         self._udp_cache = set(desired.udp_ports)
         self._sctp_cache = set(desired.sctp_ports)
+        self._zone_tcp_cache = {zone: set(ports) for zone, ports in desired.zone_tcp_ports.items()}
+        self._zone_udp_cache = {zone: set(ports) for zone, ports in desired.zone_udp_ports.items()}
         self._trusted_cache = set(desired.trusted_cidrs)
         self._tcp_syn_rate_cache = dict(desired.tcp_syn_rate_limits)
         self._tcp_syn_agg_rate_cache = dict(desired.tcp_syn_agg_rate_limits)
-        self._tcp_conn_limit_cache = dict(desired.tcp_conn_limits)
-        self._tcp_conn_prefix_limit_cache = dict(desired.tcp_conn_prefix_limits)
-        self._tcp_conn_port_limit_cache = dict(desired.tcp_conn_port_limits)
         self._udp_rate_cache = dict(desired.udp_rate_limits)
         self._udp_agg_rate_cache = dict(desired.udp_agg_rate_limits)
         self._acl_cache = dict(desired.acl_rules)

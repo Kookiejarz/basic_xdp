@@ -1,5 +1,5 @@
 # Auto XDP configuration — /etc/auto_xdp/config.toml
-# Manage via: axdp trust / axdp acl / axdp permanent
+# Manage via: axdp trust / axdp acl / policy subjects and exposure grants
 # The daemon reloads this file on SIGHUP (no restart needed).
 # To apply changes immediately: axdp restart
 
@@ -13,6 +13,31 @@ bogon_filter = true
 # When enabled, the daemon tightens rate limits and drops marginal traffic
 # automatically during detected flood conditions.
 enabled = true
+
+# Service-aware exposure policy. A listener is not an authorization grant.
+# Start with audit while introducing grants, then switch to enforce.
+[policy]
+mode = "audit" # observe | audit | enforce; switch to enforce after grants are audited
+
+[zones.public]
+# Empty means non-loopback wildcard binds are classified as public.
+interfaces = []
+
+[zones.trusted]
+interfaces = ["tailscale0", "wg0"]
+
+# Unknown ownership is always denied; this table documents the decision per zone.
+[unknown_subjects]
+public = "deny"
+trusted = "deny"
+
+# Example grant (copy/uncomment and adjust the unit name/ports):
+# [subjects.website.resolve]
+# systemd_unit = "nginx.service"
+# [subjects.website.exposure.public.tcp]
+# ports = [80, 443]
+# [subjects.website.protection]
+# profile = "web"
 
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.
@@ -69,23 +94,10 @@ exclude_bind_cidrs = []
 # Example: exclude_ports = [22, 3306]
 exclude_ports = []
 
-[permanent_ports]
-# Ports always kept open regardless of whether the owning process is running.
-# SCTP ports are config-managed only — not auto-discovered from sockets.
-tcp  = []   # e.g. [80, 443]
-udp  = []   # e.g. [53, 123]
-sctp = []   # e.g. [5060]
-
 [trusted_ips]
 # Source IPs/CIDRs with elevated handling.
-# XDP TCP: trusted sources may pass pure SYN packets even when the port was not
-# auto-discovered, and they bypass SYN rate limits.
-# XDP UDP: trusted sources do NOT open closed UDP ports; the destination UDP
-# port must already be whitelisted. Once whitelisted, trusted sources bypass
-# UDP rate limits and port handlers.
-# nftables fallback mirrors the XDP distinction: trusted TCP sources may open
-# a SYN to an otherwise closed port, while trusted UDP sources still require
-# the destination port to be open; both bypass fallback rate limits.
+# Trusted sources may bypass selected mitigation checks, but never authorize a
+# closed or ungranted destination port. The destination must already be allowed.
 # Format: "CIDR" = "label"
 # "10.0.0.0/8"    = "internal network"
 # "203.0.113.5/32" = "monitoring host"
@@ -97,8 +109,8 @@ sctp = []   # e.g. [5060]
 # Ports absent from both tables use the default tier (see [xdp.runtime] below).
 
 [rate_limits]
-# Aggregation prefix used by syn_agg_rate, per-prefix ESTABLISHED cap, and other
-# per-prefix counters. Default /24 for IPv4 so distributed floods from one /24
+# Aggregation prefix used by syn_agg_rate and other per-prefix counters. Default
+# /24 for IPv4 so distributed floods from one /24
 # share a single counter; per-IP /32 counter still applies independently.
 # IPv6 default /64 covers a typical end-site.
 source_cidr_v4 = 24
@@ -157,51 +169,6 @@ telnet          = 2
 # https = 5000
 # ssh   = 50
 
-[rate_limits.tcp_conn_by_proc]
-# Max concurrent tracked TCP connections per source IP, per process's ports.
-# Helps prevent one client from monopolising connection table slots.
-# Format: process_name = max_concurrent_connections_per_source_ip
-# Example:
-# caddy = 200       # one source IP -> one Caddy port: max 200 established conns
-# sshd  = 5         # one source IP -> one SSH port: max 5 established conns
-
-[rate_limits.tcp_conn_by_service]
-# Fallback concurrent connection cap keyed by IANA service name.
-# Example:
-# http  = 200
-# https = 200
-# ssh   = 5
-
-[rate_limits.tcp_conn_prefix_by_proc]
-# Per-prefix ESTABLISHED cap override per process. Format:
-# proc_name = max_established_per_prefix
-# Empty → uses default_tcp_established_per_prefix(_strict) from [xdp.runtime].
-# Example:
-# caddy = 2000      # one source prefix -> one Caddy port: max 2000 conns
-# sshd  = 20        # one source prefix -> one SSH port: max 20 conns
-
-[rate_limits.tcp_conn_prefix_by_service]
-# Same, keyed by IANA service name.
-# Example:
-# http  = 2000
-# https = 2000
-# ssh   = 20
-
-[rate_limits.tcp_conn_port_by_proc]
-# Per-port total ESTABLISHED cap override per process. Format:
-# proc_name = max_established_per_port
-# Example:
-# caddy = 50000     # each Caddy TCP port total: max 50000 established conns
-# sshd  = 200       # each SSH TCP port total: max 200 established conns
-
-[rate_limits.tcp_conn_port_by_service]
-# Same, keyed by IANA service name.
-# Example:
-# http  = 50000
-# https = 50000
-# ssh   = 200
-
-
 # UDP rate limits
 # UDP is connectionless, so rate limits are the primary abuse control.
 
@@ -229,12 +196,8 @@ openvpn = 200
 
 
 # Per-CIDR port ACL
-# XDP TCP ACL entries explicitly allow matching source CIDRs to reach listed
-# TCP ports even when those ports were not auto-discovered, and bypass TCP SYN
-# rate limits.
-# XDP UDP ACL entries do not open closed UDP ports; the destination UDP port
-# must already be whitelisted. Once whitelisted, matching ACL entries bypass
-# UDP rate limits and port handlers.
+# ACL entries restrict already-authorized destination ports; they never create
+# exposure. Matching traffic may bypass selected mitigation checks.
 #
 # [[acl]]
 # proto = "tcp"          # "tcp" or "udp"
@@ -299,28 +262,7 @@ refresh_seconds = 3600
 # Requires daemon restart to take effect.
 bpf_pin_dir = "/sys/fs/bpf/xdp_fw"
 
-# How many consecutive reconcile rounds a conntrack entry must be absent from
-# the observed socket table before the daemon removes it from the BPF map.
-# Higher values tolerate brief process restarts without dropping active flows.
-conntrack_stale_reconciles = 2
-
 [xdp.runtime]
-# How long (seconds) an established TCP flow's conntrack entry stays valid
-# without seeing new packets. Flows idle longer than this are evicted.
-tcp_timeout_seconds = 300
-
-# How long (seconds) a UDP conntrack entry (created by TC egress tracking)
-# remains valid. Shorter than TCP since UDP is connectionless.
-udp_timeout_seconds = 60
-
-# Minimum interval (seconds) between conntrack timestamp refreshes.
-# Entries seen more recently than this are not re-stamped, reducing write load.
-conntrack_refresh_seconds = 30
-
-# Interval (seconds) between full conntrack map GC sweeps that expire stale
-# entries. Reduces LRU eviction pressure under sustained traffic. 0 = disabled.
-conntrack_gc_interval_seconds = 300
-
 # Maximum number of ICMP echo requests queued in the token bucket before
 # rate limiting kicks in (burst allowance).
 icmp_burst_packets = 100
@@ -342,11 +284,6 @@ udp_global_byte_rate_mbps = 997
 # (SYN rate, UDP packet rate, aggregate byte rate).
 rate_window_seconds = 1
 
-# Half-open (SYN-only) conntrack TTL (seconds). Entries that never receive
-# an ACK are expired faster than tcp_timeout_seconds to free map slots under
-# SYN flood. Increase if clients have high-latency links (> 100 ms RTT).
-syn_timeout_seconds = 20
-
 # --- Default-on TCP protection ---
 # Sensitivity threshold: a port is "sensitive" when its owning process or
 # service has an explicit syn-rate ≤ this value in [rate_limits.syn_by_proc]
@@ -361,19 +298,6 @@ default_tcp_syn_rate        = 100    # HTTP/HTTPS/games/RPC/anything else
 # Per-prefix aggregate SYN rate (SYN/s). L2 — caps distributed floods.
 default_tcp_syn_agg_rate_strict = 50
 default_tcp_syn_agg_rate        = 1000
-
-# Per-source ESTABLISHED concurrent connections (sessions). L3.
-default_tcp_established_per_src_strict = 5
-default_tcp_established_per_src        = 50
-
-# Per-prefix ESTABLISHED concurrent connections (sessions). L4.
-default_tcp_established_per_prefix_strict = 20
-default_tcp_established_per_prefix        = 200
-
-# Per-port total ESTABLISHED concurrent connections (sessions). L5.
-default_tcp_established_per_port_strict = 200
-default_tcp_established_per_port        = 5000
-
 
 # nftables fallback
 # Used only when the nftables backend is active instead of XDP.

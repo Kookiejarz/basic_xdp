@@ -1,6 +1,6 @@
 # Auto XDP
 
-**Automatically keep a Linux host's firewall policy aligned with the services actually listening on it.**
+**Keep a Linux host's exposure aligned with explicit workload grants and live service state.**
 <p align="center">
   <a href="https://github.com/Kookiejarz/Auto_XDP/wiki"><strong>📑 Manuals & Wiki</strong></a>
 </p>
@@ -30,7 +30,7 @@
 </p>
 
 
-Auto XDP is a host-side firewall for public and self-hosted Linux machines. It discovers the TCP and UDP sockets that services are listening on and keeps the active filtering policy in sync. When the host supports it, Auto XDP uses XDP/eBPF. It falls back to `nftables` when XDP cannot be attached safely.
+Auto XDP is a host-side exposure controller and firewall for public and self-hosted Linux machines. It discovers TCP/UDP endpoints, attributes them to workloads when runtime evidence permits, and keeps only explicitly granted live exposure in sync. When the host supports it, Auto XDP uses XDP/eBPF. It falls back to `nftables` when XDP cannot be attached safely.
 
 It is designed for per-host protection on VPSes, cloud instances, homelabs, and other Internet-facing Linux machines.
 
@@ -38,20 +38,20 @@ It is designed for per-host protection on VPSes, cloud instances, homelabs, and 
 
 ## Why Auto XDP?
 
-Static firewall rules drift as services come and go. Auto XDP watches listening sockets and updates the policy when a service starts or stops:
+Static firewall rules drift as services come and go. Auto XDP watches runtime endpoints and updates the policy when a service starts or stops:
 
-- A newly listening service can become reachable without a new manual rule.
-- A stopped service no longer remains open because of an old rule.
+- A newly listening service becomes reachable only when a matching workload grant exists.
+- A stopped service no longer remains open because its runtime justification disappeared.
 - Native XDP can drop unwanted packets before they enter the normal Linux networking path.
 - The same listener policy can use `nftables` when native XDP is unavailable.
 
-This keeps the firewall tied to what the host is actually exposing, while leaving explicit controls for permanent ports, exclusions, trusted sources, and CIDR-based access rules.
+This keeps the firewall tied to both operator intent and current runtime state. Legacy permanent-port behavior remains available when the new `[policy]` section is absent; service-aware mode uses grants, zones, and protection profiles.
 
 ## Auto XDP compared with other firewalls
 
 | Solution | How it gets its policy | Where it filters | Who maintains the rules |
 |---|---|---|---|
-| **Auto XDP** | Host listening sockets, plus explicit overrides | XDP when available, `nftables` fallback | Auto XDP and the operator's overrides |
+| **Auto XDP** | Explicit workload grants intersected with live endpoints | XDP when available, `nftables` fallback | Auto XDP and the operator's grants |
 | `nftables` | Explicit rules | Linux networking stack | The operator or another automation tool |
 | UFW | Explicit rules through a simpler frontend | Its configured firewall backend | The operator or another automation tool |
 | Raw XDP/eBPF | Custom program logic | XDP ingress | The program author |
@@ -128,6 +128,9 @@ sudo axdp backend
 # List ports allowed by the current policy
 sudo axdp ports
 
+# Inspect runtime ownership and grant decisions without changing the firewall
+sudo xdp-port-sync --mode audit --explain
+
 # Show packet counters
 sudo axdp stats
 
@@ -135,16 +138,16 @@ sudo axdp stats
 sudo axdp tui
 ```
 
-A quick check of automatic synchronization:
+A quick check of service-aware synchronization:
 
 ```bash
 sudo axdp ports
 python3 -m http.server 8080 &
-sudo axdp ports
+sudo xdp-port-sync --mode observe --explain
 kill %1
 ```
 
-After the next policy sync, port 8080 should appear while the server is running and disappear after it stops.
+Port 8080 is reported as an unapproved endpoint unless its process is mapped by a matching subject grant. See [architecture.md](./architecture.md) for the policy format and the legacy compatibility boundary.
 
 ## Real-World Performance Benchmark
 
@@ -185,7 +188,7 @@ echo "clone_skb 100" > "$PGDEV"
 
 ## Important behavior
 
-Auto XDP treats a socket bound to a non-loopback or wildcard address, such as `0.0.0.0` or `::`, as potentially public. Use discovery exclusions or explicit ACLs for private and management services. The [Configuration Reference](https://github.com/Kookiejarz/Auto_XDP/wiki/Configuration-Reference) covers these settings.
+Auto XDP treats bind scope and ingress zone as separate facts. A wildcard bind such as `0.0.0.0` or `::` is not authorization; service-aware mode requires a matching subject grant. Use `observe` or `audit` before enabling `enforce` on an existing host.
 
 ## Documentation
 

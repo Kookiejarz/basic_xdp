@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import shutil
 
 from auto_xdp import config as cfg
@@ -12,7 +13,6 @@ from auto_xdp.bpf.syscall import map_id, obj_get, probe_inner_map_support
 from auto_xdp.bpf.maps import (
     BpfAclMaps,
     BpfArrayMap,
-    BpfConntrackMaps,
     BpfGlobalRlMap,
     BpfPortPolicyMap,
     BpfPortPolicyViewMap,
@@ -21,6 +21,7 @@ from auto_xdp.bpf.maps import (
     BpfSit4EndpointsMap,
     BpfSynRatePortsMap,
     BpfTrustedMaps,
+    BpfZonePortMap,
     XDP_CFG_FLAG_ABUSEIPDB_ENABLED,
     XDP_CFG_FLAG_BOGON_DISABLED,
     XDP_CFG_FLAG_DROP_EVENTS_DISABLED,
@@ -108,18 +109,6 @@ class XdpBackend(PortBackend):
                     checks=checks,
                 )
 
-        if cfg.TC_OBJ_PATH:
-            checks["tc_obj"] = os.path.exists(cfg.TC_OBJ_PATH)
-            if not checks["tc_obj"]:
-                details["tc_obj_path"] = cfg.TC_OBJ_PATH
-                return BackendStatus(
-                    name=cls.name,
-                    available=False,
-                    reason="configured tc object file missing",
-                    details=details,
-                    checks=checks,
-                )
-
         try:
             checks["inner_map_support"] = probe_inner_map_support()
         except PermissionError:
@@ -148,17 +137,13 @@ class XdpBackend(PortBackend):
         self.last_apply_failures: int = 0
         self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH)
         self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
+        self.tcp_zone_map = BpfZonePortMap(cfg.TCP_ZONE_MAP_PATH)
+        self.udp_zone_map = BpfZonePortMap(cfg.UDP_ZONE_MAP_PATH)
         self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
-        self.conntrack_map = BpfConntrackMaps(cfg.TCP_CONNTRACK_MAP_PATH4, cfg.TCP_CONNTRACK_MAP_PATH6)
-        self.udp_conntrack_map = BpfConntrackMaps(cfg.UDP_CONNTRACK_MAP_PATH4, cfg.UDP_CONNTRACK_MAP_PATH6)
-        self._conntrack_stale_rounds: dict[bytes, int] = {}
         self._tcp_policy_map: BpfPortPolicyMap | None = None
         self._udp_policy_map: BpfPortPolicyMap | None = None
         self.syn_rate_map: RateLimitMap | None = None
         self.syn_agg_rate_map: RateLimitMap | None = None
-        self.tcp_conn_limit_map: RateLimitMap | None = None
-        self.tcp_conn_prefix_limit_map: RateLimitMap | None = None
-        self.tcp_conn_port_limit_map: RateLimitMap | None = None
         self.udp_rate_map: RateLimitMap | None = None
         self.udp_agg_rate_map: RateLimitMap | None = None
         self.acl_maps: BpfAclMaps | None = None
@@ -169,9 +154,6 @@ class XdpBackend(PortBackend):
             self._tcp_policy_map = BpfPortPolicyMap(cfg.TCP_PORT_POLICY_MAP_PATH)
             self.syn_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 0, cfg.TCP_PORT_POLICY_MAP_PATH)
             self.syn_agg_rate_map = BpfPortPolicyViewMap(self._tcp_policy_map, 1, cfg.TCP_PORT_POLICY_MAP_PATH)
-            self.tcp_conn_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 2, cfg.TCP_PORT_POLICY_MAP_PATH)
-            self.tcp_conn_prefix_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 5, cfg.TCP_PORT_POLICY_MAP_PATH)
-            self.tcp_conn_port_limit_map = BpfPortPolicyViewMap(self._tcp_policy_map, 6, cfg.TCP_PORT_POLICY_MAP_PATH)
             log.debug("tcp_port_policies map opened; TCP per-port policy active.")
         except OSError as exc:
             log.debug("tcp_port_policies map unavailable (%s); TCP per-port policy inactive.", exc)
@@ -243,6 +225,56 @@ class XdpBackend(PortBackend):
         except OSError as exc:
             log.debug("AbuseIPDB maps unavailable (%s); AbuseIPDB blocking inactive.", exc)
 
+    def _desired_zone_entries(self, desired: DesiredState, proto: str) -> set[tuple[int, int]]:
+        ports_by_zone = desired.zone_tcp_ports if proto == "tcp" else desired.zone_udp_ports
+        entries: set[tuple[int, int]] = set()
+        for zone, ports in ports_by_zone.items():
+            for interface in cfg.ZONES.get(zone, {}).get("interfaces", []):
+                if interface == "*":
+                    continue
+                try:
+                    ifindex = socket.if_nametoindex(interface)
+                except OSError:
+                    log.warning("Configured zone interface does not exist: %s", interface)
+                    continue
+                entries.update((ifindex, port) for port in ports)
+        return entries
+
+    def _zone_state(self, zone_map: BpfZonePortMap) -> dict[str, set[int]]:
+        active = zone_map.active_entries()
+        result: dict[str, set[int]] = {}
+        for zone, spec in cfg.ZONES.items():
+            indices = set()
+            for interface in spec.get("interfaces", []):
+                if interface == "*":
+                    continue
+                try:
+                    indices.add(socket.if_nametoindex(interface))
+                except OSError:
+                    continue
+            ports = {port for ifindex, port in active if ifindex in indices}
+            if ports:
+                result[zone] = ports
+        return result
+
+    def _apply_zone_delta(
+        self,
+        zone_map: BpfZonePortMap,
+        desired_entries: set[tuple[int, int]],
+        dry_run: bool,
+        additions: bool,
+    ) -> int:
+        failures = 0
+        current = zone_map.active_entries()
+        entries = (desired_entries - current) if additions else (current - desired_entries)
+        for ifindex, port in sorted(entries):
+            ok = zone_map.set(ifindex, port, dry_run=dry_run) if additions else zone_map.delete(ifindex, port, dry_run)
+            if not ok:
+                failures += 1
+            elif not dry_run:
+                log.debug("%s zone port %s %d", "+" if additions else "-", ifindex, port)
+        return failures
+
     def is_stale(self) -> bool:
         """Return True if the pinned tcp_whitelist map has been replaced since init."""
         try:
@@ -255,23 +287,13 @@ class XdpBackend(PortBackend):
         except OSError:
             return False
 
-    def run_ct_gc(self) -> None:
-        tcp_timeout_ns = int(cfg.XDP_TCP_TIMEOUT_SECONDS * 1e9)
-        syn_timeout_ns = int(cfg.XDP_SYN_TIMEOUT_SECONDS * 1e9)
-        deleted = self.conntrack_map.gc_expired(tcp_timeout_ns, syn_timeout_ns=syn_timeout_ns)
-        if deleted:
-            log.info("TCP conntrack GC: evicted %d stale entr%s", deleted, "y" if deleted == 1 else "ies")
-        udp_timeout_ns = int(cfg.XDP_UDP_TIMEOUT_SECONDS * 1e9)
-        deleted = self.udp_conntrack_map.gc_expired(udp_timeout_ns)
-        if deleted:
-            log.info("UDP conntrack GC: evicted %d stale entr%s", deleted, "y" if deleted == 1 else "ies")
-
     def close(self) -> None:
         self.tcp_map.close()
         self.udp_map.close()
+        for zone_map in (getattr(self, "tcp_zone_map", None), getattr(self, "udp_zone_map", None)):
+            if zone_map is not None:
+                zone_map.close()
         self.trusted_map.close()
-        self.conntrack_map.close()
-        self.udp_conntrack_map.close()
         if self._tcp_policy_map is not None:
             self._tcp_policy_map.close()
         if self._udp_policy_map is not None:
@@ -298,14 +320,12 @@ class XdpBackend(PortBackend):
         return AppliedState(
             tcp_ports=self.tcp_map.active_ports(),
             udp_ports=self.udp_map.active_ports(),
+            zone_tcp_ports=self._zone_state(self.tcp_zone_map) if hasattr(self, "tcp_zone_map") else {},
+            zone_udp_ports=self._zone_state(self.udp_zone_map) if hasattr(self, "udp_zone_map") else {},
             sctp_ports=self.sctp_map.active_ports() if self.sctp_map is not None else set(),
             trusted_cidrs=self.trusted_map.active_keys(),
-            conntrack_entries=self.conntrack_map.active_keys(),
             tcp_syn_rate_limits=self.syn_rate_map.active() if self.syn_rate_map is not None else {},
             tcp_syn_agg_rate_limits=self.syn_agg_rate_map.active() if self.syn_agg_rate_map is not None else {},
-            tcp_conn_limits=self.tcp_conn_limit_map.active() if self.tcp_conn_limit_map is not None else {},
-            tcp_conn_prefix_limits=self.tcp_conn_prefix_limit_map.active() if self.tcp_conn_prefix_limit_map is not None else {},
-            tcp_conn_port_limits=self.tcp_conn_port_limit_map.active() if self.tcp_conn_port_limit_map is not None else {},
             udp_rate_limits=self.udp_rate_map.active() if self.udp_rate_map is not None else {},
             udp_agg_rate_limits=self.udp_agg_rate_map.active() if self.udp_agg_rate_map is not None else {},
             acl_rules=self.acl_maps.active_entries() if self.acl_maps is not None else {},
@@ -321,23 +341,6 @@ class XdpBackend(PortBackend):
         applied_state: AppliedState,
     ) -> ReconcilePlan:
         plan = super().build_reconcile_plan(desired_state, applied_state)
-        present_desired = self.conntrack_map.existing_keys(desired_state.conntrack_entries)
-        plan.conntrack_entries_to_add = desired_state.conntrack_entries - present_desired
-
-        for key in desired_state.conntrack_entries:
-            self._conntrack_stale_rounds.pop(key, None)
-
-        stale_ready: set[bytes] = set()
-        for key in plan.conntrack_entries_to_remove:
-            rounds = self._conntrack_stale_rounds.get(key, 0) + 1
-            self._conntrack_stale_rounds[key] = rounds
-            if rounds >= cfg.XDP_CONNTRACK_STALE_RECONCILES:
-                stale_ready.add(key)
-
-        for key in set(self._conntrack_stale_rounds) - plan.conntrack_entries_to_remove:
-            self._conntrack_stale_rounds.pop(key, None)
-
-        plan.conntrack_entries_to_remove = stale_ready
         return plan
 
     def _ok(self, result: bool) -> bool:
@@ -353,6 +356,9 @@ class XdpBackend(PortBackend):
         total = 0
         total += self.tcp_map.verify()
         total += self.udp_map.verify()
+        for zone_map in (getattr(self, "tcp_zone_map", None), getattr(self, "udp_zone_map", None)):
+            if zone_map is not None:
+                total += zone_map.verify()
         if self.sctp_map is not None:
             total += self.sctp_map.verify()
         total += self.trusted_map.verify()
@@ -383,65 +389,20 @@ class XdpBackend(PortBackend):
     ) -> None:
         self.last_apply_failures = 0
         changed = False
-        trusted_permanent = set(cfg.TRUSTED_SRC_IPS)
-
         for port in sorted(plan.tcp_ports_to_remove):
             if self._ok(self.tcp_map.set(port, 0, dry_run)):
                 log.debug("TCP -%d  (stopped)", port)
                 changed = True
-
-        if plan.tcp_ports_to_remove:
-            deleted = self.conntrack_map.delete_dest_ports(plan.tcp_ports_to_remove, dry_run)
-            if deleted:
-                log.info(
-                    "TCP conntrack -%d entr%s for closed port(s): %s",
-                    deleted,
-                    "y" if deleted == 1 else "ies",
-                    ", ".join(str(port) for port in sorted(plan.tcp_ports_to_remove)),
-                )
-
-        for key in plan.conntrack_entries_to_add:
-            if self._ok(self.conntrack_map.set(key, dry_run)):
-                self._conntrack_stale_rounds.pop(key, None)
-                changed = True
-
-        if plan.conntrack_entries_to_add:
-            log.info("TCP conntrack +%d entr%s seeded from observed established flows.", len(plan.conntrack_entries_to_add), "y" if len(plan.conntrack_entries_to_add) == 1 else "ies")
-
-        removed_conntrack = 0
-        for key in plan.conntrack_entries_to_remove:
-            if self._ok(self.conntrack_map.delete(key, dry_run)):
-                self._conntrack_stale_rounds.pop(key, None)
-                removed_conntrack += 1
-                changed = True
-
-        if removed_conntrack:
-            log.info(
-                "TCP conntrack -%d stale entr%s removed after repeated misses.",
-                removed_conntrack,
-                "y" if removed_conntrack == 1 else "ies",
-            )
 
         for port in sorted(plan.udp_ports_to_remove):
             if self._ok(self.udp_map.set(port, 0, dry_run)):
                 log.debug("UDP -%d  (stopped)", port)
                 changed = True
 
-        if plan.udp_ports_to_remove:
-            deleted = self.udp_conntrack_map.delete_dest_ports(plan.udp_ports_to_remove, dry_run)
-            if deleted:
-                log.info(
-                    "UDP conntrack -%d entr%s for closed port(s): %s",
-                    deleted,
-                    "y" if deleted == 1 else "ies",
-                    ", ".join(str(port) for port in sorted(plan.udp_ports_to_remove)),
-                )
-
         if self.sctp_map is not None:
             for port in sorted(plan.sctp_ports_to_add):
-                tag = f" [{cfg.SCTP_PERMANENT[port]}]" if port in cfg.SCTP_PERMANENT else ""
                 if self._ok(self.sctp_map.set(port, 1, dry_run)):
-                    log.info("SCTP +%d%s", port, tag)
+                    log.info("SCTP +%d", port)
                     changed = True
 
             for port in sorted(plan.sctp_ports_to_remove):
@@ -456,7 +417,7 @@ class XdpBackend(PortBackend):
                 log.info("TRUST +%s%s", ip_str, tag)
                 changed = True
 
-        for ip_str in sorted(plan.trusted_cidrs_to_remove - trusted_permanent):
+        for ip_str in sorted(plan.trusted_cidrs_to_remove):
             if self._ok(self.trusted_map.delete(ip_str, dry_run)):
                 log.info("TRUST -%s  (removed)", ip_str)
                 changed = True
@@ -481,33 +442,6 @@ class XdpBackend(PortBackend):
                 plan.tcp_syn_agg_rate_limits_to_remove,
                 dry_run,
                 "tcp_syn_agg",
-            )
-
-        if self.tcp_conn_limit_map is not None:
-            self._apply_rate_map_delta(
-                self.tcp_conn_limit_map,
-                plan.tcp_conn_limits_to_upsert,
-                plan.tcp_conn_limits_to_remove,
-                dry_run,
-                "tcp_conn_limit",
-            )
-
-        if self.tcp_conn_prefix_limit_map is not None:
-            self._apply_rate_map_delta(
-                self.tcp_conn_prefix_limit_map,
-                plan.tcp_conn_prefix_limits_to_upsert,
-                plan.tcp_conn_prefix_limits_to_remove,
-                dry_run,
-                "tcp_conn_prefix_limit",
-            )
-
-        if self.tcp_conn_port_limit_map is not None:
-            self._apply_rate_map_delta(
-                self.tcp_conn_port_limit_map,
-                plan.tcp_conn_port_limits_to_upsert,
-                plan.tcp_conn_port_limits_to_remove,
-                dry_run,
-                "tcp_conn_port_limit",
             )
 
         if self.udp_rate_map is not None:
@@ -552,9 +486,6 @@ class XdpBackend(PortBackend):
             tcp_policy_ports = (
                 set(desired_state.tcp_syn_rate_limits)
                 | set(desired_state.tcp_syn_agg_rate_limits)
-                | set(desired_state.tcp_conn_limits)
-                | set(desired_state.tcp_conn_prefix_limits)
-                | set(desired_state.tcp_conn_port_limits)
             )
             self._tcp_policy_map.ensure_prefixes(
                 tcp_policy_ports,
@@ -612,15 +543,13 @@ class XdpBackend(PortBackend):
                 )
         else:
             for port in sorted(plan.tcp_ports_to_add):
-                tag = f" [{cfg.TCP_PERMANENT[port]}]" if port in cfg.TCP_PERMANENT else ""
                 if self._ok(self.tcp_map.set(port, 1, dry_run)):
-                    log.debug("TCP +%d%s", port, tag)
+                    log.debug("TCP +%d", port)
                     changed = True
 
             for port in sorted(plan.udp_ports_to_add):
-                tag = f" [{cfg.UDP_PERMANENT[port]}]" if port in cfg.UDP_PERMANENT else ""
                 if self._ok(self.udp_map.set(port, 1, dry_run)):
-                    log.debug("UDP +%d%s", port, tag)
+                    log.debug("UDP +%d", port)
                     changed = True
 
         if self.last_apply_failures and not dry_run:
@@ -636,12 +565,26 @@ class XdpBackend(PortBackend):
         dry_run: bool,
         observed_state: ObservedState | None = None,
     ) -> None:
-        stale_rounds_snapshot = dict(self._conntrack_stale_rounds)
-        try:
-            super().reconcile(desired_state, dry_run, observed_state)
-        finally:
-            if dry_run:
-                self._conntrack_stale_rounds = stale_rounds_snapshot
+        self.last_apply_failures = 0
+        zone_maps = (
+            (getattr(self, "tcp_zone_map", None), self._desired_zone_entries(desired_state, "tcp")),
+            (getattr(self, "udp_zone_map", None), self._desired_zone_entries(desired_state, "udp")),
+        )
+        zone_failures = 0
+        if not zone_failures:
+            zone_failures += sum(
+                self._apply_zone_delta(zone_map, entries, dry_run, additions=False)
+                for zone_map, entries in zone_maps if zone_map is not None
+            )
+        super().reconcile(desired_state, dry_run, observed_state)
+        if not zone_failures and not self.last_apply_failures:
+            zone_failures += (
+                sum(
+                    self._apply_zone_delta(zone_map, entries, dry_run, additions=True)
+                    for zone_map, entries in zone_maps if zone_map is not None
+                )
+            )
+        self.last_apply_failures += zone_failures
 
     def _apply_acl_delta(self, plan: ReconcilePlan, dry_run: bool) -> None:
         if self.acl_maps is None:
@@ -684,12 +627,6 @@ class XdpBackend(PortBackend):
                     log.info("SYN rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
                 elif kind == "tcp_syn_agg":
                     log.info("SYN aggregate port %d rate_max=%d/s", port, rate_max)
-                elif kind == "tcp_conn_limit":
-                    log.info("TCP conn limit port %d conn_max=%d", port, rate_max)
-                elif kind == "tcp_conn_prefix_limit":
-                    log.info("TCP conn prefix limit port %d conn_max=%d", port, rate_max)
-                elif kind == "tcp_conn_port_limit":
-                    log.info("TCP conn port limit port %d conn_max=%d", port, rate_max)
                 elif kind == "udp":
                     svc = port_procs.get(port) or service_name(port, "udp") or "unknown"
                     log.info("UDP rate port %d (%s) rate_max=%d/s", port, svc, rate_max)
@@ -702,12 +639,6 @@ class XdpBackend(PortBackend):
                     log.info("SYN rate port %d removed (port no longer whitelisted)", port)
                 elif kind == "tcp_syn_agg":
                     log.info("SYN aggregate port %d removed", port)
-                elif kind == "tcp_conn_limit":
-                    log.info("TCP conn limit port %d removed", port)
-                elif kind == "tcp_conn_prefix_limit":
-                    log.info("TCP conn prefix limit port %d removed", port)
-                elif kind == "tcp_conn_port_limit":
-                    log.info("TCP conn port limit port %d removed", port)
                 elif kind == "udp":
                     log.info("UDP rate port %d removed (port no longer whitelisted)", port)
                 elif kind == "udp_agg":

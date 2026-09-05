@@ -30,18 +30,11 @@ _NFT_FAMILY = "inet"
 _NFT_TABLE = "auto_xdp"
 
 XDP_OBJ_PATH = os.environ.get("XDP_OBJ_PATH", "")
-TC_OBJ_PATH = os.environ.get("TC_OBJ_PATH", "")
 
 _SYN_RATE_BY_PROC: dict[str, int] = {}
 _SYN_RATE_BY_SERVICE: dict[str, int] = {}
 _SYN_AGG_RATE_BY_PROC: dict[str, int] = {}
 _SYN_AGG_RATE_BY_SERVICE: dict[str, int] = {}
-_TCP_CONN_BY_PROC: dict[str, int] = {}
-_TCP_CONN_BY_SERVICE: dict[str, int] = {}
-_TCP_CONN_PREFIX_BY_PROC: dict[str, int] = {}
-_TCP_CONN_PREFIX_BY_SERVICE: dict[str, int] = {}
-_TCP_CONN_PORT_BY_PROC: dict[str, int] = {}
-_TCP_CONN_PORT_BY_SERVICE: dict[str, int] = {}
 _UDP_RATE_BY_PROC: dict[str, int] = {}
 _UDP_RATE_BY_SERVICE: dict[str, int] = {}
 _UDP_AGG_BYTES_BY_PROC: dict[str, int] = {}
@@ -60,12 +53,6 @@ XDP_DEFAULT_TCP_SYN_RATE_STRICT = 5
 XDP_DEFAULT_TCP_SYN_RATE = 100
 XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT = 50
 XDP_DEFAULT_TCP_SYN_AGG_RATE = 1000
-XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT = 5
-XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC = 50
-XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT = 20
-XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX = 200
-XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT = 200
-XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT = 5000
 RATE_LIMIT_SOURCE_PREFIX_V4 = 32
 RATE_LIMIT_SOURCE_PREFIX_V6 = 128
 
@@ -74,20 +61,18 @@ ISATTACK_MODE = False
 DROP_EVENTS_ENABLED = True
 LOG_LEVEL: str = "warning"
 DEBOUNCE_SECONDS = 0.4
+POLICY_MODE = "audit"
+ZONES: dict[str, dict[str, list[str]]] = {}
+SUBJECTS: dict[str, dict] = {}
+UNKNOWN_SUBJECTS: dict[str, str] = {"public": "deny"}
 DISCOVERY_EXCLUDE_LOOPBACK = True
 DISCOVERY_EXCLUDE_BIND_CIDRS: list[str] = []
 DISCOVERY_EXCLUDE_PORTS: set[int] = set()
 PREFERRED_BACKEND = BACKEND_AUTO
-XDP_CONNTRACK_STALE_RECONCILES = 2
-XDP_TCP_TIMEOUT_SECONDS = 300.0
-XDP_UDP_TIMEOUT_SECONDS = 60.0
-XDP_CONNTRACK_REFRESH_SECONDS = 30.0
-XDP_CONNTRACK_GC_INTERVAL_SECONDS = 300.0
 XDP_ICMP_BURST_PACKETS = 100
 XDP_ICMP_RATE_PPS = 100.0
 XDP_UDP_GLOBAL_WINDOW_SECONDS = 1.0
 XDP_RATE_WINDOW_SECONDS = 1.0
-XDP_SYN_TIMEOUT_SECONDS = 30.0
 XDP_UDP_GLOBAL_BYTE_RATE = 0
 
 NFT_FAMILY = _NFT_FAMILY
@@ -98,9 +83,6 @@ NFT_SCTP_SET = "sctp_ports"
 NFT_TRUSTED_SET4 = "trusted_v4"
 NFT_TRUSTED_SET6 = "trusted_v6"
 
-TCP_PERMANENT: dict[int, str] = {}
-UDP_PERMANENT: dict[int, str] = {}
-SCTP_PERMANENT: dict[int, str] = {}
 TRUSTED_SRC_IPS: dict[str, str] = {}
 ACL_RULES: list[dict] = []
 SIT4_ENDPOINTS: list[str] = []
@@ -121,12 +103,9 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "prog",
     "tcp_whitelist",
     "udp_whitelist",
+    "tcp_zone_whitelist",
+    "udp_zone_whitelist",
     "sctp_whitelist",
-    "tcp_ct4",
-    "tcp_ct6",
-    "udp_ct4",
-    "udp_ct6",
-    "sctp_conntrack",
     "trusted_ipv4",
     "trusted_ipv6",
     "tcp_port_policies",
@@ -137,17 +116,12 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "proto_handlers",
     "tcp_port_handlers",
     "udp_port_handlers",
-    "tcp_pd4",
-    "tcp_pd6",
     "hblk4",
     "hblk6",
     "udp_hv4",
     "udp_hv6",
     "slot_ctx_map",
     "sit4_endpoints",
-    "tsc_pfx4",
-    "tsc_pfx6",
-    "tsc_port",
     "abuseipdb_v4",
     "syn4",
     "syn6",
@@ -195,11 +169,9 @@ REQUIRED_XDP_MAP_NAMES = load_required_xdp_map_names()
 BPF_PIN_DIR = ""
 TCP_MAP_PATH = ""
 UDP_MAP_PATH = ""
+TCP_ZONE_MAP_PATH = ""
+UDP_ZONE_MAP_PATH = ""
 SCTP_MAP_PATH = ""
-TCP_CONNTRACK_MAP_PATH4 = ""
-TCP_CONNTRACK_MAP_PATH6 = ""
-UDP_CONNTRACK_MAP_PATH4 = ""
-UDP_CONNTRACK_MAP_PATH6 = ""
 TRUSTED_IPS_MAP_PATH4 = ""
 TRUSTED_IPS_MAP_PATH6 = ""
 TCP_PORT_POLICY_MAP_PATH = ""
@@ -221,9 +193,7 @@ REQUIRED_XDP_MAP_PATHS: tuple[str, ...] = ()
 def _set_bpf_pin_dir(pin_dir: str) -> None:
     """Update BPF_PIN_DIR and every derived map-path global in one place."""
     global BPF_PIN_DIR
-    global TCP_MAP_PATH, UDP_MAP_PATH, SCTP_MAP_PATH
-    global TCP_CONNTRACK_MAP_PATH4, TCP_CONNTRACK_MAP_PATH6
-    global UDP_CONNTRACK_MAP_PATH4, UDP_CONNTRACK_MAP_PATH6
+    global TCP_MAP_PATH, UDP_MAP_PATH, TCP_ZONE_MAP_PATH, UDP_ZONE_MAP_PATH, SCTP_MAP_PATH
     global TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6
     global TCP_PORT_POLICY_MAP_PATH, UDP_PORT_POLICY_MAP_PATH
     global UDP_GLOBAL_RL_MAP_PATH, XDP_RUNTIME_CFG_MAP_PATH
@@ -236,11 +206,9 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     BPF_PIN_DIR = pin_dir
     TCP_MAP_PATH = f"{pin_dir}/tcp_whitelist"
     UDP_MAP_PATH = f"{pin_dir}/udp_whitelist"
+    TCP_ZONE_MAP_PATH = f"{pin_dir}/tcp_zone_whitelist"
+    UDP_ZONE_MAP_PATH = f"{pin_dir}/udp_zone_whitelist"
     SCTP_MAP_PATH = f"{pin_dir}/sctp_whitelist"
-    TCP_CONNTRACK_MAP_PATH4 = f"{pin_dir}/tcp_ct4"
-    TCP_CONNTRACK_MAP_PATH6 = f"{pin_dir}/tcp_ct6"
-    UDP_CONNTRACK_MAP_PATH4 = f"{pin_dir}/udp_ct4"
-    UDP_CONNTRACK_MAP_PATH6 = f"{pin_dir}/udp_ct6"
     TRUSTED_IPS_MAP_PATH4 = f"{pin_dir}/trusted_ipv4"
     TRUSTED_IPS_MAP_PATH6 = f"{pin_dir}/trusted_ipv6"
     TCP_PORT_POLICY_MAP_PATH = f"{pin_dir}/tcp_port_policies"
@@ -367,25 +335,18 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     global BOGON_FILTER_ENABLED, ISATTACK_MODE, DROP_EVENTS_ENABLED
     global LOG_LEVEL, DEBOUNCE_SECONDS
     global DISCOVERY_EXCLUDE_LOOPBACK
-    global PREFERRED_BACKEND, XDP_CONNTRACK_STALE_RECONCILES
+    global PREFERRED_BACKEND
     global RATE_LIMIT_SOURCE_PREFIX_V4, RATE_LIMIT_SOURCE_PREFIX_V6
     global RATE_MAP_ENTRIES_V4, RATE_MAP_ENTRIES_V6
-    global XDP_TCP_TIMEOUT_SECONDS, XDP_UDP_TIMEOUT_SECONDS
-    global XDP_CONNTRACK_REFRESH_SECONDS, XDP_CONNTRACK_GC_INTERVAL_SECONDS
     global XDP_ICMP_BURST_PACKETS, XDP_ICMP_RATE_PPS
     global XDP_UDP_GLOBAL_WINDOW_SECONDS, XDP_RATE_WINDOW_SECONDS
-    global XDP_SYN_TIMEOUT_SECONDS, XDP_UDP_GLOBAL_BYTE_RATE
+    global XDP_UDP_GLOBAL_BYTE_RATE
     global NFT_FAMILY, NFT_TABLE
+    global POLICY_MODE, ZONES, SUBJECTS, UNKNOWN_SUBJECTS
     global XDP_SENSITIVE_PORT_THRESHOLD
     global XDP_DEFAULT_TCP_SYN_RATE_STRICT, XDP_DEFAULT_TCP_SYN_RATE
     global XDP_DEFAULT_TCP_SYN_AGG_RATE_STRICT, XDP_DEFAULT_TCP_SYN_AGG_RATE
-    global XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT, XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC
-    global XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT, XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX
-    global XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT, XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT
 
-    TCP_PERMANENT.clear()
-    UDP_PERMANENT.clear()
-    SCTP_PERMANENT.clear()
     TRUSTED_SRC_IPS.clear()
     ACL_RULES.clear()
     SIT4_ENDPOINTS.clear()
@@ -394,12 +355,6 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     _SYN_RATE_BY_SERVICE.clear()
     _SYN_AGG_RATE_BY_PROC.clear()
     _SYN_AGG_RATE_BY_SERVICE.clear()
-    _TCP_CONN_BY_PROC.clear()
-    _TCP_CONN_BY_SERVICE.clear()
-    _TCP_CONN_PREFIX_BY_PROC.clear()
-    _TCP_CONN_PREFIX_BY_SERVICE.clear()
-    _TCP_CONN_PORT_BY_PROC.clear()
-    _TCP_CONN_PORT_BY_SERVICE.clear()
     _UDP_RATE_BY_PROC.clear()
     _UDP_RATE_BY_SERVICE.clear()
     _UDP_AGG_BYTES_BY_PROC.clear()
@@ -408,18 +363,17 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     _RATE_MAP_ENTRIES_BY_SERVICE.clear()
     DISCOVERY_EXCLUDE_BIND_CIDRS.clear()
     DISCOVERY_EXCLUDE_PORTS.clear()
+    ZONES = {}
+    SUBJECTS = {}
+    UNKNOWN_SUBJECTS = {"public": "deny"}
+    POLICY_MODE = "audit"
     RATE_LIMIT_SOURCE_PREFIX_V4 = 32
     RATE_LIMIT_SOURCE_PREFIX_V6 = 128
     RATE_MAP_ENTRIES_V4 = 16384
     RATE_MAP_ENTRIES_V6 = 4096
 
-    perm = cfg.get("permanent_ports", {})
-    for p in perm.get("tcp", []):
-        TCP_PERMANENT[int(p)] = "config"
-    for p in perm.get("udp", []):
-        UDP_PERMANENT[int(p)] = "config"
-    for p in perm.get("sctp", []):
-        SCTP_PERMANENT[int(p)] = "config"
+    if "permanent_ports" in cfg:
+        raise ValueError("unsupported exposure configuration; use subjects.*.exposure grants")
 
     for cidr, label in cfg.get("trusted_ips", {}).items():
         TRUSTED_SRC_IPS[normalize_cidr(cidr)] = str(label)
@@ -455,12 +409,6 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     _SYN_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("syn_by_service", {}).items()})
     _SYN_AGG_RATE_BY_PROC.update({k: int(v) for k, v in rl.get("syn_agg_by_proc", {}).items()})
     _SYN_AGG_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("syn_agg_by_service", {}).items()})
-    _TCP_CONN_BY_PROC.update({k: int(v) for k, v in rl.get("tcp_conn_by_proc", {}).items()})
-    _TCP_CONN_BY_SERVICE.update({k: int(v) for k, v in rl.get("tcp_conn_by_service", {}).items()})
-    _TCP_CONN_PREFIX_BY_PROC.update({k: int(v) for k, v in rl.get("tcp_conn_prefix_by_proc", {}).items()})
-    _TCP_CONN_PREFIX_BY_SERVICE.update({k: int(v) for k, v in rl.get("tcp_conn_prefix_by_service", {}).items()})
-    _TCP_CONN_PORT_BY_PROC.update({k: int(v) for k, v in rl.get("tcp_conn_port_by_proc", {}).items()})
-    _TCP_CONN_PORT_BY_SERVICE.update({k: int(v) for k, v in rl.get("tcp_conn_port_by_service", {}).items()})
     _UDP_RATE_BY_PROC.update({k: int(v) for k, v in rl.get("udp_by_proc", {}).items()})
     _UDP_RATE_BY_SERVICE.update({k: int(v) for k, v in rl.get("udp_by_service", {}).items()})
     _UDP_AGG_BYTES_BY_PROC.update({k: int(v) for k, v in rl.get("udp_agg_bytes_by_proc", {}).items()})
@@ -492,6 +440,95 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
         int(p) for p in discovery.get("exclude_ports", [])
     )
 
+    policy_cfg = cfg.get("policy", {})
+    if not isinstance(policy_cfg, dict):
+        raise ValueError("policy must be a table")
+    POLICY_MODE = str(policy_cfg.get("mode", "audit")).lower()
+    if POLICY_MODE not in {"observe", "audit", "enforce"}:
+        raise ValueError("policy.mode must be one of observe, audit, enforce")
+
+    raw_zones = cfg.get("zones", {})
+    if not isinstance(raw_zones, dict):
+        raise ValueError("zones must be a table")
+    for zone_name, zone in raw_zones.items():
+        if not isinstance(zone, dict):
+            raise ValueError(f"zones.{zone_name} must be a table")
+        interfaces = zone.get("interfaces", [])
+        if not isinstance(interfaces, list) or not all(isinstance(item, str) for item in interfaces):
+            raise ValueError(f"zones.{zone_name}.interfaces must be a list of strings")
+        cidrs = zone.get("cidrs", [])
+        if not isinstance(cidrs, list) or not all(isinstance(item, str) for item in cidrs):
+            raise ValueError(f"zones.{zone_name}.cidrs must be a list of strings")
+        ZONES[str(zone_name)] = {"interfaces": list(interfaces), "cidrs": list(cidrs)}
+    ZONES.setdefault("public", {"interfaces": [], "cidrs": []})
+
+    raw_subjects = cfg.get("subjects", {})
+    if not isinstance(raw_subjects, dict):
+        raise ValueError("subjects must be a table")
+    for subject_name, subject in raw_subjects.items():
+        if not isinstance(subject, dict):
+            raise ValueError(f"subjects.{subject_name} must be a table")
+        resolve = subject.get("resolve", {})
+        if not isinstance(resolve, dict):
+            raise ValueError(f"subjects.{subject_name}.resolve must be a table")
+        resolve_keys = {
+            "systemd_unit", "process_name", "container_runtime", "container_id",
+            "container_name", "container_label",
+        }
+        unknown_resolve = set(resolve) - resolve_keys
+        if unknown_resolve:
+            raise ValueError(
+                f"subjects.{subject_name}.resolve has unsupported keys: "
+                f"{', '.join(sorted(str(key) for key in unknown_resolve))}"
+            )
+        container_runtime = resolve.get("container_runtime")
+        if container_runtime is not None and str(container_runtime).lower() not in {"docker", "podman"}:
+            raise ValueError(f"subjects.{subject_name}.resolve.container_runtime must be docker or podman")
+        container_label = resolve.get("container_label")
+        if container_label is not None and not isinstance(container_label, (str, dict)):
+            raise ValueError(f"subjects.{subject_name}.resolve.container_label must be a string or table")
+        container_identity = any(
+            bool(resolve.get(key))
+            for key in ("container_id", "container_name", "container_label")
+        )
+        if container_runtime and not container_identity:
+            raise ValueError(
+                f"subjects.{subject_name}.resolve.container_runtime requires container identity"
+            )
+        exposure = subject.get("exposure", {})
+        if not isinstance(exposure, dict):
+            raise ValueError(f"subjects.{subject_name}.exposure must be a table")
+        for zone_name, zone_policy in exposure.items():
+            if str(zone_name) not in ZONES:
+                raise ValueError(f"subjects.{subject_name} references unknown zone {zone_name}")
+            if not isinstance(zone_policy, dict):
+                raise ValueError(f"subjects.{subject_name}.exposure.{zone_name} must be a table")
+            for protocol in ("tcp", "udp", "sctp"):
+                protocol_policy = zone_policy.get(protocol)
+                if protocol_policy is None:
+                    continue
+                if not isinstance(protocol_policy, dict):
+                    raise ValueError(f"subjects.{subject_name}.exposure.{zone_name}.{protocol} must be a table")
+                ports = protocol_policy.get("ports", [])
+                if not isinstance(ports, list):
+                    raise ValueError(f"subjects.{subject_name}.exposure.{zone_name}.{protocol}.ports must be a list")
+                try:
+                    if any(isinstance(port, bool) or not 1 <= int(port) <= 65535 for port in ports):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"subjects.{subject_name}.exposure.{zone_name}.{protocol}.ports must contain 1..65535"
+                    ) from None
+        SUBJECTS[str(subject_name)] = copy.deepcopy(subject)
+
+    raw_unknown = cfg.get("unknown_subjects", policy_cfg.get("unknown_subjects", {"public": "deny"}))
+    if not isinstance(raw_unknown, dict):
+        raise ValueError("unknown_subjects must be a table")
+    for zone_name, action in raw_unknown.items():
+        if str(action).lower() != "deny":
+            raise ValueError("unknown_subjects may only use deny")
+        UNKNOWN_SUBJECTS[str(zone_name)] = "deny"
+
     xdp = cfg.get("xdp", {})
     _set_bpf_pin_dir(str(xdp.get("bpf_pin_dir", _BPF_PIN_DIR)).rstrip("/"))
 
@@ -499,32 +536,7 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     NFT_FAMILY = str(nftables.get("family", _NFT_FAMILY))
     NFT_TABLE = str(nftables.get("table", _NFT_TABLE))
 
-    XDP_CONNTRACK_STALE_RECONCILES = _coerce_positive_int(
-        xdp.get("conntrack_stale_reconciles", 2),
-        "xdp.conntrack_stale_reconciles",
-        2,
-    )
     xdp_runtime = xdp.get("runtime", {})
-    XDP_TCP_TIMEOUT_SECONDS = _coerce_nonnegative_float(
-        xdp_runtime.get("tcp_timeout_seconds", 300.0),
-        "xdp.runtime.tcp_timeout_seconds",
-        300.0,
-    )
-    XDP_UDP_TIMEOUT_SECONDS = _coerce_nonnegative_float(
-        xdp_runtime.get("udp_timeout_seconds", 60.0),
-        "xdp.runtime.udp_timeout_seconds",
-        60.0,
-    )
-    XDP_CONNTRACK_REFRESH_SECONDS = _coerce_nonnegative_float(
-        xdp_runtime.get("conntrack_refresh_seconds", 30.0),
-        "xdp.runtime.conntrack_refresh_seconds",
-        30.0,
-    )
-    XDP_CONNTRACK_GC_INTERVAL_SECONDS = _coerce_nonnegative_float(
-        xdp_runtime.get("conntrack_gc_interval_seconds", 300.0),
-        "xdp.runtime.conntrack_gc_interval_seconds",
-        300.0,
-    )
     XDP_ICMP_BURST_PACKETS = _coerce_positive_int(
         xdp_runtime.get("icmp_burst_packets", 100),
         "xdp.runtime.icmp_burst_packets",
@@ -545,11 +557,6 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
         "xdp.runtime.rate_window_seconds",
         1.0,
     )
-    XDP_SYN_TIMEOUT_SECONDS = _coerce_nonnegative_float(
-        xdp_runtime.get("syn_timeout_seconds", 30.0),
-        "xdp.runtime.syn_timeout_seconds",
-        30.0,
-    )
     XDP_SENSITIVE_PORT_THRESHOLD = _coerce_positive_int(
         xdp_runtime.get("sensitive_port_threshold", 5),
         "xdp.runtime.sensitive_port_threshold", 5,
@@ -569,30 +576,6 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     XDP_DEFAULT_TCP_SYN_AGG_RATE = _coerce_positive_int(
         xdp_runtime.get("default_tcp_syn_agg_rate", 1000),
         "xdp.runtime.default_tcp_syn_agg_rate", 1000,
-    )
-    XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC_STRICT = _coerce_positive_int(
-        xdp_runtime.get("default_tcp_established_per_src_strict", 5),
-        "xdp.runtime.default_tcp_established_per_src_strict", 5,
-    )
-    XDP_DEFAULT_TCP_ESTABLISHED_PER_SRC = _coerce_positive_int(
-        xdp_runtime.get("default_tcp_established_per_src", 50),
-        "xdp.runtime.default_tcp_established_per_src", 50,
-    )
-    XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX_STRICT = _coerce_positive_int(
-        xdp_runtime.get("default_tcp_established_per_prefix_strict", 20),
-        "xdp.runtime.default_tcp_established_per_prefix_strict", 20,
-    )
-    XDP_DEFAULT_TCP_ESTABLISHED_PER_PREFIX = _coerce_positive_int(
-        xdp_runtime.get("default_tcp_established_per_prefix", 200),
-        "xdp.runtime.default_tcp_established_per_prefix", 200,
-    )
-    XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT_STRICT = _coerce_positive_int(
-        xdp_runtime.get("default_tcp_established_per_port_strict", 200),
-        "xdp.runtime.default_tcp_established_per_port_strict", 200,
-    )
-    XDP_DEFAULT_TCP_ESTABLISHED_PER_PORT = _coerce_positive_int(
-        xdp_runtime.get("default_tcp_established_per_port", 5000),
-        "xdp.runtime.default_tcp_established_per_port", 5000,
     )
     _udp_global_byte_rate_mbps = _coerce_nonnegative_float(
         xdp_runtime.get("udp_global_byte_rate_mbps", 0.0),
@@ -625,9 +608,9 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
 def apply_toml_config(cfg: dict) -> None:
     """Apply a configuration atomically from the daemon's perspective.
 
-    The parser below updates module-level policy tables for compatibility with
-    existing callers. If any field fails validation, restore every config
-    global so a failed SIGHUP cannot leave a partially applied policy.
+    The parser below updates module-level policy tables used by the daemon. If
+    any field fails validation, restore every config global so a failed SIGHUP
+    cannot leave a partially applied policy.
     """
     snapshot = {
         name: (value, copy.deepcopy(value))

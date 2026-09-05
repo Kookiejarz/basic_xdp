@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
+import re
 import socket
+import shutil
 import struct
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 
 from auto_xdp import config as cfg
-from auto_xdp.state import ObservedState
+from auto_xdp.state import ObservedState, RuntimeEndpoint
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +43,6 @@ _NLM_F_REQUEST = 0x01
 _NLM_F_DUMP = 0x300  # NLM_F_ROOT | NLM_F_MATCH
 
 _SS_LISTEN = 1 << 10
-_SS_ESTABLISHED = 1 << 1
 _SS_ALL = 0xFFFFFFFF
 
 _IPPROTO_SCTP = 132
@@ -55,10 +59,34 @@ _DIAG_REQ_SZ = _DIAG_REQ.size   # 56
 _DIAG_MSG_SZ = _DIAG_MSG.size   # 72
 _ZERO16 = bytes(16)
 _RECV_BUFSZ = 1 << 16  # 64 KB
+_LOCAL_ADDRESS_ZONES: dict[str, str] | None = None
 
 
 class DiscoveryError(RuntimeError):
     """The socket dump did not produce a complete, trustworthy snapshot."""
+
+
+@dataclass(frozen=True)
+class ContainerIdentity:
+    runtime: str
+    container_id: str
+    name: str
+    labels: dict[str, str]
+    host_ip: str = ""
+
+    @property
+    def subject(self) -> str:
+        return f"{self.runtime}:{self.container_id[:12] or self.name}"
+
+
+_CONTAINER_METADATA_TTL = 5.0
+_CONTAINER_METADATA_UNTIL = 0.0
+_CONTAINER_PORTS: dict[tuple[str, int], list[ContainerIdentity]] = {}
+_CONTAINER_BY_ID: dict[str, ContainerIdentity] = {}
+_CONTAINER_CGROUP_RE = re.compile(
+    r"(?:^|/)(?:docker|libpod)[-/]([0-9a-f]{12,64})(?:\.scope)?(?:/|$)",
+    re.IGNORECASE,
+)
 
 
 # low-level netlink helpers
@@ -161,48 +189,148 @@ def _pid_comm(pid: int) -> str:
         return ""
 
 
+def _container_inspect(runtime: str) -> list[dict]:
+    """Read running container metadata without trusting process names."""
+    if shutil.which(runtime) is None:
+        return []
+    try:
+        listed = subprocess.run(
+            [runtime, "ps", "-q"], capture_output=True, text=True, timeout=5, check=False
+        )
+        if listed.returncode != 0:
+            return []
+        ids = [item for item in listed.stdout.split() if re.fullmatch(r"[0-9a-fA-F]{12,64}", item)]
+        if not ids:
+            return []
+        records: list[dict] = []
+        for offset in range(0, len(ids), 64):
+            inspected = subprocess.run(
+                [runtime, "inspect", *ids[offset:offset + 64]],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if inspected.returncode != 0:
+                continue
+            try:
+                payload = json.loads(inspected.stdout)
+            except ValueError:
+                continue
+            if isinstance(payload, list):
+                records.extend(item for item in payload if isinstance(item, dict))
+        return records
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return []
+
+
+def _container_port_bindings(record: dict) -> list[tuple[str, int, str]]:
+    network = record.get("NetworkSettings", {})
+    ports = network.get("Ports", {}) if isinstance(network, dict) else {}
+    if not isinstance(ports, dict):
+        ports = {}
+    if not ports:
+        host_config = record.get("HostConfig", {})
+        ports = host_config.get("PortBindings", {}) if isinstance(host_config, dict) else {}
+    bindings: list[tuple[str, int, str]] = []
+    for container_port, host_bindings in ports.items():
+        if not isinstance(container_port, str) or "/" not in container_port:
+            continue
+        raw_port, protocol = container_port.rsplit("/", 1)
+        protocol = protocol.lower()
+        if protocol not in {"tcp", "udp", "sctp"}:
+            continue
+        try:
+            int(raw_port)
+        except ValueError:
+            continue
+        if not isinstance(host_bindings, list):
+            continue
+        for binding in host_bindings:
+            if not isinstance(binding, dict):
+                continue
+            try:
+                host_port = int(str(binding.get("HostPort", "")))
+            except ValueError:
+                continue
+            if not 1 <= host_port <= 65535:
+                continue
+            host_ip = str(binding.get("HostIp", ""))
+            bindings.append((protocol, host_port, host_ip))
+    return bindings
+
+
+def _container_metadata() -> tuple[dict[tuple[str, int], list[ContainerIdentity]], dict[str, ContainerIdentity]]:
+    global _CONTAINER_METADATA_UNTIL, _CONTAINER_PORTS, _CONTAINER_BY_ID
+    now = time.monotonic()
+    if now < _CONTAINER_METADATA_UNTIL:
+        return _CONTAINER_PORTS, _CONTAINER_BY_ID
+    by_port: dict[tuple[str, int], list[ContainerIdentity]] = {}
+    by_id: dict[str, ContainerIdentity] = {}
+    for runtime in ("docker", "podman"):
+        for record in _container_inspect(runtime):
+            container_id = str(record.get("Id", "")).lower()
+            if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+                continue
+            raw_name = str(record.get("Name", "")).lstrip("/")
+            config = record.get("Config", {})
+            raw_labels = config.get("Labels", {}) if isinstance(config, dict) else {}
+            labels = {
+                str(key): str(value)
+                for key, value in raw_labels.items()
+            } if isinstance(raw_labels, dict) else {}
+            identity = ContainerIdentity(runtime, container_id, raw_name, labels)
+            by_id[f"{runtime}:{container_id}"] = identity
+            by_id.setdefault(container_id, identity)
+            for protocol, host_port, host_ip in _container_port_bindings(record):
+                bound = ContainerIdentity(runtime, container_id, raw_name, labels, host_ip)
+                by_port.setdefault((protocol, host_port), []).append(bound)
+    _CONTAINER_PORTS = by_port
+    _CONTAINER_BY_ID = by_id
+    _CONTAINER_METADATA_UNTIL = now + _CONTAINER_METADATA_TTL
+    return by_port, by_id
+
+
+def _container_from_pid(pid: int) -> ContainerIdentity | None:
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
+            cgroup = fh.read()
+    except OSError:
+        return None
+    match = _CONTAINER_CGROUP_RE.search(cgroup)
+    if not match:
+        return None
+    container_id = match.group(1).lower()
+    identity = _CONTAINER_BY_ID.get(container_id)
+    if identity is not None:
+        return identity
+    runtime = "podman" if "libpod" in match.group(0).lower() else "docker"
+    return ContainerIdentity(runtime, container_id, "", {})
+
+
+def _container_for_endpoint(protocol: str, host_address: str, port: int) -> ContainerIdentity | None:
+    candidates = _CONTAINER_PORTS.get((protocol, port), [])
+    matches: list[ContainerIdentity] = []
+    seen: set[tuple[str, str]] = set()
+    for identity in candidates:
+        host_ip = identity.host_ip.split("%", 1)[0]
+        if host_ip in {"", "0.0.0.0", "::", "*"} or host_ip == host_address.split("%", 1)[0]:
+            key = (identity.runtime, identity.container_id)
+            if key not in seen:
+                seen.add(key)
+                matches.append(identity)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return ContainerIdentity("ambiguous", "", "", {})
+    return None
+
+
 def _addr_str(family: int, raw: bytes) -> str:
     return socket.inet_ntop(family, raw[:4] if family == socket.AF_INET else raw)
 
 
-def _pack_conntrack_key_raw(family: int, sport_h: int, dport_h: int, src: bytes, dst: bytes) -> bytes:
-    """Pack XDP conntrack lookup key from SOCK_DIAG fields."""
-    if family == socket.AF_INET:
-        return struct.pack("!HH4s4s", dport_h, sport_h, dst[:4], src[:4])
-    if family == socket.AF_INET6 and _is_ipv4_mapped_v6(src) and _is_ipv4_mapped_v6(dst):
-        return struct.pack("!HH4s4s", dport_h, sport_h, dst[12:16], src[12:16])
-    return struct.pack("!HH16s16s", dport_h, sport_h, dst, src)
-
-
 # shared helpers (used by both paths)
-
-def _is_ipv4_mapped_v6(raw: bytes) -> bool:
-    return len(raw) >= 16 and raw[:10] == b"\x00" * 10 and raw[10:12] == b"\xff\xff"
-
-
-def _ipv4_mapped_packed(ip_str: str) -> bytes | None:
-    try:
-        addr = ipaddress.IPv6Address(ip_str.split("%", 1)[0])
-    except ValueError:
-        return None
-    if addr.ipv4_mapped is None:
-        return None
-    return addr.ipv4_mapped.packed
-
-
-def _pack_tcp_conntrack_key(conn) -> bytes:
-    if conn.family == socket.AF_INET:
-        remote_ip = socket.inet_aton(conn.raddr.ip)
-        local_ip = socket.inet_aton(conn.laddr.ip)
-        return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-    mapped_remote = _ipv4_mapped_packed(conn.raddr.ip)
-    mapped_local = _ipv4_mapped_packed(conn.laddr.ip)
-    if mapped_remote is not None and mapped_local is not None:
-        return struct.pack("!HH4s4s", conn.raddr.port, conn.laddr.port, mapped_remote, mapped_local)
-    remote_ip = socket.inet_pton(socket.AF_INET6, conn.raddr.ip)
-    local_ip = socket.inet_pton(socket.AF_INET6, conn.laddr.ip)
-    return struct.pack("!HH16s16s", conn.raddr.port, conn.laddr.port, remote_ip, local_ip)
-
 
 def _resolve_pid_name(pid: int, cache: dict[int, str]) -> str:
     if pid not in cache:
@@ -244,6 +372,137 @@ def _bind_ip_is_exposed(
         if addr.version == net.version and addr in net:
             return False
     return True
+
+
+def _bind_scope(ip_str: str) -> str:
+    """Describe the bind address without treating it as authorization."""
+    if ip_str in ("0.0.0.0", "::", "*"):
+        return "wildcard"
+    try:
+        address = ipaddress.ip_address(ip_str.split("%", 1)[0])
+    except ValueError:
+        return "unknown"
+    return "loopback" if address.is_loopback else "specific"
+
+
+def _pid_systemd_unit(pid: int) -> str:
+    """Return the systemd service unit owning pid, if cgroup evidence exists."""
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as fh:
+            for line in fh:
+                path = line.rstrip().rsplit(":", 1)[-1]
+                for component in reversed(path.split("/")):
+                    if component.endswith(".service"):
+                        return component
+    except OSError:
+        pass
+    return ""
+
+
+def _endpoint_zone(host_address: str) -> str:
+    """Classify the local bind into a configured ingress zone.
+
+    Exact address-to-interface resolution is intentionally conservative. A
+    wildcard bind is reported as public because it is the only zone that can
+    safely represent the global port maps used by the current backends.
+    """
+    global _LOCAL_ADDRESS_ZONES
+    try:
+        address = ipaddress.ip_address(host_address.split("%", 1)[0])
+    except ValueError:
+        return "unknown"
+    if address.is_loopback:
+        return "local"
+    if host_address in {"0.0.0.0", "::", "*"}:
+        return "public"
+    if _LOCAL_ADDRESS_ZONES is None:
+        _LOCAL_ADDRESS_ZONES = {}
+        try:
+            raw = subprocess.check_output(
+                ["ip", "-j", "address", "show"],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            links = json.loads(raw)
+            for link in links if isinstance(links, list) else []:
+                ifname = link.get("ifname")
+                if not isinstance(ifname, str):
+                    continue
+                for zone, spec in cfg.ZONES.items():
+                    if ifname not in spec.get("interfaces", []) and "*" not in spec.get("interfaces", []):
+                        continue
+                    for info in link.get("addr_info", []):
+                        local = info.get("local") if isinstance(info, dict) else None
+                        if isinstance(local, str):
+                            _LOCAL_ADDRESS_ZONES[local.split("%", 1)[0]] = zone
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+            pass
+    mapped_zone = _LOCAL_ADDRESS_ZONES.get(host_address.split("%", 1)[0])
+    if mapped_zone:
+        return mapped_zone
+    for zone, spec in cfg.ZONES.items():
+        for cidr in spec.get("cidrs", []):
+            try:
+                if address in ipaddress.ip_network(cidr, strict=False):
+                    return zone
+            except ValueError:
+                continue
+    return "unknown"
+
+
+def _endpoint(
+    protocol: str,
+    host_address: str,
+    port: int,
+    subject: str,
+    attribution_state: str,
+    attribution_source: str,
+    container: ContainerIdentity | None = None,
+) -> RuntimeEndpoint:
+    endpoint = RuntimeEndpoint(
+        protocol=protocol,
+        host_address=host_address,
+        host_port=port,
+        bind_scope=_bind_scope(host_address),
+        ingress_zone=_endpoint_zone(host_address),
+        subject=subject,
+        attribution_state=attribution_state,
+        attribution_source=attribution_source,
+    )
+    identity = container or _container_for_endpoint(protocol, host_address, port)
+    if identity is None:
+        return endpoint
+    if identity.runtime == "ambiguous":
+        endpoint.subject = ""
+        endpoint.attribution_state = "ambiguous"
+        endpoint.attribution_source = "container-runtime-port-collision"
+        return endpoint
+    endpoint.subject = identity.subject
+    endpoint.attribution_state = "exact"
+    endpoint.attribution_source = (
+        f"{identity.runtime}-inspect"
+        if identity.name or identity.labels
+        else f"{identity.runtime}-cgroup"
+    )
+    endpoint.container_runtime = identity.runtime
+    endpoint.container_id = identity.container_id
+    endpoint.container_name = identity.name
+    endpoint.container_labels = dict(identity.labels)
+    return endpoint
+
+
+def _mark_shared_endpoints(state: ObservedState) -> ObservedState:
+    """Mark reuse/listener collisions so policy cannot silently privilege one owner."""
+    groups: dict[tuple[str, int], list[RuntimeEndpoint]] = {}
+    for endpoint in state.endpoints:
+        groups.setdefault((endpoint.protocol, endpoint.host_port), []).append(endpoint)
+    for endpoints in groups.values():
+        subjects = {endpoint.subject for endpoint in endpoints}
+        if len(endpoints) > 1 and len(subjects) > 1:
+            for endpoint in endpoints:
+                endpoint.attribution_state = "shared" if endpoint.subject else "ambiguous"
+                endpoint.attribution_source = "shared-port-inventory"
+    return state
 
 
 def _parse_proc_udp(path: str) -> dict[int, dict]:
@@ -305,6 +564,8 @@ def _build_systemd_socket_map() -> dict[int, str]:
 
 def _get_listening_ports_netlink() -> ObservedState:
     """Query sockets via SOCK_DIAG — no subprocess, no psutil."""
+    global _LOCAL_ADDRESS_ZONES
+    _LOCAL_ADDRESS_ZONES = None
     state = ObservedState()
     exclude_nets = _discovery_exclude_networks()
 
@@ -325,6 +586,24 @@ def _get_listening_ports_netlink() -> ObservedState:
             pid_names[pid] = _pid_comm(pid)
         return pid_names[pid]
 
+    def _proc_attribution(inode: int) -> tuple[str, str, str, ContainerIdentity | None]:
+        nonlocal inode_pid
+        if not inode:
+            return "", "unknown", "", None
+        if inode_pid is None:
+            inode_pid = _build_inode_pid()
+        pid = inode_pid.get(inode)
+        if pid is None:
+            return "", "unknown", "", None
+        container = _container_from_pid(pid)
+        if container is not None:
+            return container.subject, "exact", f"{container.runtime}-cgroup", container
+        unit = _pid_systemd_unit(pid)
+        if unit:
+            return unit, "exact", "systemd-cgroup", None
+        name = _proc_name(inode)
+        return (name, "delegated", "process-name", None) if name else ("", "unknown", "", None)
+
     def _resolve_systemd(name: str, port: int) -> str:
         nonlocal systemd_socket_map
         if name != "systemd":
@@ -342,21 +621,18 @@ def _get_listening_ports_netlink() -> ObservedState:
             if port in cfg.DISCOVERY_EXCLUDE_PORTS:
                 continue
             state.tcp.add(port)
-            name = _resolve_systemd(_proc_name(inode), port)
+            raw_name = _proc_name(inode)
+            name = _resolve_systemd(raw_name, port)
             if name:
                 state.tcp_processes[port] = name
-
-    # TCP ESTABLISHED — seed conntrack for existing flows
-    for family in (socket.AF_INET, socket.AF_INET6):
-        for sport_h, dport_h, src, dst, _inode, _rq in _nldiag_dump(
-            family, socket.IPPROTO_TCP, _SS_ESTABLISHED
-        ):
-            if not _bind_ip_is_exposed(_addr_str(family, src), exclude_nets):
-                continue
-            try:
-                state.established.add(_pack_conntrack_key_raw(family, sport_h, dport_h, src, dst))
-            except (OSError, ValueError):
-                continue
+            subject, attribution, source, container = _proc_attribution(inode)
+            if raw_name == "systemd" and name != "systemd":
+                subject, attribution, source, container = name, "exact", "systemd-socket", None
+            if name and name != "systemd" and container is None:
+                subject = name
+            state.endpoints.append(
+                _endpoint("tcp", _addr_str(family, src), port, subject, attribution, source, container)
+            )
 
     # UDP — collect drops from /proc, rqueue from SOCK_DIAG
     proc_udp: dict[int, dict] = {}
@@ -409,6 +685,12 @@ def _get_listening_ports_netlink() -> ObservedState:
         name = _resolve_systemd(_proc_name(info["inode"]), port)
         if name:
             state.udp_processes[port] = name
+        subject, attribution, source, container = _proc_attribution(info["inode"])
+        if name and name != "systemd" and container is None:
+            subject = name
+        state.endpoints.append(
+            _endpoint("udp", _addr_str(family, src), port, subject, attribution, source, container)
+        )
         opts: set[str] = set()
         if info["count"] > 1:
             opts.add("SO_REUSEPORT")
@@ -427,10 +709,14 @@ def _get_listening_ports_netlink() -> ObservedState:
             ):
                 if _bind_ip_is_exposed(_addr_str(family, src), exclude_nets) and sport_h not in cfg.DISCOVERY_EXCLUDE_PORTS:
                     state.sctp.add(sport_h)
+                    subject, attribution, source, container = _proc_attribution(_in)
+                    state.endpoints.append(
+                        _endpoint("sctp", _addr_str(family, src), sport_h, subject, attribution, source, container)
+                    )
     except OSError:
         pass
 
-    return state
+    return _mark_shared_endpoints(state)
 
 
 # psutil fallback (non-Linux)
@@ -479,6 +765,8 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
         sys.exit("psutil not installed. Run: pip3 install psutil")
 
     connections = cached_conns if cached_conns is not None else _net_connections(kind="inet")
+    global _LOCAL_ADDRESS_ZONES
+    _LOCAL_ADDRESS_ZONES = None
     state = ObservedState()
     exclude_nets = _discovery_exclude_networks()
     pid_names: dict[int, str] = {}
@@ -496,16 +784,19 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                 if port in cfg.DISCOVERY_EXCLUDE_PORTS:
                     continue
                 state.tcp.add(port)
-                name, systemd_map = _resolve_process_name(getattr(conn, "pid", None), port, pid_names, systemd_map)
+                pid = getattr(conn, "pid", None)
+                name, systemd_map = _resolve_process_name(pid, port, pid_names, systemd_map)
                 if name:
                     state.tcp_processes[port] = name
-            elif conn.status == psutil.CONN_ESTABLISHED and conn.raddr:
-                if not _bind_ip_is_exposed(conn.laddr.ip, exclude_nets):
-                    continue
-                try:
-                    state.established.add(_pack_tcp_conntrack_key(conn))
-                except (OSError, ValueError):
-                    continue
+                container = _container_from_pid(pid) if isinstance(pid, int) else None
+                state.endpoints.append(
+                    _endpoint(
+                        "tcp", conn.laddr.ip, port, name,
+                        "exact" if name.endswith(".service") else ("delegated" if name else "unknown"),
+                        "systemd-socket" if name.endswith(".service") else ("process-name" if name else ""),
+                        container,
+                    )
+                )
         elif conn.type in (socket.SOCK_DGRAM, socket.SOCK_SEQPACKET):
             if conn.raddr:
                 if conn.type != socket.SOCK_DGRAM:
@@ -519,20 +810,35 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                 continue
             if conn.type == socket.SOCK_DGRAM:
                 state.udp.add(port)
-                name, systemd_map = _resolve_process_name(getattr(conn, "pid", None), port, pid_names, systemd_map)
+                pid = getattr(conn, "pid", None)
+                name, systemd_map = _resolve_process_name(pid, port, pid_names, systemd_map)
                 if name:
                     state.udp_processes[port] = name
+                container = _container_from_pid(pid) if isinstance(pid, int) else None
+                state.endpoints.append(
+                    _endpoint(
+                        "udp", conn.laddr.ip, port, name,
+                        "exact" if name.endswith(".service") else ("delegated" if name else "unknown"),
+                        "systemd-socket" if name.endswith(".service") else ("process-name" if name else ""),
+                        container,
+                    )
+                )
                 _annotate_udp_sock_opts(port, proc_udp, state)
             else:
                 state.sctp.add(port)
+                state.endpoints.append(
+                    _endpoint("sctp", conn.laddr.ip, port, "", "unknown", "")
+                )
 
-    return state
+    return _mark_shared_endpoints(state)
 
 
 # public API
 
 def get_listening_ports(cached_conns=None) -> ObservedState:
     """Read externally reachable listening TCP/UDP/SCTP ports."""
+    if _IS_LINUX:
+        _container_metadata()
     if _IS_LINUX:
         return _get_listening_ports_netlink()
     return _get_listening_ports_psutil(cached_conns)

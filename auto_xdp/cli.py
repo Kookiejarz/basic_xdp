@@ -51,6 +51,17 @@ def main() -> None:
         help="Run as a daemon (event-driven reconciliation)",
     )
     p.add_argument(
+        "--mode",
+        choices=["observe", "audit", "enforce"],
+        default=None,
+        help="Exposure policy mode; observe/audit never change the backend",
+    )
+    p.add_argument(
+        "--explain",
+        action="store_true",
+        help="Log endpoint ownership, zone, grant reason, and protection profile",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Print operations without executing them",
@@ -92,11 +103,23 @@ def main() -> None:
         p.error(str(exc))
 
     if args.watch:
-        watch(
-            args.dry_run, args.backend, args.config,
-            cli_trusted_ips, cli_log_level=args.log_level,
-        )
+        if args.mode is None and not args.explain:
+            watch(
+                args.dry_run, args.backend, args.config,
+                cli_trusted_ips, cli_log_level=args.log_level,
+            )
+        else:
+            watch(
+                args.dry_run, args.backend, args.config, cli_trusted_ips,
+                cli_log_level=args.log_level, mode=args.mode, explain=args.explain,
+            )
     else:
+        if args.mode in {"observe", "audit"}:
+            sync_once(None, False, mode=args.mode, explain=True if args.explain else False)
+            return
         with open_backend(args.backend) as backend:
-            sync_once(backend, args.dry_run)
+            if args.mode is None and not args.explain:
+                sync_once(backend, args.dry_run)
+            else:
+                sync_once(backend, args.dry_run, mode=args.mode, explain=args.explain)
             log.info("Sync completed.")

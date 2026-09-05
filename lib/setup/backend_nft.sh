@@ -88,7 +88,6 @@ finalize_nftables_cutover() {
         fi
         detached=$((detached + 1))
     done
-    cleanup_tc_egress_filter
     for pin in "${rollback_pins[@]}"; do [[ -z "$pin" ]] || rm -f "$pin"; done
     [[ $have_xdp -eq 0 ]] || rmdir "$rollback_dir" 2>/dev/null || true
 

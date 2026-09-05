@@ -55,7 +55,7 @@ print(value.lower())
         local path
         local required=(
             setup_xdp.sh axdp config.toml xdp_port_sync.py pkt_relay.py
-            auto_xdp_bpf_helpers.py tc_flow_track.c auto_xdp bpf handlers
+            auto_xdp_bpf_helpers.py auto_xdp bpf handlers
             lib runtime
         )
         for path in "${required[@]}"; do
@@ -164,7 +164,6 @@ _check_update_candidate_files() {
         "xdp_port_sync.py"
         "pkt_relay.py"
         "auto_xdp_bpf_helpers.py"
-        "tc_flow_track.c"
     )
 
     for path in "${fixed_files[@]}"; do

@@ -35,6 +35,7 @@ struct vlan_hdr {
 #endif
 
 #define IPV6_FRAG_DROP_SENTINEL 0xFF
+#define IPV6_EXTHDR_MALFORMED_SENTINEL 0xFE
 #define VLAN_MAX_DEPTH 4
 #define CT_FAMILY_IPV4 2
 #define CT_FAMILY_IPV6 10
@@ -46,9 +47,6 @@ struct vlan_hdr {
 #define TCP_FLAG_ACK  0x10
 
 
-// CT_SYN_PENDING and other shared conntrack flags (also included by tc_flow_track.c).
-#include "ct_flags.h"
-
 // cfg_flags bits for xdp_runtime_cfg.cfg_flags.
 // Zero means "all defaults" so old loaders remain compatible.
 #define XDP_CFG_FLAG_BOGON_DISABLED       (1U << 0)  // bogon filter off (default: on)
@@ -59,14 +57,14 @@ struct vlan_hdr {
 // Runtime tunables. Userspace writes this map from config.toml; zero fields
 // fall back to defaults so old loaders remain compatible.
 struct xdp_runtime_cfg {
-    __u64 tcp_timeout_ns;
-    __u64 udp_timeout_ns;
-    __u64 ct_refresh_ns;
+    __u64 _reserved0;
+    __u64 _reserved1;
+    __u64 _reserved2;
     __u64 icmp_token_max;
     __u64 icmp_ns_per_token;
     __u64 udp_global_window_ns;
     __u64 rate_window_ns;
-    __u64 syn_timeout_ns;   // half-open (SYN-only) TTL; default 30s
+    __u64 _reserved7;
     __u32 cfg_flags;        // XDP_CFG_FLAG_* bits; replaces bogon_cfg/abuseipdb_cfg/observability_cfg/slot_def_action
     __u32 _pad;
 };
@@ -86,26 +84,6 @@ static __always_inline struct xdp_runtime_cfg *runtime_cfg(void)
 
 // cfg_*_ns(): pre-fetched cfg pointer variants — callers that already hold a
 // runtime_cfg() pointer use these to avoid redundant map lookups in hot paths.
-static __always_inline __u64 cfg_tcp_timeout_ns(struct xdp_runtime_cfg *cfg)
-{
-    return cfg && cfg->tcp_timeout_ns ? cfg->tcp_timeout_ns : 300ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 cfg_syn_timeout_ns(struct xdp_runtime_cfg *cfg)
-{
-    return cfg && cfg->syn_timeout_ns ? cfg->syn_timeout_ns : 30ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 cfg_udp_timeout_ns(struct xdp_runtime_cfg *cfg)
-{
-    return cfg && cfg->udp_timeout_ns ? cfg->udp_timeout_ns : 60ULL * NS_PER_SEC;
-}
-
-static __always_inline __u64 cfg_ct_refresh_ns(struct xdp_runtime_cfg *cfg)
-{
-    return cfg && cfg->ct_refresh_ns ? cfg->ct_refresh_ns : 30ULL * NS_PER_SEC;
-}
-
 static __always_inline __u64 cfg_udp_global_window_ns(struct xdp_runtime_cfg *cfg)
 {
     return cfg && cfg->udp_global_window_ns ? cfg->udp_global_window_ns : NS_PER_SEC;
@@ -129,15 +107,15 @@ static __always_inline __u64 cfg_rate_window_ns(struct xdp_runtime_cfg *cfg)
 
 enum xdp_counter_idx {
     CNT_TCP_NEW_ALLOW   = 0,  // TCP pure SYN packets allowed by tcp_whitelist
-    CNT_TCP_ESTABLISHED = 1,  // TCP established/reply packets allowed by conntrack
-    CNT_TCP_DROP        = 2,  // TCP packets dropped (not in whitelist / no conntrack)
+    CNT_TCP_PASS        = 1,  // TCP packets allowed after exposure evaluation
+    CNT_TCP_DROP        = 2,  // TCP packets dropped by exposure or protection
     CNT_UDP_PASS        = 3,  // UDP packets allowed
     CNT_UDP_DROP        = 4,  // UDP packets dropped
     CNT_IPV4_OTHER      = 5,  // IPv4 non-TCP/UDP (ICMP, etc.) passed
     CNT_IPV6_OTHER      = 6,  // IPv6 non-TCP/UDP (ICMPv6, etc.) passed
     CNT_FRAG_DROP       = 7,  // Fragmented packets dropped
     CNT_NON_IP          = 8,  // Non-IP traffic (ARP, etc.) passed
-    CNT_TCP_CT_MISS     = 9,  // TCP ACK packets dropped due to missing conntrack state
+    CNT_TCP_RESERVED     = 9, // Reserved counter slot retained for ABI stability
     CNT_ICMP_DROP       = 10, // ICMP/ICMPv6 echo packets dropped by token-bucket rate limiter
     CNT_SYN_RATE_DROP   = 11, // TCP SYN dropped by per-IP rate limiter (anti-brute-force)
     CNT_UDP_RATE_DROP        = 12, // UDP dropped by per-source-IP rate limiter
@@ -156,12 +134,12 @@ enum xdp_counter_idx {
     CNT_UDP_MALFORM_PORT0    = 25, // UDP src or dst port is 0
     CNT_UDP_MALFORM_LEN      = 26, // UDP length field < 8 or exceeds packet boundary
     CNT_BOGON_DROP           = 27, // packet dropped: spoofed/reserved source address
-    CNT_TCP_CONN_LIMIT_DROP        = 28, // TCP SYN dropped by per-source concurrent connection limit
+    CNT_RESERVED_28                = 28,
     CNT_SYN_AGG_RATE_DROP          = 29, // TCP SYN dropped by per-prefix aggregate rate limiter
     CNT_UDP_AGG_RATE_DROP          = 30, // UDP dropped by per-prefix byte-rate limiter
     CNT_HANDLER_BLOCK_DROP         = 31, // dropped: src IP in handler_blocked map
-    CNT_TCP_CONN_PREFIX_LIMIT_DROP = 32, // TCP SYN dropped by per-prefix concurrent connection limit
-    CNT_TCP_CONN_PORT_LIMIT_DROP   = 33, // TCP SYN dropped by per-port total concurrent connection limit
+    CNT_RESERVED_32                = 32,
+    CNT_RESERVED_33                = 33,
     CNT_ABUSEIPDB_DROP             = 34, // dropped: src IP in AbuseIPDB blocklist
     CNT_MAX                        = 35,
 };
@@ -187,7 +165,7 @@ struct pkt_event {
     __u16 src_port;    // network byte order
     __u16 dst_port;
     __u8  proto;       // IPPROTO_TCP / UDP / ICMP / ICMPV6 …
-    __u8  family;      // CT_FAMILY_IPV4=2 / CT_FAMILY_IPV6=10
+    __u8  family;      // IPv4=2 / IPv6=10
     __u8  verdict;     // always 1 (DROP) for this ring buffer
     __u8  reason;      // xdp_counter_idx value
 };

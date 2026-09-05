@@ -7,38 +7,6 @@
  * All other SEC(".maps") map definitions are below. */
 
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, CT_MAP_MAX_ENTRIES_V4);
-    __type(key, struct ct_key_v4);
-    __type(value, __u64); // ktime_ns at insert for future timeout handling
-} tcp_ct4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, CT_MAP_MAX_ENTRIES_V6);
-    __type(key, struct ct_key_v6);
-    __type(value, __u64); // ktime_ns at insert for future timeout handling
-} tcp_ct6 SEC(".maps");
-
-// Pending TCP validations owned by per-port handlers.
-// Key: inbound 5-tuple. Value: handler destination port (host byte order).
-// Used when ACK/data misses tcp_conntrack but should still be re-dispatched
-// into a multi-packet handler state machine before the final CT_MISS drop.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
-    __type(key, struct ct_key_v4);
-    __type(value, __u32);
-} tcp_pd4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
-    __type(key, struct ct_key_v6);
-    __type(value, __u32);
-} tcp_pd6 SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 256);
     __type(key, struct trusted_v4_key);
@@ -55,20 +23,6 @@ struct {
 } trusted_ipv6 SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, CT_MAP_MAX_ENTRIES_V4);
-    __type(key, struct ct_key_v4);
-    __type(value, __u64); // ktime_ns of the most recent outbound UDP packet
-} udp_ct4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, CT_MAP_MAX_ENTRIES_V6);
-    __type(key, struct ct_key_v6);
-    __type(value, __u64); // ktime_ns of the most recent outbound UDP packet
-} udp_ct6 SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 65536);
     __type(key, __u32);   // port number (host byte order) as array index
@@ -82,22 +36,30 @@ struct {
     __type(value, __u32); // 1 = allow
 } udp_whitelist SEC(".maps");
 
-// Shared SCTP whitelist / conntrack maps.
-// The main program pins them so the optional slot handler and tc egress tracker
-// can reuse the same fds instead of creating private copies.
+// Zone-only exposure for ports that must not be globally public. A hit here
+// authorizes the port on the ingress interface; the global whitelist remains
+// the fast path for public grants.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct zone_port_key);
+    __type(value, __u32);
+} tcp_zone_whitelist SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct zone_port_key);
+    __type(value, __u32);
+} udp_zone_whitelist SEC(".maps");
+
+// Shared SCTP whitelist map for the optional stateless slot handler.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 65536);
     __type(key, __u32);
     __type(value, __u32);
 } sctp_whitelist SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct flow_key);
-    __type(value, __u64);
-} sctp_conntrack SEC(".maps");
 
 // Global ICMP token-bucket state (single entry, protected by spin lock)
 struct {
@@ -127,7 +89,7 @@ struct {
 } udp_percpu_acc SEC(".maps");
 
 // Per-port TCP policy config, populated at runtime by xdp_port_sync.
-// Key: dest port (host byte order). Value: SYN/per-prefix/conn-limit controls.
+// Key: dest port (host byte order). Value: stateless SYN protection controls.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
@@ -217,43 +179,6 @@ struct {
     __type(key, struct prefix_rate_key_v6);
     __type(value, struct prefix_rate_val);
 } udpag6 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
-    __type(key, struct tcp_src_conn_key_v4);
-    __type(value, struct tcp_src_conn_val);
-} tsc4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
-    __type(key, struct tcp_src_conn_key_v6);
-    __type(value, struct tcp_src_conn_val);
-} tsc6 SEC(".maps");
-
-/* Per-prefix × port concurrent ESTABLISHED count (Bug 2 fix L4). */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
-    __type(key, struct prefix_rate_key_v4);
-    __type(value, struct tcp_pfx_conn_val);
-} tsc_pfx4 SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
-    __type(key, struct prefix_rate_key_v6);
-    __type(value, struct tcp_pfx_conn_val);
-} tsc_pfx6 SEC(".maps");
-
-/* Per-port total concurrent ESTABLISHED count (Bug 2 fix L5). */
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 65536);
-    __type(key, __u32);
-    __type(value, struct tcp_port_conn_val);
-} tsc_port SEC(".maps");
 
 // Per-CIDR port ACL: source CIDR → list of allowed destination ports.
 // ACL entries bypass rate limiting and take priority over the port whitelist.
@@ -353,14 +278,14 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, RATE_MAP_MAX_ENTRIES_V4);
-    __type(key, struct ct_key_v4);
+    __type(key, struct udp_validation_key_v4);
     __type(value, __u64);  // validated_until_ns
 } udp_hv4 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, RATE_MAP_MAX_ENTRIES_V6);
-    __type(key, struct ct_key_v6);
+    __type(key, struct udp_validation_key_v6);
     __type(value, __u64);  // validated_until_ns
 } udp_hv6 SEC(".maps");
 
@@ -376,38 +301,3 @@ struct {
     __type(value, __u32);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } abuseipdb_v4 SEC(".maps");
-
-static __always_inline __u64 *tcp_conntrack_lookup(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
-{
-    if (ipv4)
-        return bpf_map_lookup_elem(&tcp_ct4, key_v4);
-    return bpf_map_lookup_elem(&tcp_ct6, key_v6);
-}
-
-static __always_inline void tcp_conntrack_delete(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
-{
-    if (ipv4)
-        bpf_map_delete_elem(&tcp_ct4, key_v4);
-    else
-        bpf_map_delete_elem(&tcp_ct6, key_v6);
-}
-
-static __always_inline void tcp_conntrack_update(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6,
-    __u64 val, __u64 flags)
-{
-    if (ipv4)
-        bpf_map_update_elem(&tcp_ct4, key_v4, &val, flags);
-    else
-        bpf_map_update_elem(&tcp_ct6, key_v6, &val, flags);
-}
-
-static __always_inline __u32 *tcp_pending_lookup(
-    bool ipv4, const struct ct_key_v4 *key_v4, const struct ct_key_v6 *key_v6)
-{
-    if (ipv4)
-        return bpf_map_lookup_elem(&tcp_pd4, key_v4);
-    return bpf_map_lookup_elem(&tcp_pd6, key_v6);
-}

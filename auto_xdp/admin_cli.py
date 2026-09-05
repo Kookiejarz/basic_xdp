@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime as _dt
 import errno
 from importlib import resources
 import json
@@ -9,6 +10,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import struct
 import shutil
 import subprocess
@@ -18,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from auto_xdp import config as cfg
+from auto_xdp import approvals
+from auto_xdp import discovery, policy
 from auto_xdp.admin.detect import detect_backend as _detect_backend
 from auto_xdp.bpf.syscall import (
     BPF_MAP_DELETE_ELEM,
@@ -62,7 +66,7 @@ def _discover_builtin_slot_info() -> dict[str, tuple[int, str]]:
         }
     for source in sorted(handlers_dir.glob("*_handler.c")):
         text = source.read_text(encoding="utf-8", errors="ignore")
-        if "SEC(\"xdp/" not in text or "tcp_ct4" in text or "udp_ct4" in text:
+        if "SEC(\"xdp/" not in text:
             continue
         name = _slot_handler_name(source)
         proto = _IPPROTO_BY_NAME.get(name)
@@ -81,16 +85,7 @@ _BUILTIN_SLOT_ARTIFACTS = {
 }
 _CUSTOM_SLOT_ARTIFACT_RE = re.compile(r"^custom_\d+_.+\.(?:c|o)$")
 _CUSTOM_PORT_ARTIFACT_RE = re.compile(r"^custom_(?:tcp|udp)_\d+_.+\.(?:c|o)$")
-_PORT_HANDLER_MARKERS = (
-    "tcp_ct4",
-    "tcp_ct6",
-    "tcp_pd4",
-    "tcp_pd6",
-    "udp_hv4",
-    "udp_hv6",
-    "hblk4",
-    "hblk6",
-)
+_PORT_HANDLER_MARKERS = ("udp_hv4", "udp_hv6", "hblk4", "hblk6")
 
 
 def _default_config_template() -> str:
@@ -742,7 +737,9 @@ def _transactional_dir_prog_swap(
             print(f"Warning: old handler generation retained at {backup_dir}: {exc}", file=sys.stderr)
 
 
-class _BpfPendingConntrackMap:
+class _BpfUdpValidationMap:
+    """Small iterator used only to purge handler-specific UDP validation state."""
+
     def __init__(self, path: Path, key_len: int) -> None:
         self.path = path
         self.fd = obj_get(str(path))
@@ -766,7 +763,7 @@ class _BpfPendingConntrackMap:
             os.close(self.fd)
             self.fd = -1
 
-    def __enter__(self) -> _BpfPendingConntrackMap:
+    def __enter__(self) -> _BpfUdpValidationMap:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -790,51 +787,19 @@ class _BpfPendingConntrackMap:
             current_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._key))
         return result
 
-    def _lookup_value(self, key_raw: bytes) -> int:
-        self._key_buf[:] = key_raw
-        bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-        return struct.unpack_from("=I", self._value, 0)[0]
-
-    def delete_for_port(self, dest_port: int) -> int:
-        deleted = 0
-        for key_raw in self._iter_keys():
-            try:
-                if self._lookup_value(key_raw) != dest_port:
-                    continue
-                self._key_buf[:] = key_raw
-                bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
-                deleted += 1
-            except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    continue
-                raise
-        return deleted
-
     def delete_key_port(self, dest_port: int, dport_offset: int = 2) -> int:
         deleted = 0
         for key_raw in self._iter_keys():
+            if struct.unpack_from("!H", key_raw, dport_offset)[0] != dest_port:
+                continue
+            self._key_buf[:] = key_raw
             try:
-                if struct.unpack_from("!H", key_raw, dport_offset)[0] != dest_port:
-                    continue
-                self._key_buf[:] = key_raw
                 bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
                 deleted += 1
             except OSError as exc:
-                if exc.errno == errno.ENOENT:
-                    continue
-                raise
+                if exc.errno != errno.ENOENT:
+                    raise
         return deleted
-
-
-def _flush_tcp_pending_for_port(bpf_pin_dir: Path, port: int) -> int:
-    deleted = 0
-    for name, key_len in (("tcp_pd4", 12), ("tcp_pd6", 36)):
-        pending_path = bpf_pin_dir / name
-        if not pending_path.exists():
-            continue
-        with _BpfPendingConntrackMap(pending_path, key_len) as pending_map:
-            deleted += pending_map.delete_for_port(port)
-    return deleted
 
 
 def _flush_udp_validated_for_port(bpf_pin_dir: Path, port: int) -> int:
@@ -843,7 +808,7 @@ def _flush_udp_validated_for_port(bpf_pin_dir: Path, port: int) -> int:
         map_path = bpf_pin_dir / name
         if not map_path.exists():
             continue
-        with _BpfPendingConntrackMap(map_path, key_len) as validated:
+        with _BpfUdpValidationMap(map_path, key_len) as validated:
             deleted += validated.delete_key_port(port)
     return deleted
 
@@ -866,9 +831,7 @@ def _cleanup_existing_port_handler(bpf_pin_dir: Path, proto: str, port: int) -> 
         capture_output=True,
         text=True,
     )
-    if proto == "tcp":
-        _flush_tcp_pending_for_port(bpf_pin_dir, port)
-    else:
+    if proto == "udp":
         _flush_udp_validated_for_port(bpf_pin_dir, port)
     pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
     shutil.rmtree(pin_dir, ignore_errors=True)
@@ -1043,45 +1006,6 @@ def _cmd_acl_del(args: argparse.Namespace) -> int:
     ]
     _write_toml(path, data)
     print(f"Removed ACL: {args.proto} {cidr}")
-    return 0
-
-
-def _cmd_permanent_list(args: argparse.Namespace) -> int:
-    _, data = _load_config(args.config)
-    perm = data.get("permanent_ports", {})
-    tcp = _normalize_ports([int(port) for port in perm.get("tcp", [])])
-    udp = _normalize_ports([int(port) for port in perm.get("udp", [])])
-    sctp = _normalize_ports([int(port) for port in perm.get("sctp", [])])
-    if not tcp and not udp and not sctp:
-        print("  (none)")
-        return 0
-    for port in tcp:
-        print(f"  TCP  {port}")
-    for port in udp:
-        print(f"  UDP  {port}")
-    for port in sctp:
-        print(f"  SCTP {port}")
-    return 0
-
-
-def _cmd_permanent_add(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
-    port = _normalize_ports([args.port])[0]
-    perm = data.setdefault("permanent_ports", {"tcp": [], "udp": [], "sctp": []})
-    values = _normalize_ports([int(item) for item in perm.setdefault(args.proto, [])] + [port])
-    perm[args.proto] = values
-    _write_toml(path, data)
-    print(f"Added permanent: {args.proto}/{port}")
-    return 0
-
-
-def _cmd_permanent_del(args: argparse.Namespace) -> int:
-    path, data = _load_config(args.config)
-    port = _normalize_ports([args.port])[0]
-    perm = data.setdefault("permanent_ports", {"tcp": [], "udp": [], "sctp": []})
-    perm[args.proto] = [item for item in _normalize_ports([int(v) for v in perm.get(args.proto, [])]) if item != port]
-    _write_toml(path, data)
-    print(f"Removed permanent: {args.proto}/{port}")
     return 0
 
 
@@ -1260,12 +1184,8 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
 
     if proto == 132 and builtin_name == "sctp":
         sctp_whitelist = bpf_pin_dir / "sctp_whitelist"
-        sctp_conntrack = bpf_pin_dir / "sctp_conntrack"
         if not sctp_whitelist.exists():
             print("XDP not loaded completely (sctp_whitelist map not found).", file=sys.stderr)
-            return 1
-        if not sctp_conntrack.exists():
-            print("XDP not loaded completely (sctp_conntrack map not found).", file=sys.stderr)
             return 1
         load_cmd.extend(
             [
@@ -1274,11 +1194,6 @@ def _cmd_slot_load(args: argparse.Namespace) -> int:
                 "sctp_whitelist",
                 "pinned",
                 str(sctp_whitelist),
-                "map",
-                "name",
-                "sctp_conntrack",
-                "pinned",
-                str(sctp_conntrack),
             ]
         )
 
@@ -1443,16 +1358,7 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         ("hblk4", bpf_pin_dir / "hblk4"),
         ("hblk6", bpf_pin_dir / "hblk6"),
     ]
-    if proto == "tcp":
-        shared_maps.extend(
-            [
-                ("tcp_ct4", bpf_pin_dir / "tcp_ct4"),
-                ("tcp_ct6", bpf_pin_dir / "tcp_ct6"),
-                ("tcp_pd4", bpf_pin_dir / "tcp_pd4"),
-                ("tcp_pd6", bpf_pin_dir / "tcp_pd6"),
-            ]
-        )
-    else:
+    if proto == "udp":
         shared_maps.extend(
             [
                 ("udp_hv4", bpf_pin_dir / "udp_hv4"),
@@ -1500,9 +1406,7 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     # Handler-specific validation caches must not survive a successful handler
     # replacement. Flush only after the new program is committed so a failed
     # candidate never mutates the active handler's state.
-    if proto == "tcp":
-        _flush_tcp_pending_for_port(bpf_pin_dir, port)
-    else:
+    if proto == "udp":
         _flush_udp_validated_for_port(bpf_pin_dir, port)
 
     if not args.no_config_update:
@@ -1512,64 +1416,6 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     if not args.no_config_update:
         print(f"  config: {path}")
     return 0
-
-
-def _summarize_conntrack_maps(paths: list[str], limit: int) -> tuple[int, list[tuple[int, int, int, int]]]:
-    """Returns (total_entries, [(dport, total, v4, v6), ...]) sorted by total desc."""
-    rows: list[Any] = []
-    for path in paths:
-        try:
-            out = subprocess.check_output(
-                ["bpftool", "-j", "map", "dump", "pinned", path],
-                stderr=subprocess.DEVNULL,
-            )
-            data = json.loads(out)
-        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
-            data = []
-        if isinstance(data, list):
-            rows.extend(data)
-
-    stats: dict[int, dict[str, int]] = {}
-
-    def _to_int(v: Any) -> int:
-        if isinstance(v, str):
-            return int(v, 0)
-        return int(v)
-
-    for row in rows:
-        key = row.get("key", [])
-        if not isinstance(key, list):
-            continue
-        try:
-            if len(key) == 12:
-                family = 2   # ct_key_v4: sport[0:2], dport[2:4], saddr[4:8], daddr[8:12]
-                dport = (_to_int(key[2]) << 8) | _to_int(key[3])
-            elif len(key) == 36:
-                family = 10  # ct_key_v6: sport[0:2], dport[2:4], saddr[4:20], daddr[20:36]
-                dport = (_to_int(key[2]) << 8) | _to_int(key[3])
-            else:
-                continue
-        except (ValueError, IndexError, TypeError):
-            continue
-        entry = stats.setdefault(dport, {"total": 0, "v4": 0, "v6": 0})
-        entry["total"] += 1
-        if family == 2:
-            entry["v4"] += 1
-        elif family == 10:
-            entry["v6"] += 1
-
-    sorted_ports = sorted(stats.items(), key=lambda item: (-item[1]["total"], item[0]))[:limit]
-    result = [(dport, entry["total"], entry["v4"], entry["v6"]) for dport, entry in sorted_ports]
-    return len(rows), result
-
-
-def _render_conntrack_section(label: str, total: int, port_rows: list[tuple[int, int, int, int]]) -> None:
-    print(f"{label} conntrack:")
-    for dport, count, v4, v6 in port_rows:
-        print(f"  dport {dport:<5} total={count:<4} ipv4={v4:<4} ipv6={v6}")
-    if total == 0:
-        print("  (none)")
-    print(f"  total={total}")
 
 
 def _autodetect_iface() -> str:
@@ -1950,36 +1796,148 @@ def _cmd_ports(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_conntrack(args: argparse.Namespace) -> int:
-    """Handler for the conntrack subcommand."""
-    bpf_pin_dir = args.bpf_pin_dir
-    target = args.target
-    limit = args.limit
+def _policy_snapshot(args: argparse.Namespace):
+    cfg.apply_toml_config(_load_toml(Path(args.config)))
+    observed = discovery.get_listening_ports()
+    return observed, policy.resolve_desired_state(observed)
 
-    has_bpftool = shutil.which("bpftool") is not None
 
-    def _summarize(paths: list[str]) -> tuple[int, list[tuple[int, int, int, int]]]:
-        if not has_bpftool:
-            return 0, []
-        return _summarize_conntrack_maps(paths, limit)
+def _active_backend_name(args: argparse.Namespace) -> str:
+    ifaces = (args.iface or "").split()
+    if not ifaces:
+        try:
+            ifaces = [_autodetect_iface()]
+        except RuntimeError:
+            ifaces = []
+    try:
+        return _detect_backend(
+            Path(args.bpf_pin_dir), Path(args.run_state_dir), ifaces,
+            args.nft_family, args.nft_table,
+        )
+    except RuntimeError:
+        return "unavailable"
 
-    if target in ("tcp", "all"):
-        total, port_rows = _summarize([
-            f"{bpf_pin_dir}/tcp_ct4",
-            f"{bpf_pin_dir}/tcp_ct6",
-        ])
-        _render_conntrack_section("TCP", total, port_rows)
 
-    if target == "all":
+def _owner_text(endpoint: Any) -> str:
+    if endpoint.container_runtime:
+        return f"{endpoint.container_runtime}:{endpoint.container_name or endpoint.container_id[:12]}"
+    owner = endpoint.subject or "unknown"
+    if endpoint.attribution_source.startswith("systemd") and not owner.endswith(".service"):
+        owner += ".service"
+    return owner
+
+
+def _service_label(protocol: str, port: int) -> str:
+    try:
+        return socket.getservbyport(port, protocol)
+    except OSError:
+        return f"{protocol}{port}"
+
+
+def _grant_label(decision: Any) -> str:
+    return f"{decision.subject}.{decision.endpoint.ingress_zone}_{_service_label(decision.endpoint.protocol, decision.endpoint.host_port)}"
+
+
+def _endpoint_text(endpoint: Any) -> str:
+    address = f"[{endpoint.host_address}]" if ":" in endpoint.host_address else endpoint.host_address
+    return f"{address}:{endpoint.host_port}"
+
+
+def _cmd_exposure(args: argparse.Namespace) -> int:
+    try:
+        _observed, desired = _policy_snapshot(args)
+    except (OSError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    backend = _active_backend_name(args)
+    decisions = sorted(
+        desired.exposure_decisions,
+        key=lambda item: (
+            item.endpoint.ingress_zone, item.endpoint.host_port,
+            item.endpoint.protocol, item.endpoint.host_address,
+        ),
+    )
+    if not decisions:
+        print("No externally reachable runtime endpoints.")
+        return 0
+    current_zone = None
+    for decision in decisions:
+        zone = decision.endpoint.ingress_zone.upper()
+        if zone != current_zone:
+            if current_zone is not None:
+                print("")
+            print(zone)
+            print("")
+            current_zone = zone
+        endpoint = decision.endpoint
+        print(f"{endpoint.host_port}/{endpoint.protocol}")
+        print(f"  subject: {decision.subject or 'unknown'}")
+        if decision.action == "allow":
+            print(f"  owner: {_owner_text(endpoint)}")
+            print(f"  grant: {_grant_label(decision)}")
+            print(f"  backend: {backend}")
+            print("  status: allowed")
+        else:
+            print("  status: blocked")
+            print(f"  reason: {decision.reason}")
         print("")
+    return 0
 
-    if target in ("udp", "all"):
-        total, port_rows = _summarize([
-            f"{bpf_pin_dir}/udp_ct4",
-            f"{bpf_pin_dir}/udp_ct6",
-        ])
-        _render_conntrack_section("UDP", total, port_rows)
 
+def _render_explanation(decision: Any, backend: str) -> None:
+    endpoint = decision.endpoint
+    print("ALLOW" if decision.action == "allow" else "BLOCK")
+    print("")
+    print("runtime endpoint:")
+    print(f"  {_endpoint_text(endpoint)}")
+    print("")
+    print("owner:")
+    print(f"  {_owner_text(endpoint)}")
+    print("")
+    print("subject:")
+    print(f"  {decision.subject or 'unknown'}")
+    print("")
+    if decision.action == "allow":
+        print("matched grant:")
+        print(f"  {endpoint.ingress_zone}/{endpoint.protocol}/{endpoint.host_port}")
+    else:
+        print("reason:")
+        print(f"  {decision.reason}")
+    print("")
+    print("backend:")
+    print(f"  {backend.upper()}")
+
+
+def _cmd_explain(args: argparse.Namespace) -> int:
+    try:
+        protocol, raw_port = args.endpoint.lower().split("/", 1)
+        port = int(raw_port)
+    except (AttributeError, ValueError):
+        print("endpoint must be PROTOCOL/PORT, for example tcp/443", file=sys.stderr)
+        return 1
+    if protocol not in {"tcp", "udp", "sctp"} or not 1 <= port <= 65535:
+        print("endpoint must use tcp, udp, or sctp and a port from 1 to 65535", file=sys.stderr)
+        return 1
+    try:
+        _observed, desired = _policy_snapshot(args)
+    except (OSError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    backend = _active_backend_name(args)
+    matches = [
+        item for item in desired.exposure_decisions
+        if item.endpoint.protocol == protocol and item.endpoint.host_port == port
+    ]
+    if not matches:
+        print("BLOCK")
+        print("\nruntime endpoint:\n  not listening")
+        print("\nreason:\n  no live runtime endpoint")
+        print(f"\nbackend:\n  {backend.upper()}")
+        return 0
+    for index, decision in enumerate(matches):
+        if index:
+            print("\n---\n")
+        _render_explanation(decision, backend)
     return 0
 
 
@@ -2052,6 +2010,108 @@ def _cmd_exclude_src_del(args: argparse.Namespace) -> int:
     return 0
 
 
+def _approval_store(args: argparse.Namespace) -> Path:
+    return approvals.store_path(args.run_state_dir)
+
+
+def _render_approval(request: dict[str, Any]) -> None:
+    ports = " ".join(str(port) for port in request.get("ports", []))
+    print(
+        f"  #{request['id']} {request['status']:<8} "
+        f"{request['subject']} {request['zone']} {str(request['protocol']).upper()} "
+        f"ports: {ports}  reason: {request.get('reason', '-') }"
+    )
+
+
+def _cmd_approval_list(args: argparse.Namespace) -> int:
+    requests = approvals.list_requests(_approval_store(args), args.status)
+    if args.json:
+        print(json.dumps(requests, indent=2, sort_keys=True))
+    elif not requests:
+        print("  (none)")
+    else:
+        for request in requests:
+            _render_approval(request)
+    return 0
+
+
+def _cmd_approval_history(args: argparse.Namespace) -> int:
+    revision, history = approvals.list_history(_approval_store(args))
+    if args.json:
+        print(json.dumps({"revision": revision, "history": history}, indent=2, sort_keys=True))
+    elif not history:
+        print(f"revision {revision}: (none)")
+    else:
+        for item in history:
+            when = _dt.datetime.fromtimestamp(float(item["at"])).isoformat(timespec="seconds")
+            print(f"  r{item['revision']} #{item['request_id']} {item['action']:<7} {item['status']:<8} {item['actor']} {when}")
+    return 0
+
+
+def _cmd_approval_request(args: argparse.Namespace) -> int:
+    request = approvals.create_request(
+        _approval_store(args),
+        args.config,
+        subject=args.subject,
+        zone=args.zone,
+        protocol=args.protocol,
+        ports=args.ports,
+        reason=args.reason,
+        systemd_unit=args.systemd_unit,
+        process_name=args.process_name,
+        container_runtime=args.container_runtime,
+        container_id=args.container_id,
+        container_name=args.container_name,
+        container_label=args.container_label,
+        protection_profile=args.profile,
+        actor=args.actor,
+    )
+    print(f"Created approval request #{request['id']}")
+    return 0
+
+
+def _cmd_approval_approve(args: argparse.Namespace) -> int:
+    request = approvals.approve_request(_approval_store(args), args.config, args.request_id, actor=args.actor)
+    approvals.reload_daemon()
+    print(f"Approved request #{request['id']} and updated exposure grant")
+    return 0
+
+
+def _cmd_approval_reject(args: argparse.Namespace) -> int:
+    request = approvals.reject_request(_approval_store(args), args.request_id, reason=args.reason, actor=args.actor)
+    print(f"Rejected request #{request['id']}")
+    return 0
+
+
+def _cmd_approval_revoke(args: argparse.Namespace) -> int:
+    request = approvals.revoke_request(_approval_store(args), args.config, args.request_id, actor=args.actor)
+    approvals.reload_daemon()
+    print(f"Revoked request #{request['id']} exposure contribution")
+    return 0
+
+
+def _cmd_policy_grants(args: argparse.Namespace) -> int:
+    grants = approvals.list_grants(args.config)
+    if args.json:
+        print(json.dumps(grants, indent=2, sort_keys=True))
+    elif not grants:
+        print("  (none)")
+    else:
+        for grant in grants:
+            ports = " ".join(str(port) for port in grant["ports"])
+            resolver = (
+                grant["resolve"].get("systemd_unit")
+                or grant["resolve"].get("process_name")
+                or grant["resolve"].get("container_name")
+                or grant["resolve"].get("container_id")
+                or grant["resolve"].get("container_label")
+                or "-"
+            )
+            profile = grant.get("protection_profile") or "-"
+            print(f"  {grant['subject']:<20} {grant['zone']:<10} {grant['protocol'].upper():<5} ports: {ports} resolver: {resolver} profile: {profile}")
+    return 0
+
+
 def _cmd_port_handler_unload(args: argparse.Namespace) -> int:
     path = Path(args.config)
     bpf_pin_dir, _, _ = _slot_paths(args)
@@ -2070,7 +2130,7 @@ _NFT_CHAIN = "input"
 
 _XDP_COUNTER_NAMES = [
     "TCP_NEW_ALLOW",
-    "TCP_ESTABLISHED",
+    "TCP_PASS",
     "TCP_DROP",
     "UDP_PASS",
     "UDP_DROP",
@@ -2078,7 +2138,7 @@ _XDP_COUNTER_NAMES = [
     "IPv6_ICMP",
     "FRAG_DROP",
     "ARP_NON_IP",
-    "TCP_CT_MISS",
+    "TCP_RESERVED",
     "ICMP_DROP",
     "SYN_RATE_DROP",
     "UDP_RATE_DROP",
@@ -2097,12 +2157,12 @@ _XDP_COUNTER_NAMES = [
     "UDP_PORT0",
     "UDP_BAD_LEN",
     "BOGON_DROP",
-    "TCP_CONN_LIMIT_DROP",
+    "RESERVED_28",
     "SYN_AGG_RATE_DROP",
     "UDP_AGG_RATE_DROP",
     "HANDLER_BLOCK_DROP",
-    "TCP_CONN_PREFIX_LIMIT_DROP",
-    "TCP_CONN_PORT_LIMIT_DROP",
+    "RESERVED_32",
+    "RESERVED_33",
     "ABUSEIPDB_DROP",
 ]
 
@@ -2781,20 +2841,6 @@ def build_parser() -> argparse.ArgumentParser:
     acl_del.add_argument("cidr")
     acl_del.set_defaults(func=_cmd_acl_del)
 
-    permanent = subparsers.add_parser("permanent")
-    perm_sub = permanent.add_subparsers(dest="subcommand", required=True)
-    perm_list = perm_sub.add_parser("list")
-    perm_list.set_defaults(func=_cmd_permanent_list)
-    perm_add = perm_sub.add_parser("add")
-    perm_add.add_argument("proto", choices=["tcp", "udp", "sctp"])
-    perm_add.add_argument("port", type=int)
-    perm_add.add_argument("label", nargs="?")
-    perm_add.set_defaults(func=_cmd_permanent_add)
-    perm_del = perm_sub.add_parser("del")
-    perm_del.add_argument("proto", choices=["tcp", "udp", "sctp"])
-    perm_del.add_argument("port", type=int)
-    perm_del.set_defaults(func=_cmd_permanent_del)
-
     slot = subparsers.add_parser("slot")
     slot_sub = slot.add_subparsers(dest="subcommand", required=True)
     slot_list = slot_sub.add_parser("list")
@@ -2857,15 +2903,61 @@ def build_parser() -> argparse.ArgumentParser:
     exclude_src_del.add_argument("cidrs", nargs="+")
     exclude_src_del.set_defaults(func=_cmd_exclude_src_del)
 
-    conntrack_cmd = subparsers.add_parser("conntrack")
-    conntrack_cmd.add_argument("target", nargs="?", choices=["tcp", "udp", "all"], default="all")
-    conntrack_cmd.add_argument("--limit", type=int, default=10)
-    conntrack_cmd.set_defaults(func=_cmd_conntrack)
+    approval = subparsers.add_parser("approval")
+    approval_sub = approval.add_subparsers(dest="subcommand", required=True)
+    approval_list = approval_sub.add_parser("list")
+    approval_list.add_argument("--status", choices=["all", "pending", "approved", "rejected", "revoked"], default="all")
+    approval_list.add_argument("--json", action="store_true")
+    approval_list.set_defaults(func=_cmd_approval_list)
+    approval_history = approval_sub.add_parser("history")
+    approval_history.add_argument("--json", action="store_true")
+    approval_history.set_defaults(func=_cmd_approval_history)
+    approval_request = approval_sub.add_parser("request")
+    approval_request.add_argument("subject")
+    approval_request.add_argument("zone")
+    approval_request.add_argument("protocol", choices=["tcp", "udp", "sctp"])
+    approval_request.add_argument("ports", nargs="+", type=int)
+    approval_request.add_argument("--reason", required=True)
+    approval_request.add_argument("--systemd-unit", default="")
+    approval_request.add_argument("--process-name", default="")
+    approval_request.add_argument("--container-runtime", choices=["docker", "podman"], default="")
+    approval_request.add_argument("--container-id", default="")
+    approval_request.add_argument("--container-name", default="")
+    approval_request.add_argument("--container-label", default="")
+    approval_request.add_argument("--profile", default="")
+    approval_request.add_argument("--actor")
+    approval_request.set_defaults(func=_cmd_approval_request)
+    approval_approve = approval_sub.add_parser("approve")
+    approval_approve.add_argument("request_id", type=int)
+    approval_approve.add_argument("--actor")
+    approval_approve.set_defaults(func=_cmd_approval_approve)
+    approval_reject = approval_sub.add_parser("reject")
+    approval_reject.add_argument("request_id", type=int)
+    approval_reject.add_argument("--reason", required=True)
+    approval_reject.add_argument("--actor")
+    approval_reject.set_defaults(func=_cmd_approval_reject)
+    approval_revoke = approval_sub.add_parser("revoke")
+    approval_revoke.add_argument("request_id", type=int)
+    approval_revoke.add_argument("--actor")
+    approval_revoke.set_defaults(func=_cmd_approval_revoke)
+
+    policy = subparsers.add_parser("policy")
+    policy_sub = policy.add_subparsers(dest="subcommand", required=True)
+    grants = policy_sub.add_parser("grants")
+    grants.add_argument("--json", action="store_true")
+    grants.set_defaults(func=_cmd_policy_grants)
 
     ports_cmd = subparsers.add_parser("ports")
     ports_cmd.add_argument("--watch", action="store_true")
     ports_cmd.add_argument("--interval", type=float, default=2.0)
     ports_cmd.set_defaults(func=_cmd_ports)
+
+    exposure_cmd = subparsers.add_parser("exposure")
+    exposure_cmd.set_defaults(func=_cmd_exposure)
+
+    explain_cmd = subparsers.add_parser("explain")
+    explain_cmd.add_argument("endpoint", help="runtime endpoint, for example tcp/443")
+    explain_cmd.set_defaults(func=_cmd_explain)
 
     stats_cmd = subparsers.add_parser("stats")
     stats_cmd.add_argument("--watch", action="store_true")
@@ -2882,12 +2974,23 @@ def build_parser() -> argparse.ArgumentParser:
     tui_cmd.add_argument("--interface", dest="iface")
     tui_cmd.set_defaults(func=_cmd_tui)
 
+    approval_api = subparsers.add_parser("approval-api")
+    approval_api.add_argument("--socket-path")
+    approval_api.set_defaults(func=lambda args: approvals.run_api(
+        args.config,
+        args.run_state_dir,
+        args.socket_path or str(Path(args.run_state_dir) / "approval.sock"),
+    ))
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command in {"approval", "approval-api"} and os.geteuid() != 0:
+        print("approval management requires root; try re-running with sudo", file=sys.stderr)
+        return 77
     try:
         return int(args.func(args))
     except ValueError as exc:

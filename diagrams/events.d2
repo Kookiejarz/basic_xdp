@@ -1,0 +1,51 @@
+# Event, relay, and observability flow
+direction: right
+
+kernel: {
+  label: "Kernel event producers"
+  packet: "xdp_firewall.c\npacket verdict + counters"
+  socket: "sock_state_track.c\ninet_sock_set_state"
+  tc: "tc_flow_track.c\nshared CT updates"
+  packet_rb: "pkt_ringbuf"
+  socket_rb: "sock_state_rb"
+  packet -> packet_rb
+  socket -> socket_rb
+  tc -> socket_rb: "not an event source;\nupdates shared state"
+}
+
+relay: {
+  label: "auto_xdp_relay"
+  consume: "mmap/poll ring buffers"
+  normalize: "Normalize event records"
+  history: "Bounded recent history"
+  auth: "Unix peer credentials\nSO_PEERCRED"
+  socket: "Local Unix socket\nNDJSON broadcast"
+  consume -> normalize -> history -> auth -> socket
+}
+
+control: {
+  label: "Control-plane consumers"
+  port_change: "port_change trigger"
+  sync: "xdp-port-sync\nfull discovery + reconcile"
+  reconnect: "5-second reconnect\n+ 30-second scan"
+  port_change -> sync
+  reconnect -> sync
+}
+
+clients: {
+  label: "Management consumers"
+  tui: "TUI"
+  admin: "axdp / admin CLI"
+  diagnostics: "Status, counters,\npolicy, backend checks"
+  tui -> diagnostics
+  admin -> diagnostics
+}
+
+kernel.packet_rb -> relay.consume
+kernel.socket_rb -> relay.consume
+relay.socket -> control.port_change: "socket-state changes"
+relay.socket -> clients.tui: "live events"
+clients.admin -> control.sync: "reload / reconcile"
+
+degraded: "Under attack: packet event emission\nmay be disabled; counters and enforcement continue"
+kernel.packet -> degraded

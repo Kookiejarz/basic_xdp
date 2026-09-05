@@ -377,19 +377,6 @@ ensure_bpffs() {
     fi
 }
 
-cleanup_tc_egress_filter() {
-    command -v tc &>/dev/null || return 0
-    local iface_var iface
-    iface_var=$(_auto_xdp_iface_var_name) || return 0
-    local -n ifaces_ref="$iface_var"
-    for iface in "${ifaces_ref[@]}"; do
-        tc filter del dev "$iface" egress pref "${TC_FILTER_PREF:-49152}" 2>/dev/null || true
-    done
-    rm -f "${BPF_PIN_DIR}/sock_state_link" \
-          "${BPF_PIN_DIR}/sock_state_prog" \
-          "${BPF_PIN_DIR}/sock_state_rb" 2>/dev/null || true
-}
-
 _map_value_size_ok() {
     local _path="$1" _want="$2" _got=""
     _got=$(bpftool map show pinned "$_path" 2>/dev/null \
@@ -496,18 +483,13 @@ xdp_required_map_names() {
 	pkt_counters
 	pkt_ringbuf
 	byte_counters
-	tcp_ct4
-	tcp_ct6
-	tcp_pd4
-	tcp_pd6
 	trusted_ipv4
 	trusted_ipv6
-	udp_ct4
-	udp_ct6
 	tcp_whitelist
 	udp_whitelist
+	tcp_zone_whitelist
+	udp_zone_whitelist
 	sctp_whitelist
-	sctp_conntrack
 	icmp_tb
 	udp_global_rl
 	udp_percpu_acc
@@ -521,11 +503,6 @@ xdp_required_map_names() {
 	synag6
 	udpag4
 	udpag6
-	tsc4
-	tsc6
-	tsc_pfx4
-	tsc_pfx6
-	tsc_port
 	tcp_acl_v4
 	tcp_acl_v6
 	udp_acl_v4
@@ -541,186 +518,6 @@ xdp_required_map_names() {
 	abuseipdb_v4
 	slot_ctx_map
 	EOF
-}
-
-seed_existing_tcp_conntrack() {
-    local map_path_v4="${BPF_PIN_DIR}/tcp_ct4"
-    local map_path_v6="${BPF_PIN_DIR}/tcp_ct6"
-    local seeded=""
-    local helper_script=""
-
-    [[ -e "$map_path_v4" || -e "$map_path_v6" ]] || return 0
-
-    helper_script=$(_auto_xdp_first_value BPF_HELPER_BOOTSTRAP BPF_HELPER_SCRIPT) || {
-        _auto_xdp_warn "BPF helper is not available for conntrack seeding."
-        return 1
-    }
-
-    if ! seeded=$("${PYTHON3_BIN:-python3}" "$helper_script" seed-tcp-conntrack --map-path-v4 "$map_path_v4" --map-path-v6 "$map_path_v6"); then
-        _auto_xdp_warn "Failed to pre-seed tcp_ct4/tcp_ct6; established sessions may reconnect."
-        return 1
-    fi
-
-    if [[ "$seeded" != "0" ]]; then
-        _auto_xdp_info "Seeded ${seeded} existing TCP session(s) into tcp_ct4/tcp_ct6."
-    fi
-}
-
-load_tc_egress_program() {
-    local tc_prog_path="${BPF_PIN_DIR}/tc_egress_prog"
-    local tc_obj_path=""
-    local iface_var iface attached=0 total=0
-    local rollback_prog="${TC_ROLLBACK_PROG_PATH:-}"
-    local allow_existing_candidate="${TC_ALLOW_EXISTING_CANDIDATE:-0}"
-    local filter_pref="${TC_FILTER_PREF:-49152}"
-    local filter_handle="${TC_FILTER_HANDLE:-1}"
-    local -a replaced_ifaces=() old_filter_flags=()
-
-    AUTO_XDP_TC_ROLLBACK_COMPLETE=1
-
-    if ! command -v tc &>/dev/null; then
-        _auto_xdp_warn "tc not found; TCP/UDP/SCTP reply tracking on egress will be skipped."
-        return 1
-    fi
-
-    tc_obj_path=$(_auto_xdp_first_value TC_OBJ_PATH TC_OBJ_INSTALLED) || tc_obj_path=""
-    if [[ ! -f "$tc_obj_path" ]]; then
-        _auto_xdp_warn "tc egress object not found; TCP/UDP/SCTP reply tracking on egress will be skipped."
-        return 1
-    fi
-
-    # Do not delete the active filters before the candidate is ready. The
-    # kernel keeps the previous program attached until `tc filter replace`
-    # succeeds, which gives each interface an atomic old-or-new transition.
-    rm -f "$tc_prog_path"
-    if ! bpftool prog load "$tc_obj_path" "$tc_prog_path" \
-        type classifier \
-        map name tcp_ct4 pinned "${BPF_PIN_DIR}/tcp_ct4" \
-         map name tcp_ct6 pinned "${BPF_PIN_DIR}/tcp_ct6" \
-         map name udp_ct4 pinned "${BPF_PIN_DIR}/udp_ct4" \
-         map name udp_ct6 pinned "${BPF_PIN_DIR}/udp_ct6" \
-         map name sctp_conntrack pinned "${BPF_PIN_DIR}/sctp_conntrack" \
-         map name xdp_runtime_cfg pinned "${BPF_PIN_DIR}/xdp_runtime_cfg" >/dev/null 2>&1; then
-        _auto_xdp_warn "Failed to load tc egress program; outbound TCP/UDP/SCTP reply tracking will be limited."
-        return 1
-    fi
-
-    iface_var=$(_auto_xdp_iface_var_name) || {
-        _auto_xdp_warn "No interfaces configured for tc egress attach."
-        return 1
-    }
-    local -n ifaces_ref="$iface_var"
-    if [[ ${#ifaces_ref[@]} -eq 0 ]]; then
-        _auto_xdp_warn "No interfaces configured for tc egress attach."
-        return 1
-    fi
-
-    total=${#ifaces_ref[@]}
-    for iface in "${ifaces_ref[@]}"; do
-        if tc filter show dev "$iface" egress pref "$filter_pref" \
-                handle "$filter_handle" \
-                2>/dev/null | grep -q .; then
-            if [[ -e "$rollback_prog" ]]; then
-                old_filter_flags+=(1)
-            elif [[ "$allow_existing_candidate" -eq 1 ]]; then
-                old_filter_flags+=(0)
-            else
-                _auto_xdp_warn "Existing tc filter on $iface has no pinned rollback program; refusing unsafe replacement."
-                rm -f "$tc_prog_path"
-                return 1
-            fi
-        else
-            old_filter_flags+=(0)
-        fi
-    done
-
-    for iface in "${ifaces_ref[@]}"; do
-        tc qdisc add dev "$iface" clsact 2>/dev/null || true
-        if tc filter replace dev "$iface" egress pref "$filter_pref" \
-            handle "$filter_handle" \
-            bpf direct-action object-pinned "$tc_prog_path" >/dev/null 2>&1; then
-            _auto_xdp_info "Attached tc egress TCP/UDP/SCTP tracker on $iface."
-            attached=$((attached + 1))
-            replaced_ifaces+=("$iface")
-        else
-            _auto_xdp_warn "Failed to attach tc egress filter on $iface; rolling back tc on switched interfaces."
-            local rollback_iface rollback_index=0
-            for rollback_iface in "${replaced_ifaces[@]}"; do
-                if [[ ${old_filter_flags[$rollback_index]} -eq 1 ]]; then
-                    if ! tc filter replace dev "$rollback_iface" egress \
-                        pref "$filter_pref" handle "$filter_handle" \
-                        bpf direct-action \
-                        object-pinned "$rollback_prog" >/dev/null 2>&1; then
-                        AUTO_XDP_TC_ROLLBACK_COMPLETE=0
-                        _auto_xdp_warn "Failed to restore previous tc filter on $rollback_iface."
-                    fi
-                else
-                    if ! tc filter del dev "$rollback_iface" egress \
-                        pref "$filter_pref" handle "$filter_handle" \
-                        2>/dev/null; then
-                        AUTO_XDP_TC_ROLLBACK_COMPLETE=0
-                        _auto_xdp_warn "Failed to remove candidate tc filter from $rollback_iface."
-                    fi
-                fi
-                rollback_index=$((rollback_index + 1))
-            done
-            if [[ $AUTO_XDP_TC_ROLLBACK_COMPLETE -eq 1 ]]; then
-                rm -f "$tc_prog_path"
-            else
-                _auto_xdp_warn "tc rollback was incomplete; retaining the candidate program pin."
-            fi
-            return 1
-        fi
-    done
-
-    [[ $attached -eq $total && $total -gt 0 ]]
-}
-
-_auto_xdp_restore_tc_egress() {
-    local tc_prog_path="${BPF_PIN_DIR}/tc_egress_prog"
-    local iface_var iface restored
-    local -a restored_ifaces=()
-
-    command -v tc &>/dev/null || {
-        _auto_xdp_warn "tc not found; cannot restore the egress tracker."
-        return 1
-    }
-
-    iface_var=$(_auto_xdp_iface_var_name) || return 1
-    local -n ifaces_ref="$iface_var"
-    [[ ${#ifaces_ref[@]} -gt 0 ]] || return 1
-
-    # Reuse the pinned program when only filters were lost after an interface
-    # reset. This avoids replacing healthy filters on other interfaces.
-    if [[ ! -e "$tc_prog_path" ]]; then
-        load_tc_egress_program
-        return $?
-    fi
-
-    for iface in "${ifaces_ref[@]}"; do
-        if tc filter show dev "$iface" egress pref "${TC_FILTER_PREF:-49152}" \
-                handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null | grep -q .; then
-            continue
-        fi
-        tc qdisc add dev "$iface" clsact 2>/dev/null || true
-        if tc filter replace dev "$iface" egress \
-                pref "${TC_FILTER_PREF:-49152}" \
-                handle "${TC_FILTER_HANDLE:-1}" \
-                bpf direct-action object-pinned "$tc_prog_path" >/dev/null 2>&1; then
-            _auto_xdp_info "Restored tc egress TCP/UDP/SCTP tracker on $iface."
-            restored_ifaces+=("$iface")
-            continue
-        fi
-
-        _auto_xdp_warn "Failed to restore tc egress filter on $iface; rolling back restored filters."
-        for restored in "${restored_ifaces[@]}"; do
-            tc filter del dev "$restored" egress \
-                pref "${TC_FILTER_PREF:-49152}" \
-                handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null || true
-        done
-        return 1
-    done
-    return 0
 }
 
 _auto_xdp_iface_xdp_mode() {
@@ -849,7 +646,7 @@ PY
 }
 
 _auto_xdp_record_xdp_state() {
-    local prog="$1" program_id="" iface_var="" iface mode tc_state generation
+    local prog="$1" program_id="" iface_var="" iface mode generation
     local machine_state="${MACHINE_STATE:-/etc/auto_xdp/machine-state.json}"
     local runtime_state="${RUNTIME_STATE:-/etc/auto_xdp/runtime-state.json}"
     local requested="${REQUESTED_BACKEND:-${PREFERRED_BACKEND:-auto}}"
@@ -861,14 +658,8 @@ _auto_xdp_record_xdp_state() {
     local -a args=()
     for iface in "${state_ifaces[@]}"; do
         mode=$(_auto_xdp_iface_xdp_mode "$iface")
-        tc_state="off"
-        if tc filter show dev "$iface" egress pref "${TC_FILTER_PREF:-49152}" \
-                handle "${TC_FILTER_HANDLE:-1}" 2>/dev/null | grep -q .; then
-            tc_state="attached"
-        fi
         [[ "$mode" == "native" || "$mode" == "generic" ]] || return 1
-        [[ "$tc_state" == "attached" ]] || return 1
-        args+=(--interface-state "${iface}=${mode}:${program_id}:${tc_state}")
+        args+=(--interface-state "${iface}=${mode}:${program_id}")
     done
     PYTHONPATH="$python_root${PYTHONPATH:+:$PYTHONPATH}" \
         "${PYTHON3_BIN:-python3}" -m auto_xdp.install_state record \
@@ -1017,11 +808,6 @@ _auto_xdp_finish_interrupted_reload() {
             _auto_xdp_warn "Could not validate candidate handlers; retaining both generations."
             return 1
         fi
-        if ! seed_existing_tcp_conntrack; then
-            BPF_PIN_DIR="$saved_pin_dir"
-            _auto_xdp_warn "Could not pre-seed candidate conntrack; retaining both generations."
-            return 1
-        fi
         BPF_PIN_DIR="$saved_pin_dir"
         AUTO_XDP_SWITCH_MODE=""
         for iface in "${recovery_ifaces[@]}"; do
@@ -1032,23 +818,6 @@ _auto_xdp_finish_interrupted_reload() {
             fi
             _auto_xdp_record_switch_mode "$AUTO_XDP_LAST_ATTACH_MODE"
         done
-
-        saved_pin_dir="$BPF_PIN_DIR"
-        saved_tc_rollback="${TC_ROLLBACK_PROG_PATH:-}"
-        saved_tc_allow="${TC_ALLOW_EXISTING_CANDIDATE:-0}"
-        BPF_PIN_DIR="$candidate_dir"
-        TC_ROLLBACK_PROG_PATH="${live_dir}/tc_egress_prog"
-        [[ -e "$TC_ROLLBACK_PROG_PATH" ]] || TC_ALLOW_EXISTING_CANDIDATE=1
-        if ! load_tc_egress_program; then
-            BPF_PIN_DIR="$saved_pin_dir"
-            TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
-            TC_ALLOW_EXISTING_CANDIDATE="$saved_tc_allow"
-            _auto_xdp_warn "Could not resume candidate tc filters; retaining both generations."
-            return 1
-        fi
-        BPF_PIN_DIR="$saved_pin_dir"
-        TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
-        TC_ALLOW_EXISTING_CANDIDATE="$saved_tc_allow"
 
         if [[ -e "$live_dir" ]]; then
             [[ ! -e "$rollback_dir" ]] || return 1
@@ -1065,12 +834,11 @@ _auto_xdp_finish_interrupted_reload() {
         return 0
     fi
 
-    # Candidate was already renamed to live; repeat the idempotent program/tc
+    # Candidate was already renamed to live; repeat the idempotent program
     # replacement before deleting the rollback generation.
     [[ -e "$live_dir/prog" && -e "$rollback_dir/prog" ]] || return 1
     _auto_xdp_warn "Interrupted XDP commit detected; verifying the live generation before cleanup."
     preseed_xdp_candidate_handlers || return 1
-    seed_existing_tcp_conntrack || return 1
     AUTO_XDP_SWITCH_MODE=""
     for iface in "${recovery_ifaces[@]}"; do
         if ! _auto_xdp_attach_candidate "$iface" "$live_dir/prog" \
@@ -1080,13 +848,6 @@ _auto_xdp_finish_interrupted_reload() {
         fi
         _auto_xdp_record_switch_mode "$AUTO_XDP_LAST_ATTACH_MODE"
     done
-    saved_tc_rollback="${TC_ROLLBACK_PROG_PATH:-}"
-    TC_ROLLBACK_PROG_PATH="${rollback_dir}/tc_egress_prog"
-    if ! load_tc_egress_program; then
-        TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
-        return 1
-    fi
-    TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
     if ! _auto_xdp_record_xdp_state "$live_dir/prog"; then
         _auto_xdp_warn "Could not persist verified per-interface XDP state; retaining the rollback generation."
         return 1
@@ -1101,7 +862,7 @@ _auto_xdp_restore_interrupted_reload() {
     local candidate_dir="${BPF_PIN_DIR}_next"
     local rollback_dir="${BPF_PIN_DIR}_rollback"
     local stable_dir="" discard_dir="" stable_id="" discard_id=""
-    local iface_var="" iface mode actual_id="" stable_tc=""
+    local iface_var="" iface mode actual_id=""
     local replacement_dir="${BPF_PIN_DIR}_failed_${BASHPID:-$$}"
 
     if [[ -e "$live_dir" && -e "$candidate_dir" && -e "$rollback_dir" ]]; then
@@ -1153,24 +914,6 @@ _auto_xdp_restore_interrupted_reload() {
         if ! _auto_xdp_attach_mode "$iface" "$stable_dir/prog" "$mode" >/dev/null 2>&1 \
                 || ! _auto_xdp_verify_iface_program "$iface" "$stable_dir/prog"; then
             _auto_xdp_warn "Could not restore stable XDP program $stable_id on $iface; recovery pins were retained."
-            return 1
-        fi
-    done
-
-    stable_tc="${stable_dir}/tc_egress_prog"
-    for iface in "${restore_ifaces[@]}"; do
-        if [[ -e "$stable_tc" ]]; then
-            tc qdisc add dev "$iface" clsact 2>/dev/null || true
-            tc filter replace dev "$iface" egress \
-                pref "${TC_FILTER_PREF:-49152}" handle "${TC_FILTER_HANDLE:-1}" \
-                bpf direct-action object-pinned "$stable_tc" >/dev/null 2>&1 || {
-                _auto_xdp_warn "Could not restore stable tc program on $iface; recovery pins were retained."
-                return 1
-            }
-        elif tc filter show dev "$iface" egress \
-                pref "${TC_FILTER_PREF:-49152}" handle "${TC_FILTER_HANDLE:-1}" \
-                2>/dev/null | grep -q .; then
-            _auto_xdp_warn "A tc filter remains on $iface but the stable rollback pin is missing."
             return 1
         fi
     done
@@ -1303,12 +1046,6 @@ transactional_reload_xdp() {
         rm -rf "$candidate_dir"
         return 1
     fi
-    if ! seed_existing_tcp_conntrack; then
-        BPF_PIN_DIR="$saved_pin_dir"
-        _auto_xdp_warn "Candidate XDP conntrack pre-seeding failed; current protection was not changed."
-        rm -rf "$candidate_dir"
-        return 1
-    fi
     BPF_PIN_DIR="$saved_pin_dir"
 
     [[ -d "$live_dir" ]] && had_old=1
@@ -1338,30 +1075,8 @@ transactional_reload_xdp() {
         return 1
     done
 
-    local saved_tc_rollback="${TC_ROLLBACK_PROG_PATH:-}"
     local saved_pin_dir="$BPF_PIN_DIR"
-    BPF_PIN_DIR="$candidate_dir"
-    TC_ROLLBACK_PROG_PATH="${live_dir}/tc_egress_prog"
-    if ! load_tc_egress_program; then
-        BPF_PIN_DIR="$saved_pin_dir"
-        TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
-        _auto_xdp_warn "Candidate tc attach failed; restoring previous XDP program."
-        for ((index = 0; index < switched; index++)); do
-            _auto_xdp_rollback_iface "${switch_ifaces[$index]}" \
-                "${old_modes[$index]}" "${new_modes[$index]}" \
-                "$live_dir/prog" || rollback_ok=0
-        done
-        if [[ $rollback_ok -eq 1 && ${AUTO_XDP_TC_ROLLBACK_COMPLETE:-1} -eq 1 ]]; then
-            rm -rf "$candidate_dir"
-        else
-            rollback_ok=0
-            _auto_xdp_warn "XDP rollback was incomplete; retaining both pin generations for recovery."
-        fi
-        AUTO_XDP_SWITCH_ROLLED_BACK=$rollback_ok
-        return 1
-    fi
     BPF_PIN_DIR="$saved_pin_dir"
-    TC_ROLLBACK_PROG_PATH="$saved_tc_rollback"
 
     if [[ $had_old -eq 1 ]]; then
         mv "$live_dir" "$rollback_dir" || return 1
@@ -1514,14 +1229,12 @@ for entry in enabled:
     ]
     if proto == 132:
         sctp_whitelist = os.path.join(bpf_pin_dir, "sctp_whitelist")
-        sctp_conntrack = os.path.join(bpf_pin_dir, "sctp_conntrack")
-        if not (os.path.exists(sctp_whitelist) and os.path.exists(sctp_conntrack)):
+        if not os.path.exists(sctp_whitelist):
             print("  [WARN] Shared SCTP maps not pinned; skipping proto 132", file=sys.stderr)
             failures += 1
             continue
         load_cmd.extend([
             "map", "name", "sctp_whitelist", "pinned", sctp_whitelist,
-            "map", "name", "sctp_conntrack", "pinned", sctp_conntrack,
         ])
 
     r = subprocess.run(load_cmd, capture_output=True, text=True)

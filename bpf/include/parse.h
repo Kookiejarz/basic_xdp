@@ -2,7 +2,7 @@
 #include "common.h"
 
 // TCP malformed packet check. Called after the basic 20-byte bounds check,
-// before conntrack. Returns XDP_DROP (and increments the appropriate counter)
+// before policy evaluation. Returns XDP_DROP (and increments the appropriate counter)
 // for any packet that violates RFC 793 structural invariants.
 // Returns 0 for valid packets, or a CNT_TCP_MALFORM_* reason code for drops.
 // count() and emit_drop() are the caller's responsibility.
@@ -49,7 +49,8 @@ static __always_inline __u8 udp_malformed_reason(struct udphdr *udp, __u32 l4_av
 static __always_inline __u8 skip_ipv6_exthdr(
     void **trans_data, void *data_end, __u8 nexthdr)
 {
-    // Traverse at most 6 extension headers; treat more as anomalous and pass
+    // Traverse at most 6 extension headers; treat more as anomalous and let the
+    // caller apply its fail-closed policy.
     #pragma unroll
     for (int i = 0; i < 6; i++) {
         switch (nexthdr) {
@@ -59,12 +60,12 @@ static __always_inline __u8 skip_ipv6_exthdr(
         {
             __u8 *hdr = *trans_data;
             if ((void *)(hdr + 2) > data_end)
-                return IPPROTO_NONE;
+                return IPV6_EXTHDR_MALFORMED_SENTINEL;
             nexthdr = hdr[0];
             __u32 hdrlen = (((__u32)hdr[1] + 1) * 8);
             *trans_data += hdrlen;
             if (*trans_data > data_end)
-                return IPPROTO_NONE;
+                return IPV6_EXTHDR_MALFORMED_SENTINEL;
             break;
         }
         case IPPROTO_FRAGMENT: // 44 Fragment header (fixed 8 bytes)
@@ -72,7 +73,7 @@ static __always_inline __u8 skip_ipv6_exthdr(
             __u8 *hdr = *trans_data;
             __u16 frag_off_flags;
             if ((void *)(hdr + 8) > data_end)
-                return IPPROTO_NONE;
+                return IPV6_EXTHDR_MALFORMED_SENTINEL;
             frag_off_flags = ((__u16)hdr[2] << 8) | hdr[3];
             if (frag_off_flags & 0xFFF8)
                 return IPV6_FRAG_DROP_SENTINEL;
@@ -85,11 +86,11 @@ static __always_inline __u8 skip_ipv6_exthdr(
             return nexthdr;
         }
     }
-    return nexthdr;
+    return IPV6_EXTHDR_MALFORMED_SENTINEL;
 }
 
 // Strip up to VLAN_MAX_DEPTH 802.1Q/802.1AD tags from the Ethernet frame.
-// Returns false if the packet is truncated mid-tag (caller should XDP_PASS).
+// Returns false if the packet is truncated mid-tag (caller should XDP_DROP).
 // After a successful return, if *eth_proto is still 0x8100/0x88a8 the nesting
 // depth exceeds VLAN_MAX_DEPTH and the caller should DROP.
 static __always_inline bool strip_vlan_tags(
@@ -102,7 +103,7 @@ static __always_inline bool strip_vlan_tags(
             return true;
         struct vlan_hdr *vlan = *l3_data;
         if ((void *)(vlan + 1) > data_end)
-            return false; // truncated: let the kernel handle it
+            return false; // truncated: do not let it bypass XDP policy
         *eth_proto = vlan->h_vlan_encapsulated_proto;
         *l3_data   = (void *)(vlan + 1);
     }

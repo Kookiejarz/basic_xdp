@@ -130,7 +130,6 @@ SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
 PYTHON3_BIN="${PYTHON3_BIN}"
 BPF_PIN_DIR="${BPF_PIN_DIR}"
 XDP_OBJ_PATH="${CURRENT_LINK}/${XDP_OBJ}"
-TC_OBJ_PATH="${CURRENT_LINK}/${TC_OBJ}"
 SOCK_STATE_OBJ_PATH="${CURRENT_LINK}/${SOCK_STATE_OBJ}"
 BPFTOOL_BIN="${BPFTOOL_BIN:-}"
 PREFERRED_BACKEND="${REQUESTED_BACKEND}"
@@ -404,7 +403,7 @@ build_release_payload() {
 
     install_compiled_bpf_objects() {
         local object source
-        for object in "$XDP_OBJ" "$TC_OBJ" "$SOCK_STATE_OBJ"; do
+        for object in "$XDP_OBJ" "$SOCK_STATE_OBJ"; do
             source="${BUILD_STAGING_DIR}/${object}"
             [[ -f "$source" ]] || continue
             place_file "$source" "${INSTALL_DIR}/${object}" || return 1
@@ -591,7 +590,7 @@ run_initial_sync_step() {
     fi
     if [[ ${PENDING_NFT_CUTOVER:-0} -eq 1 ]]; then
         if ! finalize_nftables_cutover; then
-            step_fail "nftables candidate loaded, but XDP/tc cutover could not be verified"
+            step_fail "nftables candidate loaded, but XDP cutover could not be verified"
             return 1
         fi
     fi

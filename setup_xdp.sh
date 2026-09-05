@@ -105,8 +105,6 @@ IFACES=()
 ALL_IFACES=0
 XDP_SRC="bpf/xdp_firewall.c"
 XDP_OBJ="xdp_firewall.o"
-TC_SRC="tc_flow_track.c"
-TC_OBJ="tc_flow_track.o"
 
 INSTALL_ROOT="/usr/local/lib/auto_xdp"
 RELEASES_DIR="${INSTALL_ROOT}/releases"
@@ -134,7 +132,6 @@ RUNNER_SCRIPT="${CURRENT_LINK}/auto_xdp_start.sh"
 RUNNER_SRC="runtime/auto_xdp_start.sh"
 RUNTIME_COMMON_SRC="runtime/auto_xdp_runtime_common.sh"
 XDP_OBJ_INSTALLED="${INSTALL_DIR}/xdp_firewall.o"
-TC_OBJ_INSTALLED="${INSTALL_DIR}/tc_flow_track.o"
 SOCK_STATE_SRC="bpf/sock_state_track.c"
 SOCK_STATE_OBJ="sock_state_track.o"
 SOCK_STATE_OBJ_INSTALLED="${INSTALL_DIR}/sock_state_track.o"
@@ -164,7 +161,6 @@ RELAY_SERVICE_NAME="auto-xdp-relay"
 RAW_BASE_URL="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP"
 AUTO_XDP_SOURCE_REF="${AUTO_XDP_SOURCE_REF:-}"
 RAW_URL=""
-TC_FILTER_PREF=49152
 PREFER_REMOTE_SOURCES=0
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 SYSTEMD_RUN_DIR="${SYSTEMD_RUN_DIR:-/run/systemd/system}"
@@ -381,8 +377,8 @@ load_runtime_common_lib
 source_setup_lib "lib/setup/install.sh"
 source_setup_lib "lib/setup/release.sh"
 
-# The backend bring-up: load the XDP/nftables backend, register handlers, seed
-# conntrack, and install + start the system service. These steps run the shared
+# The backend bring-up: load the XDP/nftables backend, register handlers, and
+# install + start the system service. These steps run the shared
 # runtime library in-process, so they execute as a single privileged unit.
 run_backend_phase() {
     deploy_backend_step
