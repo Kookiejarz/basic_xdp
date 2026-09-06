@@ -234,7 +234,7 @@ def _grant_for(endpoint: RuntimeEndpoint, subject: dict) -> tuple[bool, str, str
     if endpoint.host_port not in {int(port) for port in ports}:
         return False, "port is not listed in the exposure grant", ""
     protection = subject.get("protection", {})
-    profile = str(protection.get("profile", "")) if isinstance(protection, dict) else ""
+    profile = str(protection.get("profile", "")).strip().lower() if isinstance(protection, dict) else ""
     return True, "matched explicit exposure grant", profile
 
 
@@ -346,6 +346,13 @@ def _service_aware_desired_state(observed: ObservedState) -> DesiredState:
     desired.exposure_decisions = decisions
     desired.zone_tcp_ports = zone_tcp_ports
     desired.zone_udp_ports = zone_udp_ports
+    desired.tcp_protection_profiles = {
+        item.endpoint.host_port: item.protection_profile
+        for item in decisions
+        if item.action == "allow"
+        and item.endpoint.protocol == "tcp"
+        and item.protection_profile == "minecraft"
+    }
     return desired
 
 

@@ -49,14 +49,14 @@ interfaces = ["tailscale0", "wg0"]
 public = "deny"
 trusted = "deny"
 
-[subjects.website.resolve]
-systemd_unit = "nginx.service"
+[subjects.minecraft.resolve]
+systemd_unit = "minecraft.service"
 
-[subjects.website.exposure.public.tcp]
-ports = [80, 443]
+[subjects.minecraft.exposure.public.tcp]
+ports = [25565]
 
-[subjects.website.protection]
-profile = "web"
+[subjects.minecraft.protection]
+profile = "minecraft"
 ```
 
 The resolver evaluates, in order:
@@ -103,12 +103,14 @@ systemd / sockets / containers
 ```
 
 XDP consumes ingress-interface/protocol/port policy, source ACLs, rate limits,
-and handler state. The resolver carries the profile name for decisions and
-explanations; profile-specific behavior is still deferred, so V1 applies the
-existing generic protection maps to every authorized endpoint. Exposure
-authorization, asymmetric ingress-only reconciliation, and stateless
-protection do not require symmetric routing or project-owned connection
-tracking.
+and handler state. The `minecraft` profile automatically binds a per-port XDP
+handler before exposure. It validates the Minecraft Java handshake and first
+status/login packets, rate-limits status and login attempts by source prefix,
+and passes later packets only for flows that completed validation. Its flow
+state is built exclusively from ingress packets, so asymmetric routing does
+not hide required return traffic. If XDP or the handler is unavailable, the
+profile's ports remain closed instead of silently falling back to generic
+nftables protection.
 
 If a future stateful feature needs kernel conntrack, it must capability-detect
 the kernel facility and retain a restricted stateless fallback. Auto XDP does
@@ -149,7 +151,7 @@ latency measurement, and fail-closed structural parsing.
 Implemented after the V1 baseline: Docker/Podman published-port attribution,
 including NAT-only publications, and the approval workflow.
 
-Deferred until separately evidenced: a service-specific profile implementation,
+Deferred until separately evidenced: additional service-specific profiles,
 optional kernel conntrack lookup, destination-address/CIDR zone keys, strict
 per-packet workload authentication, full L7 inspection, custom BPF conntrack,
 and upstream volumetric mitigation.

@@ -31,13 +31,13 @@ interfaces = ["tailscale0", "wg0"]
 public = "deny"
 trusted = "deny"
 
-# Example grant:
-# [subjects.website.resolve]
-# systemd_unit = "nginx.service"
-# [subjects.website.exposure.public.tcp]
-# ports = [80, 443]
-# [subjects.website.protection]
-# profile = "web"
+# Minecraft Java example (the profile loads protocol-aware XDP protection):
+# [subjects.minecraft.resolve]
+# systemd_unit = "minecraft.service"
+# [subjects.minecraft.exposure.public.tcp]
+# ports = [25565]
+# [subjects.minecraft.protection]
+# profile = "minecraft"
 
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.

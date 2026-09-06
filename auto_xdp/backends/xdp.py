@@ -1,10 +1,15 @@
 """XDP/BPF backend — syncs port whitelist and rate-limit maps directly."""
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 import logging
 import os
+from pathlib import Path
 import socket
 import shutil
+import subprocess
+import sys
 
 from auto_xdp import config as cfg
 from auto_xdp.backends.base import BackendStatus, PortBackend
@@ -36,6 +41,9 @@ log = logging.getLogger(__name__)
 # A rate-limit map slot holds either the standalone SYN-rate map or a per-field
 # view over the shared port-policy map; both expose active()/set()/delete().
 RateLimitMap = BpfSynRatePortsMap | BpfPortPolicyViewMap
+
+_MINECRAFT_PROFILE = "minecraft"
+_PROFILE_STATE_DIR = "profile-handlers"
 
 
 def _compute_cfg_flags(desired: DesiredState) -> int:
@@ -281,6 +289,174 @@ class XdpBackend(PortBackend):
                 failures += 1
             elif not dry_run:
                 log.debug("%s zone port %s %d", "+" if additions else "-", ifindex, port)
+        return failures
+
+    @staticmethod
+    def _profile_install_dir() -> Path:
+        python_root = os.environ.get("PYTHON_LIB_DIR")
+        if python_root:
+            return Path(python_root).resolve().parent
+        return Path(__file__).resolve().parents[2]
+
+    @staticmethod
+    def _profile_marker(port: int) -> Path:
+        run_dir = Path(os.environ.get("RUN_STATE_DIR", "/run/auto_xdp"))
+        return run_dir / _PROFILE_STATE_DIR / "tcp" / str(port)
+
+    @staticmethod
+    def _pinned_program_id(pin: Path) -> int | None:
+        if not pin.exists():
+            return None
+        try:
+            result = subprocess.run(
+                ["bpftool", "-j", "prog", "show", "pinned", str(pin)],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            value = json.loads(result.stdout)
+            if isinstance(value, list):
+                value = value[0]
+            return int(value["id"])
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _profile_command(self, action: str, port: int, object_path: Path | None = None) -> bool:
+        install_dir = self._profile_install_dir()
+        command = [
+            sys.executable,
+            "-m",
+            "auto_xdp.admin_cli",
+            "--config",
+            cfg.TOML_CONFIG_PATH,
+            "--bpf-pin-dir",
+            cfg.BPF_PIN_DIR,
+            "--install-dir",
+            str(install_dir),
+            "port-handler",
+            action,
+            "tcp",
+            str(port),
+        ]
+        if object_path is not None:
+            command.append(str(object_path))
+        command.append("--no-config-update")
+        try:
+            result = subprocess.run(command, capture_output=True, text=True)
+        except OSError as exc:
+            log.error("Cannot run Minecraft profile handler command: %s", exc)
+            return False
+        if result.returncode == 0:
+            return True
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        log.error("Minecraft profile handler %s failed for TCP/%d: %s", action, port, detail)
+        return False
+
+    def _managed_profile_handlers(self) -> dict[int, tuple[str, int]]:
+        root = self._profile_marker(1).parent
+        managed: dict[int, tuple[str, int]] = {}
+        if not root.is_dir():
+            return managed
+        try:
+            markers = list(root.iterdir())
+        except OSError:
+            return managed
+        for marker in markers:
+            try:
+                port = int(marker.name)
+                value = json.loads(marker.read_text(encoding="utf-8"))
+                profile = str(value["profile"])
+                program_id = int(value["program_id"])
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if 1 <= port <= 65535:
+                managed[port] = (profile, program_id)
+        return managed
+
+    def _ensure_profile_handlers(self, desired: dict[int, str], dry_run: bool) -> set[int]:
+        failures: set[int] = set()
+        managed = self._managed_profile_handlers()
+        install_dir = self._profile_install_dir()
+        object_path = install_dir / "handlers" / f"{_MINECRAFT_PROFILE}_handler.o"
+
+        for port, profile in sorted(desired.items()):
+            if profile != _MINECRAFT_PROFILE:
+                log.error("Unsupported TCP protection profile %r on port %d", profile, port)
+                failures.add(port)
+                continue
+            live_pin = Path(cfg.BPF_PIN_DIR) / "port_handlers" / "tcp" / str(port) / "prog"
+            live_id = self._pinned_program_id(live_pin)
+            marker = self._profile_marker(port)
+            ownership = managed.get(port)
+            if ownership == (profile, live_id):
+                continue
+            if ownership is not None and not dry_run:
+                try:
+                    marker.unlink()
+                except OSError:
+                    pass
+            if live_id is not None:
+                log.error(
+                    "TCP/%d already has a non-profile handler; keeping Minecraft exposure closed",
+                    port,
+                )
+                failures.add(port)
+                continue
+            if dry_run:
+                log.info("Would load Minecraft profile handler for TCP/%d", port)
+                continue
+            if not object_path.is_file():
+                log.error("Minecraft profile object is missing: %s", object_path)
+                failures.add(port)
+                continue
+            if not self._profile_command("load", port, object_path):
+                failures.add(port)
+                continue
+            program_id = self._pinned_program_id(live_pin)
+            if program_id is None:
+                self._profile_command("unload", port)
+                failures.add(port)
+                continue
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    json.dumps({"profile": profile, "program_id": program_id}),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                log.error("Cannot record Minecraft profile ownership for TCP/%d: %s", port, exc)
+                self._profile_command("unload", port)
+                failures.add(port)
+                continue
+            log.info("Minecraft protection enabled for TCP/%d", port)
+        return failures
+
+    def _remove_stale_profile_handlers(self, desired: dict[int, str], dry_run: bool) -> int:
+        failures = 0
+        for port, (profile, program_id) in sorted(self._managed_profile_handlers().items()):
+            if desired.get(port) == profile:
+                continue
+            marker = self._profile_marker(port)
+            live_pin = Path(cfg.BPF_PIN_DIR) / "port_handlers" / "tcp" / str(port) / "prog"
+            if dry_run:
+                log.info("Would unload stale Minecraft profile handler from TCP/%d", port)
+                continue
+            if self._pinned_program_id(live_pin) == program_id:
+                if not self._profile_command("unload", port):
+                    failures += 1
+                    continue
+                log.info("Minecraft protection disabled for TCP/%d", port)
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.warning("Cannot remove stale profile marker %s: %s", marker, exc)
+                failures += 1
         return failures
 
     def is_stale(self) -> bool:
@@ -573,10 +749,26 @@ class XdpBackend(PortBackend):
         dry_run: bool,
         observed_state: ObservedState | None = None,
     ) -> None:
+        failed_profile_ports = self._ensure_profile_handlers(
+            desired_state.tcp_protection_profiles,
+            dry_run,
+        )
+        effective_desired = desired_state
+        if failed_profile_ports:
+            effective_desired = replace(
+                desired_state,
+                tcp_ports=desired_state.tcp_ports - failed_profile_ports,
+                zone_tcp_ports={
+                    zone: ports - failed_profile_ports
+                    for zone, ports in desired_state.zone_tcp_ports.items()
+                    if ports - failed_profile_ports
+                },
+            )
+
         self.last_apply_failures = 0
         zone_maps = (
-            (getattr(self, "tcp_zone_map", None), self._desired_zone_entries(desired_state, "tcp")),
-            (getattr(self, "udp_zone_map", None), self._desired_zone_entries(desired_state, "udp")),
+            (getattr(self, "tcp_zone_map", None), self._desired_zone_entries(effective_desired, "tcp")),
+            (getattr(self, "udp_zone_map", None), self._desired_zone_entries(effective_desired, "udp")),
         )
         zone_failures = 0
         if not zone_failures:
@@ -584,7 +776,8 @@ class XdpBackend(PortBackend):
                 self._apply_zone_delta(zone_map, entries, dry_run, additions=False)
                 for zone_map, entries in zone_maps if zone_map is not None
             )
-        super().reconcile(desired_state, dry_run, observed_state)
+        super().reconcile(effective_desired, dry_run, observed_state)
+        self.last_apply_failures += len(failed_profile_ports)
         if not zone_failures and not self.last_apply_failures:
             zone_failures += (
                 sum(
@@ -593,6 +786,10 @@ class XdpBackend(PortBackend):
                 )
             )
         self.last_apply_failures += zone_failures
+        self.last_apply_failures += self._remove_stale_profile_handlers(
+            desired_state.tcp_protection_profiles,
+            dry_run,
+        )
 
     def _apply_acl_delta(self, plan: ReconcilePlan, dry_run: bool) -> None:
         if self.acl_maps is None:

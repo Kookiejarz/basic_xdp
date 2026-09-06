@@ -6,6 +6,7 @@ half-applied policy when ports, ACLs, and rate limits change together.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import ipaddress
 import logging
 import math
@@ -511,10 +512,26 @@ class NftablesBackend(PortBackend):
         observed_state: ObservedState | None = None,
     ) -> None:
         _ = plan, observed_state  # native conntrack owns established-flow state
+        protected_ports = set(desired_state.tcp_protection_profiles)
+        if protected_ports:
+            desired_state = replace(
+                desired_state,
+                tcp_ports=desired_state.tcp_ports - protected_ports,
+                zone_tcp_ports={
+                    zone: ports - protected_ports
+                    for zone, ports in desired_state.zone_tcp_ports.items()
+                    if ports - protected_ports
+                },
+            )
         signature = _policy_signature(desired_state)
         if signature == self._policy_signature:
             log.debug("nftables policy up-to-date.")
             return
+        if protected_ports:
+            log.warning(
+                "Minecraft protection requires XDP; keeping TCP ports %s closed on nftables",
+                sorted(protected_ports),
+            )
 
         # A single nft batch validates the complete candidate and commits it
         # atomically.  If parsing or kernel validation fails, the old table is

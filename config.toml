@@ -31,13 +31,13 @@ interfaces = ["tailscale0", "wg0"]
 public = "deny"
 trusted = "deny"
 
-# Example grant (copy/uncomment and adjust the unit name/ports):
-# [subjects.website.resolve]
-# systemd_unit = "nginx.service"
-# [subjects.website.exposure.public.tcp]
-# ports = [80, 443]
-# [subjects.website.protection]
-# profile = "web"
+# Minecraft Java example (copy/uncomment and adjust the unit name/port):
+# [subjects.minecraft.resolve]
+# systemd_unit = "minecraft.service"
+# [subjects.minecraft.exposure.public.tcp]
+# ports = [25565]
+# [subjects.minecraft.protection]
+# profile = "minecraft"
 
 [daemon]
 # Log verbosity for the Python sync daemon: debug, info, warning, error.

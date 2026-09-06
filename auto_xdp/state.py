@@ -75,6 +75,7 @@ class DesiredState:
     exposure_decisions: list[ExposureDecision] = field(default_factory=list)
     zone_tcp_ports: dict[str, set[int]] = field(default_factory=dict)
     zone_udp_ports: dict[str, set[int]] = field(default_factory=dict)
+    tcp_protection_profiles: dict[int, str] = field(default_factory=dict)
     xdp_runtime_config: tuple[int, int, int, int, int, int, int, int] = (
         0,
         0,

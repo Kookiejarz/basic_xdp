@@ -43,6 +43,7 @@ Static firewall rules drift as services come and go. Auto XDP watches runtime en
 - A newly listening service becomes reachable only when a matching workload grant exists.
 - A stopped service no longer remains open because its runtime justification disappeared.
 - Native XDP can drop unwanted packets before they enter the normal Linux networking path.
+- The `minecraft` profile validates Java handshakes/login traffic and follows the service lifecycle without requiring symmetric routing.
 - The same listener policy can use `nftables` when native XDP is unavailable.
 
 This keeps the firewall tied to both operator intent and current runtime state. Legacy `permanent_ports` configuration is rejected; exposure must use workload grants and zones.
