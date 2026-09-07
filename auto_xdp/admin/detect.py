@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def iface_xdp_state(iface: str) -> str:
-    """Return the XDP attach state for iface: 'missing', 'generic', 'native', or 'off'."""
+    """Return the XDP attach state for iface."""
     if not iface:
         return "missing"
     try:
@@ -21,13 +21,15 @@ def iface_xdp_state(iface: str) -> str:
         return "missing"
     if "xdpgeneric" in info:
         return "generic"
-    if "xdp" in info or "xdpoffload" in info:
+    if "xdpoffload" in info:
+        return "offload"
+    if "xdp" in info:
         return "native"
     return "off"
 
 
 def _iface_has_xdp(iface: str) -> bool:
-    return iface_xdp_state(iface) in ("generic", "native")
+    return iface_xdp_state(iface) in ("generic", "native", "offload")
 
 
 def _nft_table_exists(family: str, table: str) -> bool:

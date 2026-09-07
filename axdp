@@ -4,6 +4,7 @@ set -euo pipefail
 CONFIG_FILE="/etc/auto_xdp/auto_xdp.env"
 TOML_CONFIG="/etc/auto_xdp/config.toml"
 CONFIG_DIR="/etc/auto_xdp"
+APPROVAL_STORE="${CONFIG_DIR}/approval_requests.json"
 RELAY_GROUP="auto-xdp"
 RELAY_GROUP_MARKER="${CONFIG_DIR}/.relay-group-created"
 RUN_STATE_DIR="/run/auto_xdp"
@@ -42,6 +43,7 @@ Commands:
   tui [args...]          Open htop-like live TUI
   watch [args...]        Shorthand for: stats --watch
   ports [args...]        Show currently allowed TCP/UDP ports
+  discover               Show discovered services and exposure decisions
   exposure               Show live service-aware exposure decisions
   explain PROTO/PORT     Explain one runtime endpoint authorization decision
   backend                Show active backend and runtime attachment state
@@ -50,9 +52,15 @@ Commands:
   log-level [LVL]        Show or change daemon log level
   under-attack [on|off] Show or change under-attack mode
   start                  Start the installed service
-  stop                   Stop the installed service
+  stop                   Stop the controller (active data plane remains)
   restart                Restart the installed service
   status                 Show service status
+  allow SERVICE PROTO/PORT [options]  Persist and apply a service grant
+  deny SERVICE PROTO/PORT [options]   Remove a service grant
+  grants                 List service exposure grants
+  mode [observe|audit|enforce]        Show or change activation mode
+  enable [--force]       Validate and activate the configured policy
+  disable [audit|observe] Detach the data plane and continue discovery
   uninstall [IFACE...]   Completely remove Auto XDP from this host
   config show            Show current TOML config
   config init            Create default config.toml (if missing)
@@ -108,22 +116,23 @@ EOF
 
 run_service_cmd() {
     local action="$1"
+    local service_status=0
 
     if command -v systemctl >/dev/null 2>&1 && [[ -d "$SYSTEMD_RUN_DIR" ]]; then
-        systemctl "$action" "$SERVICE_NAME"
+        systemctl "$action" "$SERVICE_NAME" || service_status=$?
         if systemctl list-unit-files "${RELAY_SERVICE_NAME}.service" >/dev/null 2>&1; then
             systemctl "$action" "$RELAY_SERVICE_NAME" || true
         else
             echo "Relay service not installed yet. Re-run setup_xdp.sh --force to install ${RELAY_SERVICE_NAME}." >&2
         fi
-        return 0
+        return "$service_status"
     fi
 
     if command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" "$action"
+        rc-service "$SERVICE_NAME" "$action" || service_status=$?
         rc-service "$RELAY_SERVICE_NAME" "$action" 2>/dev/null || \
             echo "Relay service not installed yet. Re-run setup_xdp.sh --force to install ${RELAY_SERVICE_NAME}." >&2
-        return 0
+        return "$service_status"
     fi
 
     echo "No supported init system detected for service control." >&2
@@ -384,7 +393,8 @@ PY_BOOTSTRAP='import sys, runpy; sys.path[:] = [p for p in sys.path if p]; runpy
 run_py_module() {
     local module="$1"
     shift
-    PYTHONPATH="${PYTHON_LIB_DIR}" python3 -c "$PY_BOOTSTRAP" "$module" "$@"
+    AUTO_XDP_APPROVAL_STORE="$APPROVAL_STORE" PYTHONPATH="${PYTHON_LIB_DIR}" \
+        python3 -c "$PY_BOOTSTRAP" "$module" "$@"
 }
 
 require_admin_cli_runtime() {
@@ -501,6 +511,91 @@ run_exposure() {
 run_explain() {
     require_admin_cli_runtime explain
     run_admin_config explain "$@"
+}
+
+run_allow() {
+    require_admin_cli_runtime allow
+    require_root "allow"
+    [[ -f "$TOML_CONFIG" ]] || run_config init
+    run_admin_config allow "$@"
+}
+
+run_deny() {
+    require_admin_cli_runtime deny
+    require_root "deny"
+    run_admin_config deny "$@"
+}
+
+remote_access_is_granted() {
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 0
+    local _client_ip _client_port _server_ip server_port explanation
+    read -r _client_ip _client_port _server_ip server_port <<< "$SSH_CONNECTION"
+    [[ "$server_port" =~ ^[0-9]+$ ]] || return 1
+    explanation=$(run_admin_config explain "tcp/$server_port") || return 1
+    grep -q '^ALLOW$' <<< "$explanation" && ! grep -q '^BLOCK$' <<< "$explanation"
+}
+
+run_enable() {
+    require_root "enable"
+    local force=0
+    if [[ "${1:-}" == "--force" ]]; then
+        force=1
+        shift
+    fi
+    [[ $# -eq 0 ]] || { echo "Usage: axdp enable [--force]" >&2; return 1; }
+    [[ -f "$TOML_CONFIG" ]] || run_config init
+    if [[ $force -eq 0 ]] && ! remote_access_is_granted; then
+        echo "Refusing to enable: the current SSH listener has no matching grant." >&2
+        echo "Allow it first, or use axdp enable --force from a recovery console." >&2
+        return 1
+    fi
+    run_admin_config policy mode enforce >/dev/null || return 1
+    if ! run_service_cmd restart; then
+        run_admin_config policy mode audit >/dev/null || true
+        run_service_cmd start || true
+        echo "Enable failed; policy returned to audit mode." >&2
+        return 1
+    fi
+    echo "Auto XDP enforcement enabled."
+    run_backend
+}
+
+run_disable() {
+    local target_mode="${1:-audit}" previous_mode
+    [[ $# -le 1 ]] || { echo "Usage: axdp disable [audit|observe]" >&2; return 1; }
+    [[ "$target_mode" == "audit" || "$target_mode" == "observe" ]] \
+        || { echo "disable mode must be audit or observe" >&2; return 1; }
+    require_root "disable"
+    previous_mode=$(run_admin_config policy mode) || return 1
+    run_admin_config policy mode "$target_mode" >/dev/null || return 1
+    if ! run_service_cmd stop; then
+        run_admin_config policy mode "$previous_mode" >/dev/null || true
+        echo "Disable failed: could not stop the policy controller." >&2
+        return 1
+    fi
+    if ! run_admin_runtime deactivate; then
+        run_admin_config policy mode "$previous_mode" >/dev/null || true
+        run_service_cmd start || true
+        echo "Disable failed; restored policy mode $previous_mode." >&2
+        return 1
+    fi
+    run_service_cmd start
+    echo "Auto XDP data plane disabled; discovery continues in $target_mode mode."
+}
+
+run_mode() {
+    local mode="${1:-}"
+    if [[ -z "$mode" ]]; then
+        run_admin_config policy mode
+        return
+    fi
+    shift
+    [[ $# -eq 0 ]] || { echo "Usage: axdp mode [observe|audit|enforce]" >&2; return 1; }
+    case "$mode" in
+        enforce) run_enable ;;
+        audit|observe) run_disable "$mode" ;;
+        *) echo "Usage: axdp mode [observe|audit|enforce]" >&2; return 1 ;;
+    esac
 }
 
 run_stats() {
@@ -670,8 +765,11 @@ run_policy() {
             require_admin_cli_runtime policy
             run_admin_config policy grants "$@"
             ;;
+        mode)
+            run_mode "$@"
+            ;;
         -h|--help)
-            echo "Usage: axdp policy grants [--json]"
+            echo "Usage: axdp policy grants [--json]|mode [observe|audit|enforce]"
             ;;
         *)
             echo "Unknown policy subcommand: $sub" >&2; exit 1 ;;
@@ -808,7 +906,7 @@ main() {
             shift || true
             run_ports "$@"
             ;;
-        exposure)
+        discover|exposure)
             shift || true
             run_exposure "$@"
             ;;
@@ -853,6 +951,30 @@ main() {
         policy)
             shift || true
             run_policy "$@"
+            ;;
+        grants)
+            shift || true
+            run_policy grants "$@"
+            ;;
+        allow)
+            shift || true
+            run_allow "$@"
+            ;;
+        deny)
+            shift || true
+            run_deny "$@"
+            ;;
+        mode)
+            shift || true
+            run_mode "$@"
+            ;;
+        enable)
+            shift || true
+            run_enable "$@"
+            ;;
+        disable)
+            shift || true
+            run_disable "$@"
             ;;
         approval)
             shift || true

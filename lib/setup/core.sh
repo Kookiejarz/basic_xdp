@@ -527,7 +527,10 @@ EOF
     else
         echo "  Interfaces     : ${IFACES[*]}  [${IFACE_SOURCE:-arguments}]"
     fi
-    if [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
+    if [[ ${POLICY_DEFERRED:-0} -eq 1 ]]; then
+        echo "  Backend        : inactive (audit-only)"
+        echo "  Next step      : review with 'sudo axdp discover', then run 'sudo axdp enable'"
+    elif [[ "$ACTIVE_BACKEND" == "xdp" ]]; then
         echo "  Backend        : XDP ($ACTIVE_XDP_MODE mode)"
         echo "  Verification   : every interface program ID"
         echo "  BPF maps       : $BPF_PIN_DIR/"

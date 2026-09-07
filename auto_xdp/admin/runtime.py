@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,6 +145,108 @@ def _iface_xdp_program_id(iface: str) -> int | None:
     return find_xdp(value)
 
 
+def _pinned_xdp_program_id(path: Path) -> int | None:
+    if not path.exists() or not _command_exists("bpftool"):
+        return None
+    result = _run_text(["bpftool", "-j", "prog", "show", "pinned", str(path)])
+    if result.returncode != 0:
+        return None
+    try:
+        value = json.loads(result.stdout)
+        if isinstance(value, list):
+            value = value[0]
+        program_id = value.get("id") if isinstance(value, dict) else None
+    except (IndexError, json.JSONDecodeError):
+        return None
+    return program_id if isinstance(program_id, int) else None
+
+
+def _all_interface_names() -> list[str]:
+    result = _run_text(["ip", "-j", "link", "show"])
+    if result.returncode != 0:
+        return []
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item["ifname"]) for item in value if isinstance(item, dict) and item.get("ifname")]
+
+
+def deactivate_runtime(ctx: RuntimeContext) -> list[str]:
+    """Detach only the pinned Auto XDP generation and remove its nft table."""
+    pin_root = ctx.bpf_pin_dir
+    if not pin_root.is_absolute() or pin_root == Path("/") or len(pin_root.parts) < 3:
+        raise RuntimeError(f"refusing to remove unsafe BPF pin path: {pin_root}")
+    env = _load_env_file(ctx.env_config)
+    interfaces = _configured_ifaces(env)
+    runtime_path = Path(env.get("RUNTIME_STATE", "/etc/auto_xdp/runtime-state.json"))
+    saved_interfaces = _load_json_file(runtime_path).get("interfaces", {})
+    if isinstance(saved_interfaces, dict):
+        interfaces = list(dict.fromkeys([*interfaces, *map(str, saved_interfaces)]))
+    if ctx.interface:
+        interfaces = [ctx.interface]
+    messages: list[str] = []
+
+    pinned_program = ctx.bpf_pin_dir / "prog"
+    expected_id = _pinned_xdp_program_id(pinned_program)
+    attached = {iface: _iface_xdp_program_id(iface) for iface in interfaces}
+    active_ids = {program_id for program_id in attached.values() if program_id is not None}
+    if active_ids and expected_id is None:
+        raise RuntimeError("XDP is attached but the Auto XDP pinned program cannot be identified; refusing to detach it")
+    conflicts = {
+        iface: program_id for iface, program_id in attached.items()
+        if program_id is not None and program_id != expected_id
+    }
+    if conflicts:
+        detail = ", ".join(f"{iface}=program-{program_id}" for iface, program_id in sorted(conflicts.items()))
+        raise RuntimeError(f"non-Auto-XDP programs are attached ({detail}); refusing to detach them")
+    if expected_id is not None and not ctx.interface:
+        for iface in _all_interface_names():
+            if iface not in attached and _iface_xdp_program_id(iface) == expected_id:
+                attached[iface] = expected_id
+
+    for iface, program_id in attached.items():
+        if program_id is None:
+            continue
+        mode = _iface_xdp_state(iface)
+        keyword = "xdpgeneric" if mode == "generic" else "xdpoffload" if mode == "offload" else "xdp"
+        result = _run_text(["ip", "link", "set", "dev", iface, keyword, "off"])
+        if result.returncode != 0 or _iface_xdp_program_id(iface) is not None:
+            raise RuntimeError(f"failed to detach Auto XDP from {iface}: {result.stderr.strip()}")
+        messages.append(f"detached Auto XDP from {iface}")
+
+    backend_marker = ctx.run_state_dir / "backend"
+    active_backend = backend_marker.read_text().strip() if backend_marker.exists() else ""
+    if _command_exists("nft"):
+        present = _run_text(["nft", "list", "table", ctx.nft_family, ctx.nft_table]).returncode == 0
+        if present:
+            result = _run_text(["nft", "delete", "table", ctx.nft_family, ctx.nft_table])
+            if result.returncode != 0:
+                raise RuntimeError(f"failed to remove nftables table: {result.stderr.strip()}")
+            messages.append(f"removed nftables table {ctx.nft_family} {ctx.nft_table}")
+    elif active_backend == "nftables":
+        raise RuntimeError("nft is required to remove the active Auto XDP fallback table")
+
+    if pin_root.exists():
+        try:
+            shutil.rmtree(pin_root)
+        except OSError as exc:
+            raise RuntimeError(f"failed to remove BPF pins {pin_root}: {exc}") from exc
+        messages.append(f"removed BPF pins {pin_root}")
+    for suffix in ("_next", "_rollback"):
+        candidate = Path(f"{pin_root}{suffix}")
+        if candidate.exists():
+            try:
+                shutil.rmtree(candidate)
+            except OSError as exc:
+                raise RuntimeError(f"failed to remove staged BPF pins {candidate}: {exc}") from exc
+    for marker in (backend_marker, ctx.run_state_dir / "xdp_mode"):
+        marker.unlink(missing_ok=True)
+    return messages
+
+
 def _configured_ifaces(env: dict[str, str]) -> list[str]:
     if env.get("IFACES"):
         return env["IFACES"].split()
@@ -170,6 +273,20 @@ def _preferred_backend(env: dict[str, str]) -> str:
     return value if value in {"auto", "xdp", "nftables"} else default
 
 
+def _policy_mode(env: dict[str, str]) -> str:
+    path = Path(env.get("TOML_CONFIG", "/etc/auto_xdp/config.toml"))
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        with path.open("rb") as handle:
+            value = str(tomllib.load(handle).get("policy", {}).get("mode", "audit")).lower()
+    except (ImportError, OSError, ValueError):
+        return "audit"
+    return value if value in {"observe", "audit", "enforce"} else "audit"
+
+
 def detect_backend(ctx: RuntimeContext, interfaces: list[str]) -> str:
     return _detect_backend_impl(
         ctx.bpf_pin_dir, ctx.run_state_dir, interfaces, ctx.nft_family, ctx.nft_table
@@ -178,6 +295,8 @@ def detect_backend(ctx: RuntimeContext, interfaces: list[str]) -> str:
 
 def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
     env = _load_env_file(ctx.env_config)
+    policy_mode = _policy_mode(env)
+    preferred_backend = _preferred_backend(env)
     interfaces = _configured_ifaces(env)
     iface = ctx.interface or (interfaces[0] if interfaces else "") or _ip_default_iface()
     if not iface:
@@ -186,7 +305,12 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
         interfaces = [iface]
 
     check_ifaces = [ctx.interface] if ctx.interface else interfaces
-    backend = detect_backend(ctx, check_ifaces)
+    try:
+        backend = detect_backend(ctx, check_ifaces)
+    except RuntimeError:
+        if policy_mode == "enforce":
+            raise
+        backend = "inactive"
     xdp_mode_path = ctx.run_state_dir / "xdp_mode"
     xdp_mode = xdp_mode_path.read_text().strip() if xdp_mode_path.exists() else "-"
 
@@ -217,8 +341,13 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
             Path(f"{ctx.bpf_pin_dir}_rollback"),
         )
     )
-    if backend == "xdp":
-        attachments_ok = all(value in {"native", "generic"} for value in xdp_attach.values())
+    if backend == "inactive":
+        policy = f"{policy_mode} (data plane inactive)"
+        healthy = clean_generation and all(value in {"off", "missing"} for value in xdp_attach.values())
+    elif backend == "xdp":
+        attachments_ok = all(
+            value in {"native", "generic", "offload"} for value in xdp_attach.values()
+        )
         saved_interfaces = persistent.get("interfaces", {})
         ids_ok = True
         if isinstance(saved_interfaces, dict) and saved_interfaces:
@@ -234,18 +363,18 @@ def collect_backend_report(ctx: RuntimeContext) -> BackendReport:
         schema = _nft_policy_schema(ctx.nft_family, ctx.nft_table)
         policy = f"{ctx.nft_family} {ctx.nft_table} / {schema}"
         healthy = schema == "policy_schema_v2" and clean_generation
-    if persistent:
+    if persistent and backend != "inactive":
         healthy = healthy and bool(persistent.get("healthy", False))
         xdp_mode = str(persistent.get("xdp_mode", xdp_mode))
     generation = str(persistent.get("generation", "legacy"))
-    if release != "legacy" and generation not in {release, "verified"}:
+    if backend != "inactive" and release != "legacy" and generation not in {release, "verified"}:
         healthy = False
     if transition_state:
         healthy = False
 
     return BackendReport(
         backend=backend,
-        preferred_backend=_preferred_backend(env),
+        preferred_backend=preferred_backend,
         interfaces=interfaces,
         xdp_mode=xdp_mode,
         xdp_attach=xdp_attach,

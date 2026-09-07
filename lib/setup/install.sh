@@ -135,6 +135,7 @@ BPFTOOL_BIN="${BPFTOOL_BIN:-}"
 PREFERRED_BACKEND="${REQUESTED_BACKEND}"
 MACHINE_STATE="${MACHINE_STATE}"
 RUNTIME_STATE="${RUNTIME_STATE}"
+APPROVAL_STORE="${APPROVAL_STORE}"
 INSTALL_TRANSACTION_FILE="${INSTALL_TRANSACTION_FILE}"
 RUNTIME_GENERATION="${RELEASE_NAME:-unknown}"
 AUTO_TUNE_QUEUES="1"
@@ -553,11 +554,16 @@ EOF_RELAY_OPENRC
 
 run_initial_sync() {
     info "Running initial sync..."
+    local -a mode_args=()
+    if [[ ${POLICY_DEFERRED:-0} -eq 1 ]]; then
+        mode_args=(--mode "$(configured_policy_mode)")
+    fi
     as_root env \
         "PYTHONPATH=${PYTHON_LIB_DIR}" \
         "$PYTHON3_BIN" "$SYNC_SCRIPT" \
         --config "$TOML_CONFIG" \
-        --backend "$ACTIVE_BACKEND"
+        --backend "$ACTIVE_BACKEND" \
+        "${mode_args[@]}"
 }
 
 run_initial_sync_step() {
@@ -594,7 +600,11 @@ run_initial_sync_step() {
             return 1
         fi
     fi
-    step_ok "$ACTIVE_BACKEND policy verified"
+    if [[ ${POLICY_DEFERRED:-0} -eq 1 ]]; then
+        step_ok "audit-only policy verified"
+    else
+        step_ok "$ACTIVE_BACKEND policy verified"
+    fi
 }
 
 install_runtime_service_step() {

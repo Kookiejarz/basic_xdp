@@ -145,6 +145,7 @@ SOURCE_REVISION=""
 SOURCE_VERSION=""
 MACHINE_STATE="${CONFIG_DIR}/machine-state.json"
 RUNTIME_STATE="${CONFIG_DIR}/runtime-state.json"
+APPROVAL_STORE="${CONFIG_DIR}/approval_requests.json"
 MACHINE_STATE_CANDIDATE=""
 CANDIDATE_TOML_CONFIG=""
 INTERFACE_CONFIG_MODE="auto"
@@ -220,6 +221,7 @@ ACTIVE_XDP_MODE="none"
 XDP_FALLBACK_REASON=""
 REQUESTED_BACKEND="auto"
 PENDING_NFT_CUTOVER=0
+POLICY_DEFERRED=0
 PYTHON3_BIN=""
 CHECK_UPDATES=0
 FORCE=0
@@ -380,7 +382,38 @@ source_setup_lib "lib/setup/release.sh"
 # The backend bring-up: load the XDP/nftables backend, register handlers, and
 # install + start the system service. These steps run the shared
 # runtime library in-process, so they execute as a single privileged unit.
+configured_policy_mode() {
+    PYTHONPATH="${PYTHON_LIB_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "$PYTHON3_BIN" -c '
+from auto_xdp.config import load_toml_config
+import sys
+print(str(load_toml_config(sys.argv[1]).get("policy", {}).get("mode", "audit")).lower())
+' "$TOML_CONFIG"
+}
+
+deactivate_installed_runtime() {
+    PYTHONPATH="${PYTHON_LIB_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "$PYTHON3_BIN" -m auto_xdp.admin.main \
+        --env-config "$CONFIG_FILE" \
+        --bpf-pin-dir "$BPF_PIN_DIR" \
+        --run-state-dir "$RUN_STATE_DIR" \
+        --nft-family "$NFT_FAMILY" \
+        --nft-table "$NFT_TABLE" \
+        deactivate
+}
+
 run_backend_phase() {
+    if [[ "$(configured_policy_mode)" != "enforce" ]]; then
+        POLICY_DEFERRED=1
+        ACTIVE_BACKEND=$(_auto_xdp_resolve_preferred_backend "$TOML_CONFIG" "auto")
+        ACTIVE_XDP_MODE="none"
+        step_begin "Deferring firewall activation until axdp enable"
+        step_ok "audit-only"
+        deactivate_installed_runtime
+        run_initial_sync_step
+        install_runtime_service_step
+        return
+    fi
     deploy_backend_step
     load_configured_slot_handlers_step
     load_configured_port_handlers_step
@@ -398,6 +431,7 @@ _emit_backend_results() {
         printf 'ACTIVE_XDP_MODE=%q\n' "$ACTIVE_XDP_MODE"
         printf 'XDP_FALLBACK_REASON=%q\n' "$XDP_FALLBACK_REASON"
         printf 'REQUESTED_BACKEND=%q\n' "$REQUESTED_BACKEND"
+        printf 'POLICY_DEFERRED=%q\n' "$POLICY_DEFERRED"
     } > "$rf"
 }
 

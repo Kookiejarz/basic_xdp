@@ -1872,8 +1872,8 @@ def _cmd_exposure(args: argparse.Namespace) -> int:
         endpoint = decision.endpoint
         print(f"{endpoint.host_port}/{endpoint.protocol}")
         print(f"  subject: {decision.subject or 'unknown'}")
+        print(f"  owner: {_owner_text(endpoint)}")
         if decision.action == "allow":
-            print(f"  owner: {_owner_text(endpoint)}")
             print(f"  grant: {_grant_label(decision)}")
             print(f"  backend: {backend}")
             print("  status: allowed")
@@ -2109,6 +2109,89 @@ def _cmd_policy_grants(args: argparse.Namespace) -> int:
             )
             profile = grant.get("protection_profile") or "-"
             print(f"  {grant['subject']:<20} {grant['zone']:<10} {grant['protocol'].upper():<5} ports: {ports} resolver: {resolver} profile: {profile}")
+    return 0
+
+
+def _cmd_policy_mode(args: argparse.Namespace) -> int:
+    path, data = _load_config(args.config)
+    policy_config = data.setdefault("policy", {})
+    current = str(policy_config.get("mode", "audit")).lower()
+    if args.mode is None:
+        print(current)
+        return 0
+    policy_config["mode"] = args.mode
+    _write_toml(path, data)
+    print(f"policy.mode={args.mode}")
+    return 0
+
+
+def _service_subject(unit: str, explicit: str) -> tuple[str, str]:
+    unit = unit.strip()
+    if not unit:
+        raise ValueError("systemd service name is required")
+    if not unit.endswith(".service"):
+        unit += ".service"
+    subject = explicit.strip() or unit.removesuffix(".service").replace("@", "-")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", subject):
+        raise ValueError("subject must contain only letters, digits, _, ., or -")
+    return unit, subject
+
+
+def _service_endpoint(value: str) -> tuple[str, int]:
+    try:
+        protocol, raw_port = value.lower().split("/", 1)
+        port = int(raw_port)
+    except (AttributeError, ValueError):
+        raise ValueError("endpoint must be PROTO/PORT, for example tcp/25565") from None
+    if protocol not in {"tcp", "udp", "sctp"} or not 1 <= port <= 65535:
+        raise ValueError("endpoint must use tcp, udp, or sctp and a port from 1 to 65535")
+    return protocol, port
+
+
+def _cmd_allow(args: argparse.Namespace) -> int:
+    unit, subject = _service_subject(args.service, args.subject)
+    protocol, port = _service_endpoint(args.endpoint)
+    profile = args.profile.strip().lower()
+    if profile and profile != "minecraft":
+        raise ValueError(f"unsupported protection profile: {profile}")
+    if profile == "minecraft" and protocol != "tcp":
+        raise ValueError("the minecraft profile requires a TCP endpoint")
+    request = approvals.create_request(
+        _approval_store(args),
+        args.config,
+        subject=subject,
+        zone=args.zone,
+        protocol=protocol,
+        ports=[port],
+        reason=args.reason,
+        systemd_unit=unit,
+        protection_profile=profile,
+        actor=args.actor,
+    )
+    approved = approvals.approve_request(
+        _approval_store(args), args.config, request["id"], actor=args.actor
+    )
+    approvals.reload_daemon()
+    profile_text = f" profile={profile}" if profile else ""
+    print(f"Allowed {unit} {protocol}/{port} zone={args.zone}{profile_text} (approval #{approved['id']})")
+    return 0
+
+
+def _cmd_deny(args: argparse.Namespace) -> int:
+    _unit, subject = _service_subject(args.service, args.subject)
+    protocol, port = _service_endpoint(args.endpoint)
+    denied = approvals.deny_grant(
+        _approval_store(args),
+        args.config,
+        subject=subject,
+        zone=args.zone,
+        protocol=protocol,
+        ports=[port],
+        reason=args.reason,
+        actor=args.actor,
+    )
+    approvals.reload_daemon()
+    print(f"Denied {subject} {protocol}/{port} zone={args.zone} (audit #{denied['id']})")
     return 0
 
 
@@ -2946,6 +3029,28 @@ def build_parser() -> argparse.ArgumentParser:
     grants = policy_sub.add_parser("grants")
     grants.add_argument("--json", action="store_true")
     grants.set_defaults(func=_cmd_policy_grants)
+    policy_mode = policy_sub.add_parser("mode")
+    policy_mode.add_argument("mode", nargs="?", choices=["observe", "audit", "enforce"])
+    policy_mode.set_defaults(func=_cmd_policy_mode)
+
+    allow = subparsers.add_parser("allow")
+    allow.add_argument("service", help="systemd service unit, for example paper.service")
+    allow.add_argument("endpoint", help="PROTO/PORT, for example tcp/25565")
+    allow.add_argument("--zone", default="public")
+    allow.add_argument("--profile", default="")
+    allow.add_argument("--subject", default="")
+    allow.add_argument("--reason", default="local administrator grant")
+    allow.add_argument("--actor")
+    allow.set_defaults(func=_cmd_allow)
+
+    deny = subparsers.add_parser("deny")
+    deny.add_argument("service", help="systemd service unit used by the grant")
+    deny.add_argument("endpoint", help="PROTO/PORT, for example tcp/25565")
+    deny.add_argument("--zone", default="public")
+    deny.add_argument("--subject", default="")
+    deny.add_argument("--reason", default="local administrator denial")
+    deny.add_argument("--actor")
+    deny.set_defaults(func=_cmd_deny)
 
     ports_cmd = subparsers.add_parser("ports")
     ports_cmd.add_argument("--watch", action="store_true")
@@ -2988,8 +3093,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command in {"approval", "approval-api"} and os.geteuid() != 0:
-        print("approval management requires root; try re-running with sudo", file=sys.stderr)
+    if args.command in {"allow", "deny", "approval", "approval-api"} and os.geteuid() != 0:
+        print("policy changes require root; try re-running with sudo", file=sys.stderr)
+        return 77
+    if args.command == "policy" and args.subcommand == "mode" and args.mode is not None and os.geteuid() != 0:
+        print("policy changes require root; try re-running with sudo", file=sys.stderr)
         return 77
     try:
         return int(args.func(args))

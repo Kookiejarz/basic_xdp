@@ -118,6 +118,14 @@ resolve_preferred_backend() {
     _auto_xdp_resolve_preferred_backend "${TOML_CONFIG:-}" "${PREFERRED_BACKEND:-auto}"
 }
 
+resolve_policy_mode() {
+    "$PYTHON3_BIN" -c '
+from auto_xdp.config import load_toml_config
+import sys
+print(str(load_toml_config(sys.argv[1]).get("policy", {}).get("mode", "audit")).lower())
+' "${TOML_CONFIG:-/etc/auto_xdp/config.toml}"
+}
+
 resolve_committed_backend() {
     local state_path="${RUNTIME_STATE:-/etc/auto_xdp/runtime-state.json}"
     [[ -f "$state_path" ]] || return 1
@@ -139,7 +147,7 @@ run_sync_script() {
     local mode="$1"
     shift || true
     local backend
-    backend=$(cat "${RUN_STATE_DIR}/backend")
+    backend=$(cat "${RUN_STATE_DIR}/backend" 2>/dev/null || resolve_preferred_backend)
 
     if [[ "$mode" == "watch" ]]; then
         exec "$PYTHON3_BIN" "$SYNC_SCRIPT" --watch --backend "$backend" "$@"
@@ -335,8 +343,16 @@ select_backend() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     if [[ "${1:-}" == "--sync-once" ]]; then
         shift
+        if [[ "$(resolve_policy_mode)" != "enforce" ]]; then
+            run_sync_script once "$@"
+        fi
         select_backend
         run_sync_script once "$@"
+    fi
+
+    if [[ "$(resolve_policy_mode)" != "enforce" ]]; then
+        rm -f "${RUN_STATE_DIR}/backend" "${RUN_STATE_DIR}/xdp_mode"
+        run_sync_script watch
     fi
 
     select_backend

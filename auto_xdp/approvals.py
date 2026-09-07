@@ -20,6 +20,9 @@ _STATUSES = {"pending", "approved", "rejected", "revoked"}
 
 
 def store_path(run_state_dir: str | Path) -> Path:
+    configured = os.environ.get("AUTO_XDP_APPROVAL_STORE")
+    if configured:
+        return Path(configured)
     return Path(run_state_dir) / "approval_requests.json"
 
 
@@ -337,6 +340,70 @@ def revoke_request(path: Path, config_path: str | Path, request_id: int, *, acto
         request.update({"status": "revoked", "revoker": _actor(actor), "revoked_at": time.time()})
         state["revision"] = int(state["revision"]) + 1
         _history(state, request, "revoke", request["revoker"])
+        _save(path, state)
+        return dict(request)
+
+
+def deny_grant(
+    path: Path,
+    config_path: str | Path,
+    *,
+    subject: str,
+    zone: str,
+    protocol: str,
+    ports: list[int],
+    reason: str,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Remove selected ports while retaining the same audit trail as approvals."""
+    from auto_xdp.admin_cli import _load_toml, _write_toml
+
+    requested_ports = _ports(ports)
+    protocol = protocol.lower()
+    if protocol not in _PROTOCOLS:
+        raise ValueError(f"unsupported protocol: {protocol}")
+    if not reason.strip():
+        raise ValueError("denial reason is required")
+
+    with _locked(path) as state:
+        config_path = Path(config_path)
+        config = _load_toml(config_path)
+        protocol_spec = (
+            config.get("subjects", {})
+            .get(subject, {})
+            .get("exposure", {})
+            .get(zone, {})
+            .get(protocol, {})
+        )
+        if not isinstance(protocol_spec, dict):
+            raise ValueError(f"no grant found for {subject} {zone} {protocol}")
+        current = {int(port) for port in protocol_spec.get("ports", [])}
+        removed = sorted(current & set(requested_ports))
+        if not removed:
+            raise ValueError(f"none of the requested ports are granted to {subject}")
+        protocol_spec["ports"] = sorted(current - set(removed))
+        _write_toml(config_path, config)
+
+        who = _actor(actor)
+        request_id = int(state["next_id"])
+        request = {
+            "id": request_id,
+            "subject": subject,
+            "zone": zone,
+            "protocol": protocol,
+            "ports": requested_ports,
+            "applied_ports": removed,
+            "reason": reason.strip(),
+            "requester": who,
+            "revoker": who,
+            "requested_at": time.time(),
+            "revoked_at": time.time(),
+            "status": "revoked",
+        }
+        state["next_id"] = request_id + 1
+        state["revision"] = int(state["revision"]) + 1
+        state["requests"].append(request)
+        _history(state, request, "deny", who)
         _save(path, state)
         return dict(request)
 

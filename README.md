@@ -139,6 +139,21 @@ sudo axdp stats
 sudo axdp tui
 ```
 
+Fresh installs remain audit-only until explicitly enabled. Review the live
+inventory, grant required services (SSH first on remote hosts), then activate:
+
+```bash
+sudo axdp discover
+sudo axdp allow ssh.service tcp/22 --zone public
+sudo axdp allow paper.service tcp/25565 --zone public --profile minecraft
+sudo axdp enable
+```
+
+All persistent policy changes go through `axdp`; BPF maps and the managed
+nftables table are derived runtime state. Use `sudo axdp deny SERVICE PROTO/PORT`
+to remove a grant and `sudo axdp disable` to detach the managed data plane while
+continuing service discovery in audit mode.
+
 A quick check of service-aware synchronization:
 
 ```bash
