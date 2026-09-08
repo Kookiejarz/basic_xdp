@@ -472,6 +472,7 @@ User=root
 Group=${RELAY_GROUP}
 RuntimeDirectory=auto_xdp
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target

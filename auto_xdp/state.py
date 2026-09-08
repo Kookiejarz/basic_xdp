@@ -20,6 +20,9 @@ class RuntimeEndpoint:
     container_id: str = ""
     container_name: str = ""
     container_labels: dict[str, str] = field(default_factory=dict)
+    # Socket inode (Linux) or pid/fd pair (fallback), used to distinguish a
+    # restarted listener even when debounce hides the closed intermediate state.
+    instance_id: str = ""
 
     @property
     def key(self) -> tuple[str, str, int, str]:
@@ -75,7 +78,9 @@ class DesiredState:
     exposure_decisions: list[ExposureDecision] = field(default_factory=list)
     zone_tcp_ports: dict[str, set[int]] = field(default_factory=dict)
     zone_udp_ports: dict[str, set[int]] = field(default_factory=dict)
-    tcp_protection_profiles: dict[int, str] = field(default_factory=dict)
+    # Endpoint protection identity is zone-scoped; a port is only transport
+    # addressing and may intentionally use a different policy on another NIC.
+    tcp_protection_profiles: dict[tuple[str, int], str] = field(default_factory=dict)
     xdp_runtime_config: tuple[int, int, int, int, int, int, int, int] = (
         0,
         0,

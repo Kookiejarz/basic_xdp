@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import socket
+import secrets
 import shutil
 import subprocess
 import sys
+from typing import Mapping
 
 from auto_xdp import config as cfg
+from auto_xdp.install_state import atomic_write_json
 from auto_xdp.backends.base import BackendStatus, PortBackend
 from auto_xdp.abuseipdb import AbuseIPDBSyncer, BpfRiskMaps
 from auto_xdp.bpf.syscall import map_id, obj_get, probe_inner_map_support
@@ -43,7 +47,11 @@ log = logging.getLogger(__name__)
 RateLimitMap = BpfSynRatePortsMap | BpfPortPolicyViewMap
 
 _MINECRAFT_PROFILE = "minecraft"
+_PROFILE_IDS = {_MINECRAFT_PROFILE: 1}
 _PROFILE_STATE_DIR = "profile-handlers"
+_POLICY_GENERATION_STATE = "policy-generations.json"
+_TCP_ENDPOINT_VALUE_FORMAT = "=IIQQ"
+_TCP_ALLOW = 1
 
 
 def _compute_cfg_flags(desired: DesiredState) -> int:
@@ -143,10 +151,13 @@ class XdpBackend(PortBackend):
 
     def __init__(self) -> None:
         self.last_apply_failures: int = 0
-        self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH)
+        self.tcp_map = BpfArrayMap(cfg.TCP_MAP_PATH, _TCP_ENDPOINT_VALUE_FORMAT)
         self.udp_map = BpfArrayMap(cfg.UDP_MAP_PATH)
-        self.tcp_zone_map = BpfZonePortMap(cfg.TCP_ZONE_MAP_PATH)
+        self.tcp_zone_map = BpfZonePortMap(cfg.TCP_ZONE_MAP_PATH, _TCP_ENDPOINT_VALUE_FORMAT)
         self.udp_zone_map = BpfZonePortMap(cfg.UDP_ZONE_MAP_PATH)
+        self.tcp_profile_map = BpfArrayMap(cfg.TCP_PROFILE_HANDLER_MAP_PATH)
+        self._policy_generations = self._load_policy_generations()
+        self._persisted_policy_generations = dict(self._policy_generations)
         self.trusted_map = BpfTrustedMaps(cfg.TRUSTED_IPS_MAP_PATH4, cfg.TRUSTED_IPS_MAP_PATH6)
         self._tcp_policy_map: BpfPortPolicyMap | None = None
         self._udp_policy_map: BpfPortPolicyMap | None = None
@@ -241,10 +252,9 @@ class XdpBackend(PortBackend):
         except OSError as exc:
             log.debug("AbuseIPDB maps unavailable (%s); AbuseIPDB blocking inactive.", exc)
 
-    def _desired_zone_entries(self, desired: DesiredState, proto: str) -> set[tuple[int, int]]:
-        ports_by_zone = desired.zone_tcp_ports if proto == "tcp" else desired.zone_udp_ports
-        entries: set[tuple[int, int]] = set()
-        for zone, ports in ports_by_zone.items():
+    def _desired_udp_zone_values(self, desired: DesiredState) -> dict[tuple[int, int], int]:
+        values: dict[tuple[int, int], int] = {}
+        for zone, ports in desired.zone_udp_ports.items():
             for interface in cfg.ZONES.get(zone, {}).get("interfaces", []):
                 if interface == "*":
                     continue
@@ -253,8 +263,129 @@ class XdpBackend(PortBackend):
                 except OSError:
                     log.warning("Configured zone interface does not exist: %s", interface)
                     continue
-                entries.update((ifindex, port) for port in ports)
-        return entries
+                values.update(((ifindex, port), 1) for port in ports)
+        for zone, spec in cfg.ZONES.items():
+            for interface in spec.get("interfaces", []):
+                if interface == "*":
+                    continue
+                try:
+                    ifindex = socket.if_nametoindex(interface)
+                except OSError:
+                    continue
+                for port in desired.udp_ports:
+                    values.setdefault((ifindex, port), 0)
+        return values
+
+    def _policy_fingerprint(
+        self, desired: DesiredState, endpoint: tuple[str, int], profile: str
+    ) -> str:
+        zone, port = endpoint
+        material = [
+            (
+                item.endpoint.host_address,
+                item.endpoint.bind_scope,
+                item.endpoint.attribution_state,
+                item.endpoint.attribution_source,
+                item.endpoint.container_runtime,
+                item.endpoint.container_id,
+                item.endpoint.instance_id,
+                item.subject,
+                item.protection_profile,
+            )
+            for item in desired.exposure_decisions
+            if item.action == "allow"
+            and item.endpoint.protocol == "tcp"
+            and item.endpoint.ingress_zone == zone
+            and item.endpoint.host_port == port
+        ]
+        endpoint_acl = sorted(
+            (protocol, cidr, tuple(sorted(ports)))
+            for (protocol, cidr), ports in desired.acl_rules.items()
+            if protocol == "tcp" and port in ports
+        )
+        payload = (
+            zone,
+            port,
+            profile,
+            tuple(cfg.ZONES.get(zone, {}).get("interfaces", [])),
+            desired.tcp_syn_rate_limits.get(port),
+            desired.tcp_syn_agg_rate_limits.get(port),
+            endpoint_acl,
+            desired.bogon_filter_enabled,
+            sorted(material),
+        )
+        return hashlib.sha256(repr(payload).encode()).hexdigest()
+
+    def _endpoint_generation(
+        self, desired: DesiredState, endpoint: tuple[str, int], profile: str
+    ) -> int:
+        fingerprint = self._policy_fingerprint(desired, endpoint, profile)
+        current = self._policy_generations.get(endpoint)
+        if current is not None and current[0] == fingerprint:
+            return current[1]
+        generation = secrets.randbits(64) or 1
+        self._policy_generations[endpoint] = (fingerprint, generation)
+        return generation
+
+    @staticmethod
+    def _profile_generation(object_path: Path) -> int:
+        digest = hashlib.sha256(object_path.read_bytes()).digest()
+        return int.from_bytes(digest[:8], "little") or 1
+
+    def _tcp_endpoint_value(
+        self,
+        desired: DesiredState,
+        endpoint: tuple[str, int],
+        profile_generation: int,
+    ) -> tuple[int, int, int, int]:
+        profile = desired.tcp_protection_profiles.get(endpoint, "")
+        if not profile:
+            return (_TCP_ALLOW, 0, 0, 0)
+        return (
+            _TCP_ALLOW,
+            _PROFILE_IDS[profile],
+            self._endpoint_generation(desired, endpoint, profile),
+            profile_generation,
+        )
+
+    def _desired_tcp_values(
+        self, desired: DesiredState, profile_generation: int
+    ) -> tuple[dict[int, tuple[int, int, int, int]], dict[tuple[int, int], tuple[int, int, int, int]]]:
+        active_endpoints = set(desired.tcp_protection_profiles)
+        for endpoint in set(self._policy_generations) - active_endpoints:
+            self._policy_generations.pop(endpoint, None)
+
+        global_values = {
+            port: self._tcp_endpoint_value(
+                desired, ("public", port), profile_generation
+            )
+            for port in desired.tcp_ports
+        }
+        zone_values: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+        for zone, ports in desired.zone_tcp_ports.items():
+            for interface in cfg.ZONES.get(zone, {}).get("interfaces", []):
+                if interface == "*":
+                    continue
+                try:
+                    ifindex = socket.if_nametoindex(interface)
+                except OSError:
+                    log.warning("Configured zone interface does not exist: %s", interface)
+                    continue
+                for port in ports:
+                    zone_values[(ifindex, port)] = self._tcp_endpoint_value(
+                        desired, (zone, port), profile_generation
+                    )
+        for zone, spec in cfg.ZONES.items():
+            for interface in spec.get("interfaces", []):
+                if interface == "*":
+                    continue
+                try:
+                    ifindex = socket.if_nametoindex(interface)
+                except OSError:
+                    continue
+                for port in desired.tcp_ports:
+                    zone_values.setdefault((ifindex, port), (0, 0, 0, 0))
+        return global_values, zone_values
 
     def _zone_state(self, zone_map: BpfZonePortMap) -> dict[str, set[int]]:
         active = zone_map.active_entries()
@@ -276,15 +407,30 @@ class XdpBackend(PortBackend):
     def _apply_zone_delta(
         self,
         zone_map: BpfZonePortMap,
-        desired_entries: set[tuple[int, int]],
+        desired_values: Mapping[tuple[int, int], int | tuple[int, ...]],
         dry_run: bool,
         additions: bool,
     ) -> int:
         failures = 0
-        current = zone_map.active_entries()
-        entries = (desired_entries - current) if additions else (current - desired_entries)
+        current = zone_map.entries()
+        desired_entries = set(desired_values)
+        changed = {
+            key for key in current & desired_entries
+            if hasattr(zone_map, "value")
+            and zone_map.value(*key)
+            != (
+                (desired_values[key],)
+                if isinstance(desired_values[key], int)
+                else desired_values[key]
+            )
+        }
+        entries = ((desired_entries - current) | changed) if additions else (current - desired_entries)
         for ifindex, port in sorted(entries):
-            ok = zone_map.set(ifindex, port, dry_run=dry_run) if additions else zone_map.delete(ifindex, port, dry_run)
+            ok = (
+                zone_map.set(ifindex, port, desired_values[(ifindex, port)], dry_run)
+                if additions
+                else zone_map.delete(ifindex, port, dry_run)
+            )
             if not ok:
                 failures += 1
             elif not dry_run:
@@ -299,9 +445,57 @@ class XdpBackend(PortBackend):
         return Path(__file__).resolve().parents[2]
 
     @staticmethod
-    def _profile_marker(port: int) -> Path:
+    def _profile_marker() -> Path:
         run_dir = Path(os.environ.get("RUN_STATE_DIR", "/run/auto_xdp"))
-        return run_dir / _PROFILE_STATE_DIR / "tcp" / str(port)
+        return run_dir / _PROFILE_STATE_DIR / "tcp" / _MINECRAFT_PROFILE
+
+    @staticmethod
+    def _policy_generation_state_path() -> Path:
+        return Path(os.environ.get("RUN_STATE_DIR", "/run/auto_xdp")) / _POLICY_GENERATION_STATE
+
+    def _load_policy_generations(self) -> dict[tuple[str, int], tuple[str, int]]:
+        try:
+            data = json.loads(self._policy_generation_state_path().read_text(encoding="utf-8"))
+            if data.get("schema") != 1 or not isinstance(data.get("entries"), list):
+                return {}
+            result: dict[tuple[str, int], tuple[str, int]] = {}
+            for item in data["entries"]:
+                zone = str(item["zone"])
+                port = int(item["port"])
+                fingerprint = str(item["fingerprint"])
+                generation = int(item["generation"])
+                if zone and 1 <= port <= 65535 and fingerprint and generation > 0:
+                    result[(zone, port)] = (fingerprint, generation)
+            return result
+        except (AttributeError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def _save_policy_generations(self) -> None:
+        if self._policy_generations == getattr(
+            self, "_persisted_policy_generations", self._policy_generations
+        ):
+            return
+        try:
+            atomic_write_json(
+                self._policy_generation_state_path(),
+                {
+                    "schema": 1,
+                    "entries": [
+                        {
+                            "zone": zone,
+                            "port": port,
+                            "fingerprint": fingerprint,
+                            "generation": generation,
+                        }
+                        for (zone, port), (fingerprint, generation)
+                        in sorted(self._policy_generations.items())
+                    ],
+                },
+                mode=0o600,
+            )
+            self._persisted_policy_generations = dict(self._policy_generations)
+        except OSError as exc:
+            log.warning("Cannot persist policy generations: %s", exc)
 
     @staticmethod
     def _pinned_program_id(pin: Path) -> int | None:
@@ -325,7 +519,7 @@ class XdpBackend(PortBackend):
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
-    def _profile_command(self, action: str, port: int, object_path: Path | None = None) -> bool:
+    def _profile_command(self, action: str, profile_id: int, object_path: Path | None = None) -> bool:
         install_dir = self._profile_install_dir()
         command = [
             sys.executable,
@@ -337,14 +531,12 @@ class XdpBackend(PortBackend):
             cfg.BPF_PIN_DIR,
             "--install-dir",
             str(install_dir),
-            "port-handler",
+            "profile-handler",
             action,
-            "tcp",
-            str(port),
+            str(profile_id),
         ]
         if object_path is not None:
             command.append(str(object_path))
-        command.append("--no-config-update")
         try:
             result = subprocess.run(command, capture_output=True, text=True)
         except OSError as exc:
@@ -353,111 +545,126 @@ class XdpBackend(PortBackend):
         if result.returncode == 0:
             return True
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-        log.error("Minecraft profile handler %s failed for TCP/%d: %s", action, port, detail)
+        log.error("Minecraft profile handler %s failed for profile %d: %s", action, profile_id, detail)
         return False
 
-    def _managed_profile_handlers(self) -> dict[int, tuple[str, int]]:
-        root = self._profile_marker(1).parent
-        managed: dict[int, tuple[str, int]] = {}
-        if not root.is_dir():
-            return managed
+    def _managed_profile_handler(self) -> tuple[int, int] | None:
         try:
-            markers = list(root.iterdir())
-        except OSError:
-            return managed
-        for marker in markers:
-            try:
-                port = int(marker.name)
-                value = json.loads(marker.read_text(encoding="utf-8"))
-                profile = str(value["profile"])
-                program_id = int(value["program_id"])
-            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if 1 <= port <= 65535:
-                managed[port] = (profile, program_id)
-        return managed
+            value = json.loads(self._profile_marker().read_text(encoding="utf-8"))
+            if (
+                value["profile"] != _MINECRAFT_PROFILE
+                or int(value["profile_id"]) != _PROFILE_IDS[_MINECRAFT_PROFILE]
+            ):
+                return None
+            program_id = int(value["program_id"])
+            profile_generation = int(value["profile_generation"])
+            if program_id <= 0 or profile_generation <= 0:
+                return None
+            return program_id, profile_generation
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
 
-    def _ensure_profile_handlers(self, desired: dict[int, str], dry_run: bool) -> set[int]:
-        failures: set[int] = set()
-        managed = self._managed_profile_handlers()
+    def _ensure_profile_handlers(
+        self,
+        desired: dict[tuple[str, int], str],
+        profile_generation: int,
+        dry_run: bool,
+    ) -> tuple[set[tuple[str, int]], int]:
+        failures: set[tuple[str, int]] = set()
         install_dir = self._profile_install_dir()
         object_path = install_dir / "handlers" / f"{_MINECRAFT_PROFILE}_handler.o"
-
-        for port, profile in sorted(desired.items()):
+        for endpoint, profile in desired.items():
             if profile != _MINECRAFT_PROFILE:
-                log.error("Unsupported TCP protection profile %r on port %d", profile, port)
-                failures.add(port)
-                continue
-            live_pin = Path(cfg.BPF_PIN_DIR) / "port_handlers" / "tcp" / str(port) / "prog"
-            live_id = self._pinned_program_id(live_pin)
-            marker = self._profile_marker(port)
-            ownership = managed.get(port)
-            if ownership == (profile, live_id):
-                continue
-            if ownership is not None and not dry_run:
-                try:
-                    marker.unlink()
-                except OSError:
-                    pass
-            if live_id is not None:
-                log.error(
-                    "TCP/%d already has a non-profile handler; keeping Minecraft exposure closed",
-                    port,
-                )
-                failures.add(port)
-                continue
-            if dry_run:
-                log.info("Would load Minecraft profile handler for TCP/%d", port)
-                continue
-            if not object_path.is_file():
-                log.error("Minecraft profile object is missing: %s", object_path)
-                failures.add(port)
-                continue
-            if not self._profile_command("load", port, object_path):
-                failures.add(port)
-                continue
-            program_id = self._pinned_program_id(live_pin)
-            if program_id is None:
-                self._profile_command("unload", port)
-                failures.add(port)
-                continue
-            try:
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.write_text(
-                    json.dumps({"profile": profile, "program_id": program_id}),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                log.error("Cannot record Minecraft profile ownership for TCP/%d: %s", port, exc)
-                self._profile_command("unload", port)
-                failures.add(port)
-                continue
-            log.info("Minecraft protection enabled for TCP/%d", port)
-        return failures
+                log.error("Unsupported TCP protection profile %r on %s/%d", profile, *endpoint)
+                failures.add(endpoint)
+        if failures:
+            return set(desired), 0
+        if not desired:
+            return set(), 0
+        if not object_path.is_file():
+            log.error("Minecraft profile object is missing: %s", object_path)
+            return set(desired), 0
 
-    def _remove_stale_profile_handlers(self, desired: dict[int, str], dry_run: bool) -> int:
-        failures = 0
-        for port, (profile, program_id) in sorted(self._managed_profile_handlers().items()):
-            if desired.get(port) == profile:
-                continue
-            marker = self._profile_marker(port)
-            live_pin = Path(cfg.BPF_PIN_DIR) / "port_handlers" / "tcp" / str(port) / "prog"
-            if dry_run:
-                log.info("Would unload stale Minecraft profile handler from TCP/%d", port)
-                continue
-            if self._pinned_program_id(live_pin) == program_id:
-                if not self._profile_command("unload", port):
-                    failures += 1
-                    continue
-                log.info("Minecraft protection disabled for TCP/%d", port)
+        profile_id = _PROFILE_IDS[_MINECRAFT_PROFILE]
+        live_pin = Path(cfg.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
+        live_id = self._pinned_program_id(live_pin)
+        managed = self._managed_profile_handler()
+        self.tcp_profile_map.verify()
+        array_value = self.tcp_profile_map.value(profile_id)
+        array_id = array_value[0] if array_value else None
+        if managed == (live_id, profile_generation) and array_id == live_id:
+            return failures, profile_generation
+        if dry_run:
+            log.info("Would load Minecraft profile handler ID %d", profile_id)
+            return failures, profile_generation
+        if not self._profile_command("load", profile_id, object_path):
+            return set(desired), 0
+        live_id = self._pinned_program_id(live_pin)
+        self.tcp_profile_map.refresh()
+        array_value = self.tcp_profile_map.value(profile_id)
+        if live_id is None or array_value is None or array_value[0] != live_id:
+            self._profile_command("unload", profile_id)
+            return set(desired), 0
+        marker = self._profile_marker()
+        try:
+            atomic_write_json(
+                marker,
+                {
+                    "profile": _MINECRAFT_PROFILE,
+                    "profile_id": profile_id,
+                    "program_id": live_id,
+                    "profile_generation": profile_generation,
+                },
+                mode=0o600,
+            )
+        except OSError as exc:
+            log.error("Cannot record Minecraft profile ownership: %s", exc)
+            self._profile_command("unload", profile_id)
+            return set(desired), 0
+        log.info("Minecraft protection profile %d enabled", profile_id)
+        return failures, profile_generation
+
+    def _remove_stale_profile_handlers(
+        self, desired: dict[tuple[str, int], str], dry_run: bool
+    ) -> int:
+        if desired:
+            return 0
+        profile_map = getattr(self, "tcp_profile_map", None)
+        if profile_map is None:
+            return 0
+        profile_id = _PROFILE_IDS[_MINECRAFT_PROFILE]
+        live_pin = Path(cfg.BPF_PIN_DIR) / "profile_handlers" / "tcp" / str(profile_id) / "prog"
+        live_id = self._pinned_program_id(live_pin)
+        profile_map.verify()
+        array_value = profile_map.value(profile_id)
+        array_id = array_value[0] if array_value else None
+        if live_id is None and array_id is None:
             try:
-                marker.unlink()
+                self._profile_marker().unlink()
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                log.warning("Cannot remove stale profile marker %s: %s", marker, exc)
-                failures += 1
-        return failures
+                log.warning("Cannot remove stale profile marker: %s", exc)
+                return 1
+            return 0
+        if live_id is None or array_id != live_id:
+            log.error("Cannot safely remove inconsistent Minecraft profile handler state")
+            return 1
+        if dry_run:
+            log.info("Would unload stale Minecraft profile handler ID %d", profile_id)
+            return 0
+        if not self._profile_command("unload", profile_id):
+            return 1
+        profile_map.refresh()
+        try:
+            self._profile_marker().unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Cannot remove stale profile marker: %s", exc)
+            return 1
+        log.info("Minecraft protection profile %d disabled", profile_id)
+        return 0
 
     def is_stale(self) -> bool:
         """Return True if the pinned tcp_whitelist map has been replaced since init."""
@@ -474,6 +681,8 @@ class XdpBackend(PortBackend):
     def close(self) -> None:
         self.tcp_map.close()
         self.udp_map.close()
+        if hasattr(self, "tcp_profile_map"):
+            self.tcp_profile_map.close()
         for zone_map in (getattr(self, "tcp_zone_map", None), getattr(self, "udp_zone_map", None)):
             if zone_map is not None:
                 zone_map.close()
@@ -540,6 +749,8 @@ class XdpBackend(PortBackend):
         total = 0
         total += self.tcp_map.verify()
         total += self.udp_map.verify()
+        if hasattr(self, "tcp_profile_map"):
+            total += self.tcp_profile_map.verify()
         for zone_map in (getattr(self, "tcp_zone_map", None), getattr(self, "udp_zone_map", None)):
             if zone_map is not None:
                 total += zone_map.verify()
@@ -571,7 +782,8 @@ class XdpBackend(PortBackend):
         desired_state: DesiredState,
         observed_state: ObservedState | None = None,
     ) -> None:
-        self.last_apply_failures = 0
+        self.last_apply_failures = getattr(self, "_precondition_failures", 0)
+        self._precondition_failures = 0
         changed = False
         for port in sorted(plan.tcp_ports_to_remove):
             if self._ok(self.tcp_map.set(port, 0, dry_run)):
@@ -725,16 +937,8 @@ class XdpBackend(PortBackend):
                     "failed (%d map update failure(s)).",
                     self.last_apply_failures,
                 )
-        else:
-            for port in sorted(plan.tcp_ports_to_add):
-                if self._ok(self.tcp_map.set(port, 1, dry_run)):
-                    log.debug("TCP +%d", port)
-                    changed = True
-
-            for port in sorted(plan.udp_ports_to_add):
-                if self._ok(self.udp_map.set(port, 1, dry_run)):
-                    log.debug("UDP +%d", port)
-                    changed = True
+        elif not getattr(self, "_defer_global_admission", False):
+            self._apply_global_admission(plan, dry_run)
 
         if self.last_apply_failures and not dry_run:
             log.warning(
@@ -743,53 +947,136 @@ class XdpBackend(PortBackend):
                 "" if self.last_apply_failures == 1 else "s",
             )
 
+    def _apply_global_admission(self, plan: ReconcilePlan, dry_run: bool) -> None:
+        tcp_values = getattr(self, "_desired_tcp_global_values", {})
+        for port in sorted(plan.tcp_ports_to_add):
+            value = tcp_values.get(port, (_TCP_ALLOW, 0, 0, 0))
+            if self._ok(self.tcp_map.set(port, value, dry_run)):
+                log.debug("TCP +%d", port)
+        for port in sorted(plan.udp_ports_to_add):
+            if self._ok(self.udp_map.set(port, 1, dry_run)):
+                log.debug("UDP +%d", port)
+
     def reconcile(
         self,
         desired_state: DesiredState,
         dry_run: bool,
         observed_state: ObservedState | None = None,
     ) -> None:
-        failed_profile_ports = self._ensure_profile_handlers(
+        if not hasattr(self, "_policy_generations"):
+            self._policy_generations = {}
+        if not hasattr(self, "_persisted_policy_generations"):
+            self._persisted_policy_generations = dict(self._policy_generations)
+        self.last_apply_failures = 0
+
+        install_dir = self._profile_install_dir()
+        profile_object = install_dir / "handlers" / f"{_MINECRAFT_PROFILE}_handler.o"
+        tentative_profile_generation = (
+            self._profile_generation(profile_object) if profile_object.is_file() else 0
+        )
+        desired_global, desired_zone = self._desired_tcp_values(
+            desired_state, tentative_profile_generation
+        )
+        desired_udp_zone = self._desired_udp_zone_values(desired_state)
+
+        # Policy/profile replacement is close-before-open.  Removing the old
+        # admission also guarantees the base reconcile sees the endpoint as an
+        # addition and writes the complete new generation atomically.
+        for port in self.tcp_map.active_ports() & set(desired_global):
+            current = self.tcp_map.value(port) if hasattr(self.tcp_map, "value") else None
+            if current is not None and current != desired_global[port]:
+                self._ok(self.tcp_map.set(port, (0, 0, 0, 0), dry_run))
+        tcp_zone_map = getattr(self, "tcp_zone_map", None)
+        if tcp_zone_map is not None:
+            for key in tcp_zone_map.entries() & set(desired_zone):
+                current = tcp_zone_map.value(*key) if hasattr(tcp_zone_map, "value") else None
+                if current is not None and current != desired_zone[key]:
+                    self._ok(tcp_zone_map.set(*key, (0, 0, 0, 0), dry_run=dry_run))
+            for key, tcp_value in desired_zone.items():
+                if tcp_zone_map.value(*key) != tcp_value and key[1] in desired_global:
+                    self._ok(self.tcp_map.set(key[1], (0, 0, 0, 0), dry_run))
+        udp_zone_map = getattr(self, "udp_zone_map", None)
+        if udp_zone_map is not None:
+            for key in udp_zone_map.entries() & set(desired_udp_zone):
+                current = udp_zone_map.value(*key) if hasattr(udp_zone_map, "value") else None
+                if current is not None and current != (desired_udp_zone[key],):
+                    self._ok(udp_zone_map.set(*key, 0, dry_run=dry_run))
+            for key, udp_value in desired_udp_zone.items():
+                if udp_zone_map.value(*key) != (udp_value,) and key[1] in desired_state.udp_ports:
+                    self._ok(self.udp_map.set(key[1], 0, dry_run))
+
+        failed_profile_endpoints, profile_generation = self._ensure_profile_handlers(
             desired_state.tcp_protection_profiles,
+            tentative_profile_generation,
             dry_run,
         )
         effective_desired = desired_state
-        if failed_profile_ports:
+        if failed_profile_endpoints:
             effective_desired = replace(
                 desired_state,
-                tcp_ports=desired_state.tcp_ports - failed_profile_ports,
+                tcp_ports={
+                    port for port in desired_state.tcp_ports
+                    if ("public", port) not in failed_profile_endpoints
+                },
                 zone_tcp_ports={
-                    zone: ports - failed_profile_ports
+                    zone: {
+                        port for port in ports
+                        if (zone, port) not in failed_profile_endpoints
+                    }
                     for zone, ports in desired_state.zone_tcp_ports.items()
-                    if ports - failed_profile_ports
+                    if any((zone, port) not in failed_profile_endpoints for port in ports)
+                },
+                tcp_protection_profiles={
+                    endpoint: profile
+                    for endpoint, profile in desired_state.tcp_protection_profiles.items()
+                    if endpoint not in failed_profile_endpoints
                 },
             )
 
-        self.last_apply_failures = 0
-        zone_maps = (
-            (getattr(self, "tcp_zone_map", None), self._desired_zone_entries(effective_desired, "tcp")),
-            (getattr(self, "udp_zone_map", None), self._desired_zone_entries(effective_desired, "udp")),
+        self._desired_tcp_global_values, tcp_zone_values = self._desired_tcp_values(
+            effective_desired, profile_generation
         )
+        udp_zone_values = self._desired_udp_zone_values(effective_desired)
+
+        tcp_zone_map = getattr(self, "tcp_zone_map", None)
+        udp_zone_map = getattr(self, "udp_zone_map", None)
         zone_failures = 0
-        if not zone_failures:
-            zone_failures += sum(
-                self._apply_zone_delta(zone_map, entries, dry_run, additions=False)
-                for zone_map, entries in zone_maps if zone_map is not None
+        if tcp_zone_map is not None:
+            zone_failures += self._apply_zone_delta(
+                tcp_zone_map, tcp_zone_values, dry_run, additions=False
             )
-        super().reconcile(effective_desired, dry_run, observed_state)
-        self.last_apply_failures += len(failed_profile_ports)
-        if not zone_failures and not self.last_apply_failures:
-            zone_failures += (
-                sum(
-                    self._apply_zone_delta(zone_map, entries, dry_run, additions=True)
-                    for zone_map, entries in zone_maps if zone_map is not None
+        if udp_zone_map is not None:
+            zone_failures += self._apply_zone_delta(
+                udp_zone_map, udp_zone_values, dry_run, additions=False
+            )
+        self._precondition_failures = self.last_apply_failures + zone_failures
+        self._defer_global_admission = True
+        try:
+            super().reconcile(effective_desired, dry_run, observed_state)
+        finally:
+            self._defer_global_admission = False
+        self.last_apply_failures += len(failed_profile_endpoints)
+        if not self.last_apply_failures:
+            if tcp_zone_map is not None:
+                self.last_apply_failures += self._apply_zone_delta(
+                    tcp_zone_map, tcp_zone_values, dry_run, additions=True
                 )
+            if udp_zone_map is not None:
+                self.last_apply_failures += self._apply_zone_delta(
+                    udp_zone_map, udp_zone_values, dry_run, additions=True
+                )
+        if not self.last_apply_failures:
+            admission_plan = ReconcilePlan(
+                tcp_ports_to_add=effective_desired.tcp_ports - self.tcp_map.active_ports(),
+                udp_ports_to_add=effective_desired.udp_ports - self.udp_map.active_ports(),
             )
-        self.last_apply_failures += zone_failures
+            self._apply_global_admission(admission_plan, dry_run)
         self.last_apply_failures += self._remove_stale_profile_handlers(
             desired_state.tcp_protection_profiles,
             dry_run,
         )
+        if not dry_run:
+            self._save_policy_generations()
 
     def _apply_acl_delta(self, plan: ReconcilePlan, dry_run: bool) -> None:
         if self.acl_maps is None:

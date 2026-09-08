@@ -10,12 +10,13 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "xdp_slot_ctx.h"
+#include "xdp_profile_ctx.h"
+#include "counters.h"
+#include "flow_keys.h"
 #include "map_sizes.h"
 
-#define CT_FAMILY_IPV4 2
-#define CT_FAMILY_IPV6 10
-
 #define MC_TIMEOUT_NS (15ULL * 1000000000ULL)
+#define MC_VERIFIED_IDLE_TIMEOUT_NS (120ULL * 1000000000ULL)
 #define MC_BLOCK_NS   (300ULL * 1000000000ULL)
 #define MC_MAX_OUT_OF_ORDER 4
 #define MC_FLOW_MAX RATE_MAP_MAX_ENTRIES_V4
@@ -43,23 +44,6 @@
 #define MC_LOGIN_KEY_MAX 512
 #define MC_LOGIN_SIGNATURE_MAX 4096
 
-struct flow_key {
-    __u8  family;
-    __u8  pad[3];
-    __be16 sport;
-    __be16 dport;
-    __u32 saddr[4];
-    __u32 daddr[4];
-} __attribute__((aligned(8)));
-
-struct syn_rate_key_v4 {
-    __be32 addr;
-};
-
-struct syn_rate_key_v6 {
-    __u32 addr[4];
-};
-
 struct mc_rate_key_v4 {
     __be32 prefix;
 };
@@ -74,16 +58,35 @@ struct mc_rate_val {
 
 struct mc_pending_val {
     __u64 last_seen_ns;
+    __u64 policy_generation;
+    __u64 profile_generation;
     __u32 expected_seq;
     __s32 protocol_version;
+    __u32 last_payload_seq;
+    __u32 last_payload_len;
     __u16 state;
     __u16 fails;
+};
+
+struct mc_verified_val {
+    __u64 expires_ns;
+    __u64 policy_generation;
+    __u64 profile_generation;
 };
 
 struct mc_varint {
     __s32 value;
     __u32 bytes;
 };
+
+static __always_inline int profile_drop(struct xdp_md *ctx)
+{
+    __u32 pkt_len = (__u32)((char *)(long)ctx->data_end -
+                            (char *)(long)ctx->data);
+    count(CNT_PROFILE_DROP);
+    count_bytes(true, pkt_len);
+    return XDP_DROP;
+}
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -96,7 +99,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, MC_FLOW_MAX);
     __type(key, struct flow_key);
-    __type(value, __u64);
+    __type(value, struct mc_verified_val);
     /* Ingress packets alone establish and refresh this state. Return-path
      * visibility is deliberately unnecessary for asymmetric deployments. */
 } verified_mc SEC(".maps");
@@ -175,7 +178,7 @@ static __always_inline void fill_rate_key_v6(struct mc_rate_key_v6 *key, const s
 }
 
 #define MC_RATE_TICK_NS 1000000ULL
-#define MC_RATE_RETRIES 64
+#define MC_RATE_RETRIES 8
 
 #define MC_RATE_CHECK(map, key, now, window_ns, max_count, over_limit)               \
     do {                                                                             \
@@ -249,9 +252,23 @@ static __always_inline void cleanup_pending(const struct flow_key *ct)
 
 static __always_inline int restore_and_return(struct xdp_md *ctx, __u16 inner_off, int action)
 {
+    __u32 pkt_len = (__u32)((char *)(long)ctx->data_end -
+                            (char *)(long)ctx->data) + inner_off;
     if (inner_off && action != XDP_DROP && bpf_xdp_adjust_head(ctx, -(int)inner_off))
-        return XDP_DROP;
+        action = XDP_DROP;
+    count(action == XDP_PASS ? CNT_PROFILE_ALLOW : CNT_PROFILE_DROP);
+    count_bytes(action == XDP_DROP, pkt_len);
     return action;
+}
+
+static __always_inline void accept_payload(
+    struct mc_pending_val *pending, __u32 seq, __u32 payload_len, __u64 now)
+{
+    pending->last_payload_seq = seq;
+    pending->last_payload_len = payload_len;
+    pending->expected_seq += payload_len;
+    pending->fails = 0;
+    pending->last_seen_ns = now;
 }
 
 static __always_inline int drop_with_cleanup(struct xdp_md *ctx, __u16 inner_off, const struct flow_key *ct)
@@ -290,9 +307,17 @@ static __always_inline int reject_payload(
 }
 
 static __always_inline int verify_and_pass(
-    struct xdp_md *ctx, __u16 inner_off, const struct flow_key *ct, __u64 now)
+    struct xdp_md *ctx, __u16 inner_off, const struct flow_key *ct, __u64 now,
+    __u64 policy_generation, __u64 profile_generation)
 {
-    bpf_map_update_elem(&verified_mc, ct, &now, BPF_ANY);
+    struct mc_verified_val verified = {
+        .expires_ns = now + MC_VERIFIED_IDLE_TIMEOUT_NS,
+        .policy_generation = policy_generation,
+        .profile_generation = profile_generation,
+    };
+
+    if (bpf_map_update_elem(&verified_mc, ct, &verified, BPF_ANY))
+        return restore_and_return(ctx, inner_off, XDP_DROP);
     cleanup_pending(ct);
     return restore_and_return(ctx, inner_off, XDP_PASS);
 }
@@ -551,6 +576,7 @@ SEC("xdp/minecraft")
 int xdp_minecraft_handler(struct xdp_md *ctx)
 {
     struct xdp_slot_ctx *sc = get_slot_ctx(ctx);
+    struct xdp_profile_ctx *profile_ctx = get_profile_ctx();
     struct flow_key key;
     struct tcphdr *tcp;
     struct mc_pending_val *pending;
@@ -567,24 +593,29 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     __u32 l3_off;
     __u32 inner_off_u32;
 
-    if (!sc || sc->ip_proto != IPPROTO_TCP)
-        return XDP_PASS;
+    if (!sc || !profile_ctx || sc->ip_proto != IPPROTO_TCP ||
+        profile_ctx->profile_id != XDP_PROFILE_MINECRAFT ||
+        !profile_ctx->policy_generation || !profile_ctx->profile_generation)
+        return profile_drop(ctx);
+
+    __u64 policy_generation = profile_ctx->policy_generation;
+    __u64 profile_generation = profile_ctx->profile_generation;
 
     l3_off = (__u32)sc->l3_offset;
     inner_off_u32 = (__u32)sc->inner_offset;
     if (l3_off > 255 || inner_off_u32 > 255)
-        return XDP_DROP;
+        return profile_drop(ctx);
 
     inner_off = (__u16)inner_off_u32;
     family = sc->family;
     fill_flow_key(&key, sc);
 
     if (family != CT_FAMILY_IPV4 && family != CT_FAMILY_IPV6)
-        return XDP_PASS;
+        return profile_drop(ctx);
     if (family == CT_FAMILY_IPV4 && inner_off_u32 < l3_off + 20u)
-        return XDP_PASS;
+        return profile_drop(ctx);
     if (family == CT_FAMILY_IPV6 && inner_off_u32 < l3_off + 40u)
-        return XDP_PASS;
+        return profile_drop(ctx);
 
     /* Compute actual L4+payload length from the IP header *before* adjust_head.
      * data_end points to the physical Ethernet frame end, which may include
@@ -596,17 +627,17 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
         if (family == CT_FAMILY_IPV4) {
             struct iphdr *iph = (struct iphdr *)((char *)pre_data + l3_off);
             if ((void *)(iph + 1) > pre_data_end)
-                return XDP_PASS;
+                return profile_drop(ctx);
             __u32 ip_tot    = (__u32)bpf_ntohs(iph->tot_len);
             __u32 ip_l4_off = inner_off_u32 - l3_off;
             l4_and_payload_len = ip_tot > ip_l4_off ? ip_tot - ip_l4_off : 0;
         } else {
             struct ipv6hdr *ip6h = (struct ipv6hdr *)((char *)pre_data + l3_off);
             if ((void *)(ip6h + 1) > pre_data_end)
-                return XDP_PASS;
+                return profile_drop(ctx);
             __u32 ip6_hdr_and_ext = inner_off_u32 - l3_off;
             if (ip6_hdr_and_ext < 40u)
-                return XDP_PASS;
+                return profile_drop(ctx);
             __u32 ip6_plen = (__u32)bpf_ntohs(ip6h->payload_len);
             __u32 ip6_ext  = ip6_hdr_and_ext - 40u;
             l4_and_payload_len = ip6_plen > ip6_ext ? ip6_plen - ip6_ext : 0;
@@ -614,7 +645,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     }
 
     if (bpf_xdp_adjust_head(ctx, (int)inner_off))
-        return XDP_PASS;
+        return profile_drop(ctx);
 
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
@@ -634,25 +665,39 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     if (tcp->syn && !tcp->ack) {
         struct mc_pending_val new_pending = {
             .last_seen_ns = now,
+            .policy_generation = policy_generation,
+            .profile_generation = profile_generation,
             .expected_seq = bpf_ntohl(tcp->seq) + 1,
             .protocol_version = 0,
             .state = MC_AWAIT_ACK,
             .fails = 0,
         };
 
-        bpf_map_delete_elem(&verified_mc, &key);
-        bpf_map_update_elem(&pending_mc, &key, &new_pending, BPF_ANY);
+        if (bpf_map_lookup_elem(&verified_mc, &key) &&
+            bpf_map_delete_elem(&verified_mc, &key))
+            return restore_and_return(ctx, inner_off, XDP_DROP);
+        if (bpf_map_update_elem(&pending_mc, &key, &new_pending, BPF_ANY))
+            return restore_and_return(ctx, inner_off, XDP_DROP);
         return restore_and_return(ctx, inner_off, XDP_PASS);
     }
 
     {
-        __u64 *verified_at = bpf_map_lookup_elem(&verified_mc, &key);
+        struct mc_verified_val *verified = bpf_map_lookup_elem(&verified_mc, &key);
 
-        if (verified_at) {
-            if (tcp->fin || tcp->rst)
-                bpf_map_delete_elem(&verified_mc, &key);
-            else
-                *verified_at = now;
+        if (verified &&
+            (verified->policy_generation != policy_generation ||
+             verified->profile_generation != profile_generation ||
+             now >= verified->expires_ns)) {
+            bpf_map_delete_elem(&verified_mc, &key);
+            return restore_and_return(ctx, inner_off, XDP_DROP);
+        }
+        if (verified) {
+            if (tcp->fin || tcp->rst) {
+                if (bpf_map_delete_elem(&verified_mc, &key))
+                    return restore_and_return(ctx, inner_off, XDP_DROP);
+            } else {
+                verified->expires_ns = now + MC_VERIFIED_IDLE_TIMEOUT_NS;
+            }
             return restore_and_return(ctx, inner_off, XDP_PASS);
         }
     }
@@ -660,6 +705,12 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
     pending = bpf_map_lookup_elem(&pending_mc, &key);
     if (!pending)
         return restore_and_return(ctx, inner_off, XDP_DROP);
+
+    if (pending->policy_generation != policy_generation ||
+        pending->profile_generation != profile_generation) {
+        cleanup_pending(&key);
+        return restore_and_return(ctx, inner_off, XDP_DROP);
+    }
 
     if (now - pending->last_seen_ns > MC_TIMEOUT_NS)
         return drop_with_cleanup(ctx, inner_off, &key);
@@ -698,6 +749,11 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
             return penalize_and_drop(ctx, inner_off, &key, now);
 
         if (pending->expected_seq != bpf_ntohl(tcp->seq)) {
+            if (pending->last_payload_len == payload_len &&
+                pending->last_payload_seq == bpf_ntohl(tcp->seq)) {
+                pending->last_seen_ns = now;
+                return restore_and_return(ctx, inner_off, XDP_PASS);
+            }
             return reject_payload(ctx, inner_off, &key, pending, now);
         }
 
@@ -719,9 +775,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
                 pending->state = MC_AWAIT_LOGIN;
             else {
                 pending->state = (__u16)next_state;
-                pending->expected_seq += payload_len;
-                pending->fails = 0;
-                pending->last_seen_ns = now;
+                accept_payload(pending, bpf_ntohl(tcp->seq), payload_len, now);
                 return restore_and_return(ctx, inner_off, XDP_PASS);
             }
         }
@@ -734,9 +788,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
                                             MC_STATUS_RATE_WINDOW_NS, MC_STATUS_RATE_MAX))
                 return penalize_and_drop(ctx, inner_off, &key, now);
             pending->state = MC_AWAIT_PING;
-            pending->expected_seq += payload_len;
-            pending->fails = 0;
-            pending->last_seen_ns = now;
+            accept_payload(pending, bpf_ntohl(tcp->seq), payload_len, now);
             return restore_and_return(ctx, inner_off, XDP_PASS);
         }
 
@@ -745,9 +797,7 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
                 return reject_payload(ctx, inner_off, &key, pending, now);
             }
             pending->state = MC_PING_COMPLETE;
-            pending->expected_seq += payload_len;
-            pending->fails = 0;
-            pending->last_seen_ns = now;
+            accept_payload(pending, bpf_ntohl(tcp->seq), payload_len, now);
             return restore_and_return(ctx, inner_off, XDP_PASS);
         }
 
@@ -758,15 +808,14 @@ int xdp_minecraft_handler(struct xdp_md *ctx)
             if (mc_handshake_rate_exceeded(&key, now, &mc_login_rate4, &mc_login_rate6,
                                             MC_LOGIN_RATE_WINDOW_NS, MC_LOGIN_RATE_MAX))
                 return penalize_and_drop(ctx, inner_off, &key, now);
-            return verify_and_pass(ctx, inner_off, &key, now);
+            return verify_and_pass(ctx, inner_off, &key, now,
+                                   policy_generation, profile_generation);
         }
 
         if (pending->state == MC_PING_COMPLETE)
             return drop_with_cleanup(ctx, inner_off, &key);
 
-        pending->expected_seq += payload_len;
-        pending->fails = 0;
-        pending->last_seen_ns = now;
+        accept_payload(pending, bpf_ntohl(tcp->seq), payload_len, now);
         return restore_and_return(ctx, inner_off, XDP_PASS);
     }
 

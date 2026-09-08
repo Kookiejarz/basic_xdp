@@ -235,6 +235,8 @@ def _grant_for(endpoint: RuntimeEndpoint, subject: dict) -> tuple[bool, str, str
         return False, "port is not listed in the exposure grant", ""
     protection = subject.get("protection", {})
     profile = str(protection.get("profile", "")).strip().lower() if isinstance(protection, dict) else ""
+    if profile and (profile != "minecraft" or endpoint.protocol != "tcp"):
+        return False, "protection profile is unavailable for this protocol", profile
     return True, "matched explicit exposure grant", profile
 
 
@@ -271,12 +273,16 @@ def resolve_exposure_decisions(observed: ObservedState) -> list[ExposureDecision
                 )
             )
 
-    # A global port map cannot safely express two incompatible owners. Keep
-    # the whole port closed when the inventory proves shared/ambiguous ownership.
-    grouped: dict[tuple[str, int], list[ExposureDecision]] = {}
+    # One interface zone can only express one owner/profile for a protocol/port.
+    # Different zones are independent endpoint policies.
+    grouped: dict[tuple[str, int, str], list[ExposureDecision]] = {}
     for decision in decisions:
         grouped.setdefault(
-            (decision.endpoint.protocol, decision.endpoint.host_port), []
+            (
+                decision.endpoint.protocol,
+                decision.endpoint.host_port,
+                decision.endpoint.ingress_zone,
+            ), []
         ).append(decision)
     for group in grouped.values():
         if len(group) < 2:
@@ -347,7 +353,7 @@ def _service_aware_desired_state(observed: ObservedState) -> DesiredState:
     desired.zone_tcp_ports = zone_tcp_ports
     desired.zone_udp_ports = zone_udp_ports
     desired.tcp_protection_profiles = {
-        item.endpoint.host_port: item.protection_profile
+        (item.endpoint.ingress_zone, item.endpoint.host_port): item.protection_profile
         for item in decisions
         if item.action == "allow"
         and item.endpoint.protocol == "tcp"

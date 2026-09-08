@@ -235,15 +235,13 @@ activate_nftables_backend() {
         return 1
     }
 
-    local needs_cutover=0 iface mode index detached=0 rollback_ok=1
+    local needs_cutover=0 iface mode index detached=0 rollback_ok=1 table_dump=""
     local nft_family="${NFT_FAMILY:-inet}" nft_table="${NFT_TABLE:-auto_xdp}"
     local -a old_modes=()
     _auto_xdp_any_target_has_xdp && needs_cutover=1
-    if [[ $needs_cutover -eq 0 ]] \
-            && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-                | grep -Fq 'set tcp_ports' \
-            && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-                | grep -Fq 'chain input'; then
+    table_dump=$(nft list table "$nft_family" "$nft_table" 2>/dev/null || true)
+    if [[ $needs_cutover -eq 0 && "$table_dump" == *"set tcp_ports"* \
+            && "$table_dump" == *"chain input"* ]]; then
         echo "nftables" > "${RUN_STATE_DIR}/backend"
         _auto_xdp_record_nft_state
         return
@@ -257,13 +255,12 @@ activate_nftables_backend() {
         echo "[auto_xdp] nftables candidate sync failed; retaining current XDP backend" >&2
         return 1
     fi
-    nft list table "$nft_family" "$nft_table" 2>/dev/null \
-        | grep -Fq 'set tcp_ports' \
-        && nft list table "$nft_family" "$nft_table" 2>/dev/null \
-            | grep -Fq 'chain input' || {
+    table_dump=$(nft list table "$nft_family" "$nft_table" 2>/dev/null || true)
+    if [[ "$table_dump" != *"set tcp_ports"* \
+            || "$table_dump" != *"chain input"* ]]; then
         echo "[auto_xdp] nftables candidate schema verification failed; retaining current XDP backend" >&2
         return 1
-    }
+    fi
 
     if [[ $needs_cutover -eq 1 ]]; then
         for iface in "${_IFACES[@]}"; do

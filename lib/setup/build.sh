@@ -308,6 +308,10 @@ compile_xdp_program() {
             rm -f "$handler_log"
         fi
     fi
+    if [[ ! -s "${_handlers_dir}/minecraft_handler.o" ]]; then
+        step_error "Required Minecraft protection profile failed to build."
+        return 1
+    fi
     return 0
 }
 

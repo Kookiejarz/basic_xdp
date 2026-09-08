@@ -30,6 +30,7 @@ from auto_xdp.bpf.syscall import (
     BPF_MAP_LOOKUP_ELEM,
     bpf,
     map_max_entries,
+    map_value_size,
     obj_get,
 )
 from auto_xdp.discovery import _build_systemd_socket_map
@@ -648,6 +649,12 @@ def _normalize_handler_port(value: int) -> int:
     return value
 
 
+def _normalize_profile_id(value: int) -> int:
+    if value <= 0 or value > 255:
+        raise ValueError(f"invalid profile ID: {value}")
+    return value
+
+
 def _port_handler_map_path(bpf_pin_dir: Path, proto: str) -> Path:
     return bpf_pin_dir / ("tcp_port_handlers" if proto == "tcp" else "udp_port_handlers")
 
@@ -735,6 +742,31 @@ def _transactional_dir_prog_swap(
             # Traffic already uses the verified candidate. Retaining the old
             # generation is safer than treating cleanup as a failed switch.
             print(f"Warning: old handler generation retained at {backup_dir}: {exc}", file=sys.stderr)
+
+
+def _load_handler_object(
+    handler_map: Path,
+    key: int,
+    obj_path: Path,
+    pin_dir: Path,
+    shared_maps: list[tuple[str, Path]],
+) -> None:
+    pin_dir.parent.mkdir(parents=True, exist_ok=True)
+    candidate_dir = Path(
+        tempfile.mkdtemp(prefix=f"{key}_next_", dir=str(pin_dir.parent))
+    )
+    load_cmd = [
+        "bpftool", "prog", "load", str(obj_path), str(candidate_dir / "prog"),
+        "type", "xdp", "pinmaps", str(candidate_dir),
+    ]
+    for name, map_path in shared_maps:
+        load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
+    try:
+        _run_checked(load_cmd, f"Failed to load {obj_path}")
+    except RuntimeError:
+        shutil.rmtree(candidate_dir, ignore_errors=True)
+        raise
+    _transactional_dir_prog_swap(handler_map, key, candidate_dir, pin_dir)
 
 
 class _BpfUdpValidationMap:
@@ -1372,33 +1404,8 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
         return 1
 
     pin_dir = _port_handler_dir(bpf_pin_dir, proto, port)
-    pin_dir.parent.mkdir(parents=True, exist_ok=True)
-    candidate_dir = Path(tempfile.mkdtemp(prefix=f"{port}_next_", dir=str(pin_dir.parent)))
-    prog_pin = candidate_dir / "prog"
-
-    load_cmd = [
-        "bpftool",
-        "prog",
-        "load",
-        str(obj_path),
-        str(prog_pin),
-        "type",
-        "xdp",
-        "pinmaps",
-        str(candidate_dir),
-    ]
-    for name, map_path in shared_maps:
-        load_cmd.extend(["map", "name", name, "pinned", str(map_path)])
-
     try:
-        _run_checked(load_cmd, f"Failed to load {obj_path}")
-    except RuntimeError as exc:
-        shutil.rmtree(candidate_dir, ignore_errors=True)
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    try:
-        _transactional_dir_prog_swap(handler_map, port, candidate_dir, pin_dir)
+        _load_handler_object(handler_map, port, obj_path, pin_dir, shared_maps)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1415,6 +1422,96 @@ def _cmd_port_handler_load(args: argparse.Namespace) -> int:
     print(f"Loaded {proto.upper()} handler for port {port} from {obj_path}")
     if not args.no_config_update:
         print(f"  config: {path}")
+    return 0
+
+
+def _cmd_profile_handler_load(args: argparse.Namespace) -> int:
+    bpf_pin_dir, _, _ = _slot_paths(args)
+    profile_id = _normalize_profile_id(int(args.profile_id))
+    handler_map = bpf_pin_dir / "tcp_profile_handlers"
+    shared_maps = [
+        (name, bpf_pin_dir / name)
+        for name in (
+            "slot_ctx_map", "profile_ctx_map", "hblk4", "hblk6",
+            "pkt_counters", "byte_counters",
+        )
+    ]
+
+    obj_path = Path(args.path)
+    if not obj_path.is_file():
+        print(f"Handler object not found: {obj_path}", file=sys.stderr)
+        return 1
+    obj_path = obj_path.resolve()
+    missing = [name for name, path in shared_maps if not path.exists()]
+    if not handler_map.exists():
+        missing.insert(0, handler_map.name)
+    if missing:
+        print(
+            f"XDP not loaded completely (missing pinned maps: {', '.join(missing)}).",
+            file=sys.stderr,
+        )
+        return 1
+
+    pin_dir = bpf_pin_dir / "profile_handlers" / "tcp" / str(profile_id)
+    try:
+        _load_handler_object(handler_map, profile_id, obj_path, pin_dir, shared_maps)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"Loaded TCP profile handler {profile_id} from {obj_path}")
+    return 0
+
+
+def _cmd_profile_handler_unload(args: argparse.Namespace) -> int:
+    bpf_pin_dir, _, _ = _slot_paths(args)
+    profile_id = _normalize_profile_id(int(args.profile_id))
+    handler_map = bpf_pin_dir / "tcp_profile_handlers"
+    pin_dir = bpf_pin_dir / "profile_handlers" / "tcp" / str(profile_id)
+    live_pin = pin_dir / "prog"
+
+    if not handler_map.exists():
+        print(f"XDP not loaded ({handler_map.name} map not found).", file=sys.stderr)
+        return 1
+
+    active_id = _prog_array_entry_id(handler_map, profile_id)
+    if not live_pin.exists():
+        if active_id is not None:
+            print(
+                f"Profile handler {profile_id} is active but its ownership pin is missing.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"TCP profile handler {profile_id} is not loaded")
+        return 0
+
+    try:
+        pinned_id = _pinned_program_id(live_pin)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if active_id != pinned_id:
+        print(
+            f"Profile handler {profile_id} does not match its program-array entry; "
+            "retaining its pins.",
+            file=sys.stderr,
+        )
+        return 1
+    if not _prog_array_delete(handler_map, profile_id):
+        print(
+            f"Failed to remove profile handler {profile_id}; retaining its pins.",
+            file=sys.stderr,
+        )
+        return 1
+    if _prog_array_entry_id(handler_map, profile_id) is not None:
+        print(
+            f"Profile handler {profile_id} deletion could not be verified; retaining its pins.",
+            file=sys.stderr,
+        )
+        return 1
+
+    shutil.rmtree(pin_dir)
+    print(f"Unloaded TCP profile handler {profile_id}")
     return 0
 
 
@@ -1452,8 +1549,11 @@ def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
             raise RuntimeError(f"Cannot open BPF map {path}: {exc}") from exc
         try:
             n = map_max_entries(fd)
+            value_size = map_value_size(fd)
+            if value_size < 4:
+                raise RuntimeError(f"Invalid BPF map value size {value_size} for {path}")
             keys_buf = ctypes.create_string_buffer(4 * n)
-            vals_buf = ctypes.create_string_buffer(4 * n)
+            vals_buf = ctypes.create_string_buffer(value_size * n)
             out_batch = ctypes.create_string_buffer(4)
             attr = ctypes.create_string_buffer(56)
             struct.pack_into(
@@ -1470,7 +1570,7 @@ def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
                 if exc.errno != errno.ENOENT:
                     # Sequential fallback for kernels without batch support
                     k = ctypes.create_string_buffer(4)
-                    v = ctypes.create_string_buffer(4)
+                    v = ctypes.create_string_buffer(value_size)
                     la = ctypes.create_string_buffer(128)
                     struct.pack_into(
                         "=I4xQQ", la, 0, fd,
@@ -1492,7 +1592,7 @@ def _read_xdp_ports(bpf_pin_dir: str) -> tuple[list[int], list[int]]:
             return sorted({
                 struct.unpack_from("=I", keys_buf, i * 4)[0]
                 for i in range(fetched)
-                if struct.unpack_from("=I", vals_buf, i * 4)[0]
+                if struct.unpack_from("=I", vals_buf, i * value_size)[0]
                 and 0 < struct.unpack_from("=I", keys_buf, i * 4)[0] <= 65535
             })
         finally:
@@ -2247,6 +2347,9 @@ _XDP_COUNTER_NAMES = [
     "RESERVED_32",
     "RESERVED_33",
     "ABUSEIPDB_DROP",
+    "PROFILE_UNAVAILABLE_DROP",
+    "PROFILE_ALLOW",
+    "PROFILE_DROP",
 ]
 
 _XDP_DROP_INDEXES = {
@@ -2964,6 +3067,16 @@ def build_parser() -> argparse.ArgumentParser:
     port_handler_unload.add_argument("port", type=int)
     port_handler_unload.add_argument("--no-config-update", action="store_true")
     port_handler_unload.set_defaults(func=_cmd_port_handler_unload)
+
+    profile_handler = subparsers.add_parser("profile-handler")
+    profile_handler_sub = profile_handler.add_subparsers(dest="subcommand", required=True)
+    profile_handler_load = profile_handler_sub.add_parser("load")
+    profile_handler_load.add_argument("profile_id", type=int)
+    profile_handler_load.add_argument("path")
+    profile_handler_load.set_defaults(func=_cmd_profile_handler_load)
+    profile_handler_unload = profile_handler_sub.add_parser("unload")
+    profile_handler_unload.add_argument("profile_id", type=int)
+    profile_handler_unload.set_defaults(func=_cmd_profile_handler_unload)
 
     exclude = subparsers.add_parser("exclude")
     exclude_sub = exclude.add_subparsers(dest="subcommand", required=True)

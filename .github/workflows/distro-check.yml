@@ -207,6 +207,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo grep -qx 'PREFERRED_BACKEND="xdp"' /etc/auto_xdp/auto_xdp.env
+          ! sudo test -e /sys/fs/bpf/xdp_fw/prog
+          sudo /usr/local/bin/axdp enable --force
           deadline=$((SECONDS + 40))
           while ! sudo test -f /run/auto_xdp/backend && (( SECONDS < deadline )); do sleep 0.2; done
           sudo test -f /run/auto_xdp/backend

@@ -19,8 +19,9 @@ static __always_inline int check_tcp_policy(
 {
     __u64 now = bpf_ktime_get_ns();
     struct xdp_runtime_cfg *cfg = runtime_cfg();
+    struct tcp_endpoint_policy endpoint_policy = {};
 
-    if (!tcp_exposure_allowed(ctx, dest_port))
+    if (!tcp_endpoint_policy_lookup(ctx, dest_port, &endpoint_policy))
         goto drop;
 
     if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
@@ -37,6 +38,9 @@ static __always_inline int check_tcp_policy(
             goto drop;
         if (precheck_new_tcp_syn(key, dest_port, bypass_rate, now, cfg) == XDP_DROP)
             return XDP_DROP;
+        if (endpoint_policy.profile_id)
+            return dispatch_tcp_profile(
+                ctx, key, l3_off, inner_off, &endpoint_policy);
         try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
         count(CNT_TCP_NEW_ALLOW);
         emit_allow(IPPROTO_TCP, key->family, key->saddr, key->daddr,
@@ -44,6 +48,9 @@ static __always_inline int check_tcp_policy(
         return XDP_PASS;
     }
 
+    if (endpoint_policy.profile_id)
+        return dispatch_tcp_profile(
+            ctx, key, l3_off, inner_off, &endpoint_policy);
     try_tcp_port_dispatch(ctx, key, l3_off, inner_off, dest_port);
     count(CNT_TCP_PASS);
     return XDP_PASS;

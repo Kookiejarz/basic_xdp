@@ -54,27 +54,28 @@ def obj_get(path: str) -> int:
     return bpf(BPF_OBJ_GET, attr)
 
 
-def map_max_entries(fd: int) -> int:
-    """Return the max_entries of an open BPF map fd via BPF_OBJ_GET_INFO_BY_FD."""
+def _map_info_u32(fd: int, offset: int) -> int:
     info = ctypes.create_string_buffer(128)
     attr = ctypes.create_string_buffer(16)
     info_ptr = ctypes.cast(info, ctypes.c_void_p).value or 0
-    # bpf_attr.info: bpf_fd(u32), info_len(u32), info(u64 ptr)
     struct.pack_into("=IIQ", attr, 0, fd, len(info), info_ptr)
     bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
-    # bpf_map_info.max_entries is at offset 16 (after type, id, key_size, value_size)
-    return struct.unpack_from("=I", info, 16)[0]
+    return struct.unpack_from("=I", info, offset)[0]
+
+
+def map_max_entries(fd: int) -> int:
+    """Return the max_entries of an open BPF map fd."""
+    return _map_info_u32(fd, 16)
+
+
+def map_value_size(fd: int) -> int:
+    """Return the value_size of an open BPF map fd."""
+    return _map_info_u32(fd, 12)
 
 
 def map_id(fd: int) -> int:
     """Return the kernel-assigned map ID for an open BPF map fd."""
-    info = ctypes.create_string_buffer(128)
-    attr = ctypes.create_string_buffer(16)
-    info_ptr = ctypes.cast(info, ctypes.c_void_p).value or 0
-    struct.pack_into("=IIQ", attr, 0, fd, len(info), info_ptr)
-    bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
-    # bpf_map_info: type(u32) at 0, id(u32) at 4
-    return struct.unpack_from("=I", info, 4)[0]
+    return _map_info_u32(fd, 4)
 
 
 def map_create(map_type: int, key_size: int, value_size: int,

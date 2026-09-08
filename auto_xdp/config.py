@@ -116,6 +116,7 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "xdp_runtime_cfg",
     "udp_percpu_acc",
     "proto_handlers",
+    "tcp_profile_handlers",
     "tcp_port_handlers",
     "udp_port_handlers",
     "hblk4",
@@ -123,6 +124,7 @@ _DEFAULT_XDP_REQUIRED_MAP_NAMES = (
     "udp_hv4",
     "udp_hv6",
     "slot_ctx_map",
+    "profile_ctx_map",
     "sit4_endpoints",
     "abuseipdb_v4",
     "syn4",
@@ -178,6 +180,7 @@ TRUSTED_IPS_MAP_PATH4 = ""
 TRUSTED_IPS_MAP_PATH6 = ""
 TCP_PORT_POLICY_MAP_PATH = ""
 UDP_PORT_POLICY_MAP_PATH = ""
+TCP_PROFILE_HANDLER_MAP_PATH = ""
 UDP_GLOBAL_RL_MAP_PATH = ""
 XDP_RUNTIME_CFG_MAP_PATH = ""
 TCP_ACL_MAP_PATH4 = ""
@@ -197,7 +200,7 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     global BPF_PIN_DIR
     global TCP_MAP_PATH, UDP_MAP_PATH, TCP_ZONE_MAP_PATH, UDP_ZONE_MAP_PATH, SCTP_MAP_PATH
     global TRUSTED_IPS_MAP_PATH4, TRUSTED_IPS_MAP_PATH6
-    global TCP_PORT_POLICY_MAP_PATH, UDP_PORT_POLICY_MAP_PATH
+    global TCP_PORT_POLICY_MAP_PATH, UDP_PORT_POLICY_MAP_PATH, TCP_PROFILE_HANDLER_MAP_PATH
     global UDP_GLOBAL_RL_MAP_PATH, XDP_RUNTIME_CFG_MAP_PATH
     global TCP_ACL_MAP_PATH4, TCP_ACL_MAP_PATH6
     global UDP_ACL_MAP_PATH4, UDP_ACL_MAP_PATH6
@@ -215,6 +218,7 @@ def _set_bpf_pin_dir(pin_dir: str) -> None:
     TRUSTED_IPS_MAP_PATH6 = f"{pin_dir}/trusted_ipv6"
     TCP_PORT_POLICY_MAP_PATH = f"{pin_dir}/tcp_port_policies"
     UDP_PORT_POLICY_MAP_PATH = f"{pin_dir}/udp_port_policies"
+    TCP_PROFILE_HANDLER_MAP_PATH = f"{pin_dir}/tcp_profile_handlers"
     UDP_GLOBAL_RL_MAP_PATH = f"{pin_dir}/udp_global_rl"
     XDP_RUNTIME_CFG_MAP_PATH = f"{pin_dir}/xdp_runtime_cfg"
     TCP_ACL_MAP_PATH4 = f"{pin_dir}/tcp_acl_v4"
@@ -459,6 +463,7 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
     raw_zones = cfg.get("zones", {})
     if not isinstance(raw_zones, dict):
         raise ValueError("zones must be a table")
+    interface_zones: dict[str, str] = {}
     for zone_name, zone in raw_zones.items():
         if not isinstance(zone, dict):
             raise ValueError(f"zones.{zone_name} must be a table")
@@ -468,6 +473,14 @@ def _apply_toml_config_in_place(cfg: dict) -> None:
         cidrs = zone.get("cidrs", [])
         if not isinstance(cidrs, list) or not all(isinstance(item, str) for item in cidrs):
             raise ValueError(f"zones.{zone_name}.cidrs must be a list of strings")
+        for interface in interfaces:
+            if interface == "*":
+                continue
+            previous = interface_zones.setdefault(interface, str(zone_name))
+            if previous != str(zone_name):
+                raise ValueError(
+                    f"interface {interface!r} belongs to both zones {previous!r} and {zone_name!r}"
+                )
         ZONES[str(zone_name)] = {"interfaces": list(interfaces), "cidrs": list(cidrs)}
     ZONES.setdefault("public", {"interfaces": [], "cidrs": []})
 

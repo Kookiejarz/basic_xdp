@@ -512,25 +512,30 @@ class NftablesBackend(PortBackend):
         observed_state: ObservedState | None = None,
     ) -> None:
         _ = plan, observed_state  # native conntrack owns established-flow state
-        protected_ports = set(desired_state.tcp_protection_profiles)
-        if protected_ports:
+        protected_endpoints = set(desired_state.tcp_protection_profiles)
+        if protected_endpoints:
+            protected_public_ports = {
+                port for zone, port in protected_endpoints if zone == "public"
+            }
             desired_state = replace(
                 desired_state,
-                tcp_ports=desired_state.tcp_ports - protected_ports,
+                tcp_ports=desired_state.tcp_ports - protected_public_ports,
                 zone_tcp_ports={
-                    zone: ports - protected_ports
+                    zone: {
+                        port for port in ports if (zone, port) not in protected_endpoints
+                    }
                     for zone, ports in desired_state.zone_tcp_ports.items()
-                    if ports - protected_ports
+                    if any((zone, port) not in protected_endpoints for port in ports)
                 },
             )
         signature = _policy_signature(desired_state)
         if signature == self._policy_signature:
             log.debug("nftables policy up-to-date.")
             return
-        if protected_ports:
+        if protected_endpoints:
             log.warning(
-                "Minecraft protection requires XDP; keeping TCP ports %s closed on nftables",
-                sorted(protected_ports),
+                "Minecraft protection requires XDP; keeping TCP endpoints %s closed on nftables",
+                sorted(protected_endpoints),
             )
 
         # A single nft batch validates the complete candidate and commits it

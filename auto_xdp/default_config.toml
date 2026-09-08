@@ -203,8 +203,8 @@ enabled = []
 
 [port_handlers.tcp]
 # Per-port TCP handlers: "PORT" = "/path/to/handler.o" or ".c".
-# Example:
-# "25565" = "/etc/auto_xdp/handlers/minecraft_handler.o"
+# Minecraft is loaded automatically by protection.profile = "minecraft" and
+# must not be configured here as a legacy per-port handler.
 
 [port_handlers.udp]
 # Per-port UDP handlers: "PORT" = "/path/to/handler.o" or ".c".

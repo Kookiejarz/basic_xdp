@@ -434,9 +434,16 @@ xdp_maps_ready() {
 
     # Value-size guard: catches pinned maps from an older build before the
     # caller skips reload.  Sizes are derived from the C structs in bpf/include/:
+    #   tcp_endpoint_policy / xdp_profile_ctx                      = 24 B
     #   xdp_runtime_cfg  8 × __u64 + 2 × __u32 (cfg_flags + _pad) = 72 B
     #   udp_global_state bpf_spin_lock(4) + __u32(4) + 4×__u64     = 40 B
     # Update these numbers whenever the corresponding struct gains or loses fields.
+    for map_name in tcp_whitelist tcp_zone_whitelist profile_ctx_map; do
+        _map_value_size_ok "${BPF_PIN_DIR}/${map_name}" 24 || {
+            _auto_xdp_warn "${map_name} value_size mismatch; forcing XDP reload"
+            return 1
+        }
+    done
     _map_value_size_ok "${BPF_PIN_DIR}/xdp_runtime_cfg" 72 || {
         _auto_xdp_warn "xdp_runtime_cfg value_size mismatch; forcing XDP reload"
         return 1
@@ -509,6 +516,7 @@ xdp_required_map_names() {
 	udp_acl_v6
 	sit4_endpoints
 	proto_handlers
+	tcp_profile_handlers
 	tcp_port_handlers
 	udp_port_handlers
 	hblk4
@@ -517,6 +525,7 @@ xdp_required_map_names() {
 	udp_hv6
 	abuseipdb_v4
 	slot_ctx_map
+	profile_ctx_map
 	EOF
 }
 

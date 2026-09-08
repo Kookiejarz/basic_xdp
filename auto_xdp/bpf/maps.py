@@ -8,7 +8,6 @@ import os
 import socket
 import struct
 import subprocess
-import time
 from typing import Any
 
 from auto_xdp import config as cfg
@@ -25,6 +24,7 @@ from auto_xdp.bpf.syscall import (
     map_get_fd_by_id,
     map_id as _map_id,
     map_max_entries,
+    map_value_size,
     obj_get,
 )
 
@@ -98,13 +98,24 @@ class BpfFdMap(BpfBaseMap):
 
 
 class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, value_format: str = "=I", active_index: int = 0) -> None:
         super().__init__(path)
         self._max_entries: int = map_max_entries(self.fd)
-        self._cache: set[int] = set()
+        self._value_format = value_format
+        self._value_size = struct.calcsize(value_format)
+        actual_value_size = map_value_size(self.fd)
+        if actual_value_size != self._value_size:
+            self.close()
+            raise OSError(
+                errno.EINVAL,
+                f"BPF map {path} value_size={actual_value_size}, expected {self._value_size}",
+            )
+        self._value_fields = len(struct.unpack(value_format, bytes(self._value_size)))
+        self._active_index = active_index
+        self._cache: dict[int, tuple[int, ...]] = {}
 
         self._key = ctypes.create_string_buffer(4)
-        self._val = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._value_size)
         self._update_attr = ctypes.create_string_buffer(128)
         self._lookup_attr = ctypes.create_string_buffer(128)
         k_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
@@ -113,21 +124,27 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
         struct.pack_into("=I4xQQ", self._lookup_attr, 0, self.fd, k_ptr, v_ptr)
         self._load_cache()
 
-    def _update(self, port: int, val: int) -> None:
+    def _normalize_value(self, val: int | tuple[int, ...]) -> tuple[int, ...]:
+        return (val, *(0 for _ in range(self._value_fields - 1))) if isinstance(val, int) else val
+
+    def _update(self, port: int, val: tuple[int, ...]) -> None:
         struct.pack_into("=I", self._key, 0, port)
-        struct.pack_into("=I", self._val, 0, val)
+        struct.pack_into(self._value_format, self._val, 0, *val)
         bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
 
-    def _lookup(self, port: int) -> int:
+    def _lookup(self, port: int) -> tuple[int, ...]:
         struct.pack_into("=I", self._key, 0, port)
         bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-        return struct.unpack_from("=I", self._val, 0)[0]
+        return struct.unpack_from(self._value_format, self._val, 0)
 
-    def _read_kernel(self) -> set[int]:
-        result: set[int] = set()
+    def _is_active(self, value: tuple[int, ...]) -> bool:
+        return bool(value[self._active_index])
+
+    def _read_kernel(self) -> dict[int, tuple[int, ...]]:
+        result: dict[int, tuple[int, ...]] = {}
         n = self._max_entries
         keys_buf = ctypes.create_string_buffer(4 * n)
-        vals_buf = ctypes.create_string_buffer(4 * n)
+        vals_buf = ctypes.create_string_buffer(self._value_size * n)
         out_batch = ctypes.create_string_buffer(4)
         attr = ctypes.create_string_buffer(56)
         # BPF_MAP_LOOKUP_BATCH attr: in_batch, out_batch, keys, values, count, map_fd, elem_flags, flags
@@ -146,20 +163,26 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
                 # Kernel too old or other error; fall back to sequential scan.
                 for port in range(n):
                     try:
-                        if self._lookup(port):
-                            result.add(port)
+                        value = self._lookup(port)
+                        if self._is_active(value):
+                            result[port] = value
                     except OSError:
                         continue
                 return result
             # ENOENT: end of map; kernel has written the fetched count back to attr.
         fetched = struct.unpack_from("=I", attr, 32)[0]
         for i in range(fetched):
-            if struct.unpack_from("=I", vals_buf, i * 4)[0]:
-                result.add(struct.unpack_from("=I", keys_buf, i * 4)[0])
+            value = struct.unpack_from(self._value_format, vals_buf, i * self._value_size)
+            if self._is_active(value):
+                result[struct.unpack_from("=I", keys_buf, i * 4)[0]] = value
         return result
 
     def _load_cache(self) -> None:
         self._cache = self._read_kernel()
+
+    def refresh(self) -> None:
+        """Refresh after a coordinated out-of-process map update."""
+        self._load_cache()
 
     def active_ports(self) -> set[int]:
         return set(self._cache)
@@ -170,13 +193,20 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
     def get(self, port: int) -> int:
         return 1 if port in self._cache else 0
 
-    def set(self, port: int, val: int, dry_run: bool = False) -> bool:
+    def value(self, port: int) -> tuple[int, ...] | None:
+        return self._cache.get(port)
+
+    def set(self, port: int, val: int | tuple[int, ...], dry_run: bool = False) -> bool:
         if dry_run:
-            log.info("[DRY] %s port %d -> %d", self.path, port, val)
+            log.info("[DRY] %s port %d -> %s", self.path, port, val)
             return True
+        value = self._normalize_value(val)
         try:
-            self._update(port, val)
-            self._cache.add(port) if val else self._cache.discard(port)
+            self._update(port, value)
+            if self._is_active(value):
+                self._cache[port] = value
+            else:
+                self._cache.pop(port, None)
             return True
         except OSError as exc:
             log.warning("BPF update failed port=%d: %s", port, exc)
@@ -186,12 +216,23 @@ class BpfArrayMap(CacheVerifyMixin, BpfFdMap):
 class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
     """Interface-index/port admission map for non-public exposure grants."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, value_format: str = "=I", active_index: int = 0) -> None:
         super().__init__(path)
-        self._cache: set[tuple[int, int]] = set()
+        self._value_format = value_format
+        self._value_size = struct.calcsize(value_format)
+        actual_value_size = map_value_size(self.fd)
+        if actual_value_size != self._value_size:
+            self.close()
+            raise OSError(
+                errno.EINVAL,
+                f"BPF map {path} value_size={actual_value_size}, expected {self._value_size}",
+            )
+        self._value_fields = len(struct.unpack(value_format, bytes(self._value_size)))
+        self._active_index = active_index
+        self._cache: dict[tuple[int, int], tuple[int, ...]] = {}
         self._key = ctypes.create_string_buffer(8)
         self._next_key = ctypes.create_string_buffer(8)
-        self._val = ctypes.create_string_buffer(4)
+        self._val = ctypes.create_string_buffer(self._value_size)
         self._update_attr = ctypes.create_string_buffer(128)
         self._lookup_attr = ctypes.create_string_buffer(128)
         self._delete_attr = ctypes.create_string_buffer(128)
@@ -228,15 +269,15 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
             ctypes.memmove(self._key, key_raw, 8)
             current_ptr = ctypes.cast(self._key, ctypes.c_void_p).value or 0
 
-    def _read_kernel(self) -> set[tuple[int, int]]:
-        result: set[tuple[int, int]] = set()
+    def _read_kernel(self) -> dict[tuple[int, int], tuple[int, ...]]:
+        result: dict[tuple[int, int], tuple[int, ...]] = {}
         try:
             for key_raw in self._iter_raw_keys():
                 try:
                     ctypes.memmove(self._key, key_raw, 8)
                     bpf(BPF_MAP_LOOKUP_ELEM, self._lookup_attr)
-                    if struct.unpack_from("=I", self._val, 0)[0]:
-                        result.add(struct.unpack_from("=II", self._key, 0))
+                    value = struct.unpack_from(self._value_format, self._val, 0)
+                    result[struct.unpack_from("=II", self._key, 0)] = value
                 except OSError:
                     continue
         except OSError:
@@ -247,19 +288,30 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
         self._cache = self._read_kernel()
 
     def active_entries(self) -> set[tuple[int, int]]:
+        return {
+            key for key, value in self._cache.items() if value[self._active_index]
+        }
+
+    def entries(self) -> set[tuple[int, int]]:
         return set(self._cache)
 
-    def set(self, ifindex: int, port: int, val: int = 1, dry_run: bool = False) -> bool:
+    def value(self, ifindex: int, port: int) -> tuple[int, ...] | None:
+        return self._cache.get((ifindex, port))
+
+    def set(self, ifindex: int, port: int, val: int | tuple[int, ...] = 1, dry_run: bool = False) -> bool:
         key = self._pack_key(ifindex, port)
-        if not val:
-            return self.delete(*key, dry_run=dry_run)
         if dry_run:
-            log.info("[DRY] %s %s -> 1", self.path, key)
+            log.info("[DRY] %s %s -> %s", self.path, key, val)
             return True
+        value = (
+            (val, *(0 for _ in range(self._value_fields - 1)))
+            if isinstance(val, int)
+            else val
+        )
         try:
-            struct.pack_into("=I", self._val, 0, 1)
+            struct.pack_into(self._value_format, self._val, 0, *value)
             bpf(BPF_MAP_UPDATE_ELEM, self._update_attr)
-            self._cache.add(key)
+            self._cache[key] = value
             return True
         except OSError as exc:
             log.warning("BPF zone update failed key=%s: %s", key, exc)
@@ -272,11 +324,11 @@ class BpfZonePortMap(CacheVerifyMixin, BpfFdMap):
             return True
         try:
             bpf(BPF_MAP_DELETE_ELEM, self._delete_attr)
-            self._cache.discard(key)
+            self._cache.pop(key, None)
             return True
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                self._cache.discard(key)
+                self._cache.pop(key, None)
                 return True
             log.warning("BPF zone delete failed key=%s: %s", self.path, exc)
             return False

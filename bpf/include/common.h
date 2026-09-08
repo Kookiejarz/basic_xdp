@@ -11,6 +11,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include "../../handlers/xdp_slot_ctx.h"
+#include "../../handlers/xdp_profile_ctx.h"
+#include "counters.h"
+#include "flow_keys.h"
 
 #ifndef bool
 typedef _Bool bool;
@@ -37,8 +40,6 @@ struct vlan_hdr {
 #define IPV6_FRAG_DROP_SENTINEL 0xFF
 #define IPV6_EXTHDR_MALFORMED_SENTINEL 0xFE
 #define VLAN_MAX_DEPTH 4
-#define CT_FAMILY_IPV4 2
-#define CT_FAMILY_IPV6 10
 #define NS_PER_SEC 1000000000ULL
 
 #define TCP_FLAG_FIN  0x01
@@ -105,59 +106,6 @@ static __always_inline __u64 cfg_rate_window_ns(struct xdp_runtime_cfg *cfg)
 // Counter map: per-CPU array for lock-free packet accounting
 // Read with: bpftool map dump pinned /sys/fs/bpf/xdp_fw/pkt_counters
 
-enum xdp_counter_idx {
-    CNT_TCP_NEW_ALLOW   = 0,  // TCP pure SYN packets allowed by tcp_whitelist
-    CNT_TCP_PASS        = 1,  // TCP packets allowed after exposure evaluation
-    CNT_TCP_DROP        = 2,  // TCP packets dropped by exposure or protection
-    CNT_UDP_PASS        = 3,  // UDP packets allowed
-    CNT_UDP_DROP        = 4,  // UDP packets dropped
-    CNT_IPV4_OTHER      = 5,  // IPv4 non-TCP/UDP (ICMP, etc.) passed
-    CNT_IPV6_OTHER      = 6,  // IPv6 non-TCP/UDP (ICMPv6, etc.) passed
-    CNT_FRAG_DROP       = 7,  // Fragmented packets dropped
-    CNT_NON_IP          = 8,  // Non-IP traffic (ARP, etc.) passed
-    CNT_TCP_RESERVED     = 9, // Reserved counter slot retained for ABI stability
-    CNT_ICMP_DROP       = 10, // ICMP/ICMPv6 echo packets dropped by token-bucket rate limiter
-    CNT_SYN_RATE_DROP   = 11, // TCP SYN dropped by per-IP rate limiter (anti-brute-force)
-    CNT_UDP_RATE_DROP        = 12, // UDP dropped by per-source-IP rate limiter
-    CNT_UDP_GLOBAL_RATE_DROP = 13, // UDP dropped by the global sliding-window rate limiter
-    CNT_TCP_MALFORM_NULL     = 14, // TCP NULL scan (all flags zero)
-    CNT_TCP_MALFORM_XMAS     = 15, // TCP XMAS scan (FIN+URG+PSH)
-    CNT_TCP_MALFORM_SYN_FIN  = 16, // TCP SYN+FIN contradictory flags
-    CNT_TCP_MALFORM_SYN_RST  = 17, // TCP SYN+RST contradictory flags
-    CNT_TCP_MALFORM_RST_FIN  = 18, // TCP RST+FIN contradictory flags
-    CNT_TCP_MALFORM_DOFF     = 19, // TCP invalid data offset (doff < 5 or > 15 or truncated)
-    CNT_TCP_MALFORM_PORT0    = 20, // TCP src or dst port is 0
-    CNT_VLAN_DROP            = 21, // packet dropped: VLAN nesting exceeds VLAN_MAX_DEPTH
-    CNT_SLOT_CALL            = 22, // packets dispatched to a slot handler via tail call
-    CNT_SLOT_PASS            = 23, // slot miss: no handler, default_action=pass
-    CNT_SLOT_DROP            = 24, // slot miss: no handler, default_action=drop
-    CNT_UDP_MALFORM_PORT0    = 25, // UDP src or dst port is 0
-    CNT_UDP_MALFORM_LEN      = 26, // UDP length field < 8 or exceeds packet boundary
-    CNT_BOGON_DROP           = 27, // packet dropped: spoofed/reserved source address
-    CNT_RESERVED_28                = 28,
-    CNT_SYN_AGG_RATE_DROP          = 29, // TCP SYN dropped by per-prefix aggregate rate limiter
-    CNT_UDP_AGG_RATE_DROP          = 30, // UDP dropped by per-prefix byte-rate limiter
-    CNT_HANDLER_BLOCK_DROP         = 31, // dropped: src IP in handler_blocked map
-    CNT_RESERVED_32                = 32,
-    CNT_RESERVED_33                = 33,
-    CNT_ABUSEIPDB_DROP             = 34, // dropped: src IP in AbuseIPDB blocklist
-    CNT_MAX                        = 35,
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, CNT_MAX);
-    __type(key, __u32);
-    __type(value, __u64);
-} pkt_counters SEC(".maps");
-
-static __always_inline void count(enum xdp_counter_idx idx) {
-    __u32 key = (__u32)idx;
-    __u64 *val = bpf_map_lookup_elem(&pkt_counters, &key);
-    if (val)
-        (*val)++;
-}
-
 struct pkt_event {
     __u64 ts_ns;
     __u32 src_ip[4];   // v4: [0] only; v6: all 4 (network byte order)
@@ -183,7 +131,7 @@ static __always_inline bool drop_events_enabled(void)
 
 static __always_inline void emit_packet_event(
     __u8 proto, __u8 family,
-    __u32 *src_ip, __u32 *dst_ip,
+    const __u32 *src_ip, const __u32 *dst_ip,
     __be16 sport, __be16 dport,
     __u8 verdict,
     __u8 reason,
@@ -207,7 +155,7 @@ static __always_inline void emit_packet_event(
 
 static __always_inline void emit_drop(
     __u8 proto, __u8 family,
-    __u32 *src_ip, __u32 *dst_ip,
+    const __u32 *src_ip, const __u32 *dst_ip,
     __be16 sport, __be16 dport,
     __u8 reason,
     __u64 now)
@@ -217,36 +165,10 @@ static __always_inline void emit_drop(
 
 static __always_inline void emit_allow(
     __u8 proto, __u8 family,
-    __u32 *src_ip, __u32 *dst_ip,
+    const __u32 *src_ip, const __u32 *dst_ip,
     __be16 sport, __be16 dport,
     __u8 reason,
     __u64 now)
 {
     emit_packet_event(proto, family, src_ip, dst_ip, sport, dport, 2, reason, now);
-}
-
-// Byte/packet counters (called exactly once per packet — no double-counting).
-// index 0 = total bytes, 1 = drop bytes, 2 = total packets, 3 = drop packets.
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 4);
-    __type(key, __u32);
-    __type(value, __u64);
-} byte_counters SEC(".maps");
-
-static __always_inline void count_bytes(bool is_drop, __u32 pkt_len) {
-    __u32 key = 0;
-    __u64 *val = bpf_map_lookup_elem(&byte_counters, &key);
-    if (val) (*val) += pkt_len;
-    key = 2;
-    val = bpf_map_lookup_elem(&byte_counters, &key);
-    if (val) (*val) += 1;
-    if (is_drop) {
-        key = 1;
-        val = bpf_map_lookup_elem(&byte_counters, &key);
-        if (val) (*val) += pkt_len;
-        key = 3;
-        val = bpf_map_lookup_elem(&byte_counters, &key);
-        if (val) (*val) += 1;
-    }
 }

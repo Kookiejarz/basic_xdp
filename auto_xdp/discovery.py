@@ -458,6 +458,7 @@ def _endpoint(
     attribution_state: str,
     attribution_source: str,
     container: ContainerIdentity | None = None,
+    instance_id: str = "",
 ) -> RuntimeEndpoint:
     endpoint = RuntimeEndpoint(
         protocol=protocol,
@@ -468,6 +469,7 @@ def _endpoint(
         subject=subject,
         attribution_state=attribution_state,
         attribution_source=attribution_source,
+        instance_id=instance_id,
     )
     identity = container or _container_for_endpoint(protocol, host_address, port)
     if identity is None:
@@ -631,7 +633,10 @@ def _get_listening_ports_netlink() -> ObservedState:
             if attribution != "exact" and name and name != "systemd" and container is None:
                 subject = name
             state.endpoints.append(
-                _endpoint("tcp", _addr_str(family, src), port, subject, attribution, source, container)
+                _endpoint(
+                    "tcp", _addr_str(family, src), port, subject, attribution,
+                    source, container, str(inode),
+                )
             )
 
     # UDP — collect drops from /proc, rqueue from SOCK_DIAG
@@ -688,7 +693,10 @@ def _get_listening_ports_netlink() -> ObservedState:
         if attribution != "exact" and name and name != "systemd" and container is None:
             subject = name
         state.endpoints.append(
-            _endpoint("udp", _addr_str(family, src), port, subject, attribution, source, container)
+            _endpoint(
+                "udp", _addr_str(family, src), port, subject, attribution,
+                source, container, str(info["inode"]),
+            )
         )
         opts: set[str] = set()
         if aggregate["count"] > 1:
@@ -710,7 +718,10 @@ def _get_listening_ports_netlink() -> ObservedState:
                     state.sctp.add(sport_h)
                     subject, attribution, source, container = _proc_attribution(_in)
                     state.endpoints.append(
-                        _endpoint("sctp", _addr_str(family, src), sport_h, subject, attribution, source, container)
+                        _endpoint(
+                            "sctp", _addr_str(family, src), sport_h, subject,
+                            attribution, source, container, str(_in),
+                        )
                     )
     except OSError:
         pass
@@ -847,6 +858,7 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                         "exact" if name.endswith(".service") else ("delegated" if name else "unknown"),
                         "systemd-socket" if name.endswith(".service") else ("process-name" if name else ""),
                         container,
+                        f"{pid}:{getattr(conn, 'fd', -1)}",
                     )
                 )
         elif conn.type in (socket.SOCK_DGRAM, socket.SOCK_SEQPACKET):
@@ -873,6 +885,7 @@ def _get_listening_ports_psutil(cached_conns=None) -> ObservedState:
                         "exact" if name.endswith(".service") else ("delegated" if name else "unknown"),
                         "systemd-socket" if name.endswith(".service") else ("process-name" if name else ""),
                         container,
+                        f"{pid}:{getattr(conn, 'fd', -1)}",
                     )
                 )
                 _annotate_udp_sock_opts(port, proc_udp, state)

@@ -1,18 +1,6 @@
 #pragma once
 #include "common.h"
 
-// Generic parsed 5-tuple used on the packet path. Map-facing keys below are
-// split by address family so IPv4 traffic does not hash or compare zeroed IPv6
-// words on every lookup/update.
-struct flow_key {
-    __u8 family;
-    __u8 pad[3];
-    __be16 sport;
-    __be16 dport;
-    __u32 saddr[4];
-    __u32 daddr[4];
-} __attribute__((aligned(8)));
-
 struct udp_validation_key_v4 {
     __be16 sport;
     __be16 dport;
@@ -40,6 +28,20 @@ struct trusted_v6_key {
 struct zone_port_key {
     __u32 ifindex;
     __u32 port;
+};
+
+/*
+ * TCP admission result.  A non-zero allow with profile_id == 0 selects the
+ * legacy generic/per-port path.  A non-zero profile_id makes successful
+ * profile execution a prerequisite for exposure.
+ *
+ * Keep this layout in sync with userspace's "=IIQQ" packing.
+ */
+struct tcp_endpoint_policy {
+    __u32 allow;
+    __u32 profile_id;
+    __u64 policy_generation;
+    __u64 profile_generation;
 };
 
 // Global ICMP token-bucket state (single entry, protected by spin lock)
@@ -88,15 +90,6 @@ struct udp_port_policy_cfg {
     __u32 source_prefix_v6;
     __u32 _pad0;
     __u32 _pad1;
-};
-
-// Per-IP SYN rate limiter state
-struct syn_rate_key_v4 {
-    __be32 addr;
-};
-
-struct syn_rate_key_v6 {
-    __u32 addr[4];
 };
 
 struct syn_rate_val {

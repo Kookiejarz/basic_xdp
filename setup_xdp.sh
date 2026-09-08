@@ -125,6 +125,7 @@ CONFIG_DIR="/etc/auto_xdp"
 INSTALL_TRANSACTION_FILE="${CONFIG_DIR}/install-transaction.json"
 CONFIG_FILE="${CONFIG_DIR}/auto_xdp.env"
 TOML_CONFIG="${CONFIG_DIR}/config.toml"
+RUN_STATE_DIR="/run/auto_xdp"
 SYNC_SCRIPT="${CURRENT_LINK}/xdp_port_sync.py"
 RELAY_SCRIPT="${CURRENT_LINK}/pkt_relay.py"
 AXDP_CMD="/usr/local/bin/axdp"
@@ -157,6 +158,8 @@ INTERFACE_POLICY_PRESENT=0
 AUTO_XDP_ALLOW_CONTAINER=0
 
 export BPF_PIN_DIR="/sys/fs/bpf/xdp_fw"
+NFT_FAMILY="inet"
+NFT_TABLE="auto_xdp"
 SERVICE_NAME="xdp-port-sync"
 RELAY_SERVICE_NAME="auto-xdp-relay"
 RAW_BASE_URL="https://raw.githubusercontent.com/Kookiejarz/Auto_XDP"

@@ -26,7 +26,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 65536);
     __type(key, __u32);   // port number (host byte order) as array index
-    __type(value, __u32); // 1 = allow
+    __type(value, struct tcp_endpoint_policy);
 } tcp_whitelist SEC(".maps");
 
 struct {
@@ -43,7 +43,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
     __type(key, struct zone_port_key);
-    __type(value, __u32);
+    __type(value, struct tcp_endpoint_policy);
 } tcp_zone_whitelist SEC(".maps");
 
 struct {
@@ -236,6 +236,15 @@ struct {
     __type(key, __u32);
     __type(value, __u32);
 } proto_handlers SEC(".maps");
+
+// Protection-profile dispatch is keyed by stable profile identity, not port.
+// Entry zero is reserved for the generic/per-port path.
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, __u32);
+} tcp_profile_handlers SEC(".maps");
 
 // Per-port TCP/UDP handler prog arrays (key = dest port, host byte order).
 // Userspace loads a handler .o and updates the fd at the port's index to enable

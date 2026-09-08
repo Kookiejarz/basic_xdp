@@ -29,6 +29,7 @@ udp_acl_v4
 udp_acl_v6
 sit4_endpoints
 proto_handlers
+tcp_profile_handlers
 tcp_port_handlers
 udp_port_handlers
 hblk4
@@ -37,3 +38,4 @@ udp_hv4
 udp_hv6
 abuseipdb_v4
 slot_ctx_map
+profile_ctx_map
